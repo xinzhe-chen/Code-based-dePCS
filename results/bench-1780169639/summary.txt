@@ -1,0 +1,17 @@
+sizes=[4, 8]
+workers=[1, 2]
+pcs_queries=2
+records=16
+positive_verified=8
+negative_rejected=8
+charts=prove_time_by_size.svg,verify_time_by_size.svg,proof_bytes_by_size.svg,worker_scaling_max_size.svg
+
+scaling_analysis:
+  baseline: workers=1 is the non-distributed local prover path for the same protocol and size.
+  theory: ideal distributed proving speedup is bounded by worker count; small prototypes may be below ideal because oracle consistency, transcript, and verification are still largely serial.
+  protocol=r1cs size=8 baseline_prove_ms=10.151
+    workers=1 prove_ms=10.151 speedup_vs_w1=1.000 efficiency=1.000 status=plausible-prototype-overhead
+    workers=2 prove_ms=8.871 speedup_vs_w1=1.144 efficiency=0.572 status=plausible-prototype-overhead
+  protocol=plonkish size=8 baseline_prove_ms=89.348
+    workers=1 prove_ms=89.348 speedup_vs_w1=1.000 efficiency=1.000 status=plausible-prototype-overhead
+    workers=2 prove_ms=69.257 speedup_vs_w1=1.290 efficiency=0.645 status=plausible-prototype-overhead

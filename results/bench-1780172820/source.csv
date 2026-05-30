@@ -1,0 +1,17 @@
+protocol,case,workers,nv_power,size,constraints,pcs_queries,prove_ms,verify_ms,proof_bytes,communication_bytes,network_bytes,verified,failure_reason
+r1cs,positive,1,2,4,4,2,24.680,15.325,16408,11964,0,true,
+r1cs,negative,1,2,4,4,2,24.650,11.687,16408,2288,0,false,Pcs
+r1cs,positive,2,2,4,4,2,24.937,16.572,22208,17688,0,true,
+r1cs,negative,2,2,4,4,2,24.456,12.990,22208,3360,0,false,Pcs
+r1cs,positive,1,3,8,8,2,48.215,24.780,24400,14648,0,true,
+r1cs,negative,1,3,8,8,2,48.264,19.816,24400,2812,0,false,Pcs
+r1cs,positive,2,3,8,8,2,48.797,25.696,31856,22160,0,true,
+r1cs,negative,2,3,8,8,2,45.416,20.378,31856,4248,0,false,Pcs
+plonkish,positive,1,2,4,16,2,41.647,16.010,25248,3400,0,true,
+plonkish,negative,1,2,4,16,2,42.024,3.129,25248,3400,0,false,InvalidProof
+plonkish,positive,2,2,4,16,2,34.882,15.817,26520,5168,0,true,
+plonkish,negative,2,2,4,16,2,34.364,2.854,26520,5168,0,false,InvalidProof
+plonkish,positive,1,3,8,32,2,125.924,30.229,53968,4116,0,true,
+plonkish,negative,1,3,8,32,2,126.005,5.444,53968,4116,0,false,InvalidProof
+plonkish,positive,2,3,8,32,2,99.539,30.367,54980,6152,0,true,
+plonkish,negative,2,3,8,32,2,98.075,5.166,54980,6152,0,false,InvalidProof
