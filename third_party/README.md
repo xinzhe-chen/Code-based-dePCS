@@ -25,3 +25,11 @@ For any additional vendored source, record:
 - local changes;
 - which protocol pieces are used and which commitment pieces are intentionally
   excluded.
+
+Repository hygiene:
+
+- Do not commit upstream build outputs, benchmark result scratch files, or
+  generated plots from vendored projects.
+- Do not commit KZG SRS parameter binaries. HyperPlonk's `srs.params` is
+  ignored intentionally because this project does not use KZG or any
+  non-post-quantum commitment as its final PCS.

@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    name: rust-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Windows interactive script smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          $tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\scripts\interactive-powershell.ps1), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { $_.Message }; throw "PowerShell script parse failed" }
+          $smoke = @("0") | powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\interactive-powershell.ps1 -NoPause 2>&1 | Out-String
+          $smoke
+          if ($LASTEXITCODE -ne 0) { throw "PowerShell interactive menu exit smoke failed" }
+          if ($smoke -notmatch "pq_dSNARK interactive entrypoint") { throw "PowerShell menu did not render" }
+          if ($smoke -match "== Proof Experiment Wizard ==|== Performance Benchmark Wizard ==|\[pq_dSNARK\] building|cargo build") { throw "PowerShell menu exit triggered a predetermined experiment" }
+
+      - name: Windows network benchmark smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo run -p pq-experiments --release -- benchmark --runner network --n-range "2..2" --workers "1,2" --pcs-queries 1 --out results
+          $latest = Get-ChildItem -LiteralPath results -Directory -Filter "bench-*" | Sort-Object Name | Select-Object -Last 1
+          if ($null -eq $latest) { throw "benchmark did not create a results directory" }
+          if (-not (Test-Path -LiteralPath (Join-Path $latest.FullName "overview.html"))) { throw "overview.html missing" }
+          $verify = cargo run -p pq-experiments -- verify-results $latest.FullName --format json
+          $verify
+          if ($verify -notmatch '"source_rows_checked":4') { throw "semantic source row check missing from verify-results output" }
+          if ($verify -notmatch '"phase_rows_checked":11') { throw "semantic phase row check missing from verify-results output" }
+          if ($verify -notmatch '"summary_rows_checked":4') { throw "semantic summary row check missing from verify-results output" }
+
+      - name: Linux and macOS interactive script smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bash -n scripts/interactive-linux.sh
+          bash -n scripts/interactive-macos.sh
+          linux_output="$(echo 0 | bash scripts/interactive-linux.sh 2>&1)"
+          printf '%s\n' "$linux_output"
+          grep -q 'pq_dSNARK interactive entrypoint' <<< "$linux_output"
+          ! grep -Eq '== Proof Experiment Wizard ==|== Performance Benchmark Wizard ==|\[pq_dSNARK\] building|cargo build' <<< "$linux_output"
+          macos_output="$(echo 0 | bash scripts/interactive-macos.sh 2>&1)"
+          printf '%s\n' "$macos_output"
+          grep -q 'pq_dSNARK interactive entrypoint' <<< "$macos_output"
+          ! grep -Eq '== Proof Experiment Wizard ==|== Performance Benchmark Wizard ==|\[pq_dSNARK\] building|cargo build' <<< "$macos_output"
+
+      - name: Linux benchmark smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo run -p pq-experiments --release -- benchmark --runner network --n-range 2..2 --workers 1,2 --pcs-queries 1 --out results
+          latest="$(find results -maxdepth 1 -type d -name 'bench-*' | sort | tail -n 1)"
+          test -n "$latest"
+          test -f "$latest/overview.html"
+          verify_output="$(cargo run -p pq-experiments -- verify-results "$latest" --format json)"
+          printf '%s\n' "$verify_output"
+          grep -q '"source_rows_checked":4' <<< "$verify_output"
+          grep -q '"phase_rows_checked":11' <<< "$verify_output"
+          grep -q '"summary_rows_checked":4' <<< "$verify_output"

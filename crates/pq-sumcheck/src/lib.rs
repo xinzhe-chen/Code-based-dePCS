@@ -1,5 +1,5 @@
 use pq_core::{CoreError, FieldElement, MultilinearPolynomial, eq_eval, eq_evaluations};
-use pq_transcript::Transcript;
+use pq_transcript::{HashTranscript, Transcript};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SumcheckError {
@@ -615,19 +615,36 @@ pub fn rational_sum(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RationalSumcheckProof {
     pub claimed_sum: FieldElement,
-    pub numerator: Vec<FieldElement>,
-    pub denominator: Vec<FieldElement>,
+    pub len: usize,
+    pub sumcheck: SumcheckProof,
+    pub binding_challenge: FieldElement,
 }
 
 pub fn prove_rational_sumcheck(
     numerator: Vec<FieldElement>,
     denominator: Vec<FieldElement>,
 ) -> SumcheckResult<RationalSumcheckProof> {
-    let claimed_sum = rational_sum(&numerator, &denominator)?;
+    let mut transcript = HashTranscript::new(b"rational-sumcheck");
+    prove_rational_sumcheck_with_transcript(&numerator, &denominator, &mut transcript)
+}
+
+pub fn prove_rational_sumcheck_with_transcript<T: Transcript>(
+    numerator: &[FieldElement],
+    denominator: &[FieldElement],
+    transcript: &mut T,
+) -> SumcheckResult<RationalSumcheckProof> {
+    let len = numerator.len();
+    let rational_evaluations = rational_evaluations(numerator, denominator)?;
+    let rational_poly = MultilinearPolynomial::new(rational_evaluations)?;
+    absorb_rational_statement(numerator, denominator, transcript);
+    let sumcheck = prove_sumcheck(&rational_poly, transcript)?;
+    let claimed_sum = sumcheck.claimed_sum;
+    let binding_challenge = transcript.challenge_field::<FieldElement>(b"rational-binding");
     Ok(RationalSumcheckProof {
         claimed_sum,
-        numerator,
-        denominator,
+        len,
+        sumcheck,
+        binding_challenge,
     })
 }
 
@@ -637,17 +654,59 @@ pub fn verify_rational_sumcheck(
     claimed_sum: FieldElement,
     proof: &RationalSumcheckProof,
 ) -> SumcheckResult<()> {
-    if proof.numerator != numerator
-        || proof.denominator != denominator
+    let mut transcript = HashTranscript::new(b"rational-sumcheck");
+    verify_rational_sumcheck_with_transcript(
+        numerator,
+        denominator,
+        claimed_sum,
+        proof,
+        &mut transcript,
+    )
+}
+
+pub fn verify_rational_sumcheck_with_transcript<T: Transcript>(
+    numerator: &[FieldElement],
+    denominator: &[FieldElement],
+    claimed_sum: FieldElement,
+    proof: &RationalSumcheckProof,
+    transcript: &mut T,
+) -> SumcheckResult<()> {
+    if proof.len != numerator.len()
+        || proof.len != denominator.len()
         || proof.claimed_sum != claimed_sum
+        || proof.sumcheck.claimed_sum != claimed_sum
     {
         return Err(SumcheckError::InvalidProof);
     }
-    if rational_sum(numerator, denominator)? == claimed_sum {
+    let rational_evaluations = rational_evaluations(numerator, denominator)?;
+    let rational_poly = MultilinearPolynomial::new(rational_evaluations)?;
+    absorb_rational_statement(numerator, denominator, transcript);
+    verify_sumcheck(&rational_poly, &proof.sumcheck, transcript)?;
+    let binding_challenge = transcript.challenge_field::<FieldElement>(b"rational-binding");
+    if binding_challenge == proof.binding_challenge {
         Ok(())
     } else {
         Err(SumcheckError::InvalidProof)
     }
+}
+
+fn rational_evaluations(
+    numerator: &[FieldElement],
+    denominator: &[FieldElement],
+) -> SumcheckResult<Vec<FieldElement>> {
+    if numerator.len() != denominator.len() {
+        return Err(SumcheckError::LengthMismatch);
+    }
+    let mut evaluations = Vec::with_capacity(numerator.len().max(1).next_power_of_two());
+    for (p, q) in numerator.iter().zip(denominator) {
+        let inv = q.inverse().ok_or(SumcheckError::ZeroDenominator)?;
+        evaluations.push(*p * inv);
+    }
+    evaluations.resize(
+        evaluations.len().max(1).next_power_of_two(),
+        FieldElement::ZERO,
+    );
+    Ok(evaluations)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -655,10 +714,10 @@ pub struct MultisetEqualityProof {
     pub gamma: FieldElement,
     pub f1_len: usize,
     pub f2_len: usize,
+    pub g1_len: usize,
+    pub g2_len: usize,
     pub left_sum: FieldElement,
     pub right_sum: FieldElement,
-    pub left: Vec<FieldElement>,
-    pub right: Vec<FieldElement>,
 }
 
 pub fn prove_multiset_equality<T: Transcript>(
@@ -679,10 +738,10 @@ pub fn prove_multiset_equality<T: Transcript>(
         gamma,
         f1_len: f1.len(),
         f2_len: f2.len(),
+        g1_len: g1.len(),
+        g2_len: g2.len(),
         left_sum,
         right_sum,
-        left,
-        right,
     })
 }
 
@@ -694,12 +753,10 @@ pub fn verify_multiset_equality<T: Transcript>(
     proof: &MultisetEqualityProof,
     transcript: &mut T,
 ) -> SumcheckResult<()> {
-    let expected_left = f1.iter().chain(f2).copied().collect::<Vec<FieldElement>>();
-    let expected_right = g1.iter().chain(g2).copied().collect::<Vec<FieldElement>>();
-    if proof.left != expected_left
-        || proof.right != expected_right
-        || proof.f1_len != f1.len()
+    if proof.f1_len != f1.len()
         || proof.f2_len != f2.len()
+        || proof.g1_len != g1.len()
+        || proof.g2_len != g2.len()
     {
         return Err(SumcheckError::InvalidProof);
     }
@@ -709,9 +766,113 @@ pub fn verify_multiset_equality<T: Transcript>(
     if gamma != proof.gamma {
         return Err(SumcheckError::InvalidProof);
     }
+    let expected_left = f1.iter().chain(f2).copied().collect::<Vec<FieldElement>>();
+    let expected_right = g1.iter().chain(g2).copied().collect::<Vec<FieldElement>>();
     let left_sum = log_derivative_sum(&expected_left, gamma)?;
     let right_sum = log_derivative_sum(&expected_right, gamma)?;
     if proof.left_sum == left_sum && proof.right_sum == right_sum && left_sum == right_sum {
+        Ok(())
+    } else {
+        Err(SumcheckError::InvalidProof)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductMultisetEqualityProof {
+    pub gamma: FieldElement,
+    pub f1_len: usize,
+    pub f2_len: usize,
+    pub g1_len: usize,
+    pub g2_len: usize,
+    pub left_product: FieldElement,
+    pub right_product: FieldElement,
+    pub left_log_derivative: RationalSumcheckProof,
+    pub right_log_derivative: RationalSumcheckProof,
+}
+
+pub fn prove_product_multiset_equality<T: Transcript>(
+    f1: &[FieldElement],
+    f2: &[FieldElement],
+    g1: &[FieldElement],
+    g2: &[FieldElement],
+    transcript: &mut T,
+) -> SumcheckResult<ProductMultisetEqualityProof> {
+    transcript.absorb_domain(b"product-multiset-equality-v1");
+    absorb_multiset_statement(f1, f2, g1, g2, transcript);
+    let gamma = transcript.challenge_field::<FieldElement>(b"gamma");
+    let left = f1.iter().chain(f2).copied().collect::<Vec<FieldElement>>();
+    let right = g1.iter().chain(g2).copied().collect::<Vec<FieldElement>>();
+    let left_product = multiset_product(&[&left], gamma);
+    let right_product = multiset_product(&[&right], gamma);
+    let left_denominator = log_derivative_denominators(&left, gamma);
+    let right_denominator = log_derivative_denominators(&right, gamma);
+    let left_numerator = vec![FieldElement::ONE; left_denominator.len()];
+    let right_numerator = vec![FieldElement::ONE; right_denominator.len()];
+    let left_log_derivative =
+        prove_rational_sumcheck_with_transcript(&left_numerator, &left_denominator, transcript)?;
+    let right_log_derivative =
+        prove_rational_sumcheck_with_transcript(&right_numerator, &right_denominator, transcript)?;
+    Ok(ProductMultisetEqualityProof {
+        gamma,
+        f1_len: f1.len(),
+        f2_len: f2.len(),
+        g1_len: g1.len(),
+        g2_len: g2.len(),
+        left_product,
+        right_product,
+        left_log_derivative,
+        right_log_derivative,
+    })
+}
+
+pub fn verify_product_multiset_equality<T: Transcript>(
+    f1: &[FieldElement],
+    f2: &[FieldElement],
+    g1: &[FieldElement],
+    g2: &[FieldElement],
+    proof: &ProductMultisetEqualityProof,
+    transcript: &mut T,
+) -> SumcheckResult<()> {
+    if proof.f1_len != f1.len()
+        || proof.f2_len != f2.len()
+        || proof.g1_len != g1.len()
+        || proof.g2_len != g2.len()
+    {
+        return Err(SumcheckError::InvalidProof);
+    }
+    transcript.absorb_domain(b"product-multiset-equality-v1");
+    absorb_multiset_statement(f1, f2, g1, g2, transcript);
+    let gamma = transcript.challenge_field::<FieldElement>(b"gamma");
+    if gamma != proof.gamma {
+        return Err(SumcheckError::InvalidProof);
+    }
+    let left = f1.iter().chain(f2).copied().collect::<Vec<FieldElement>>();
+    let right = g1.iter().chain(g2).copied().collect::<Vec<FieldElement>>();
+    let left_product = multiset_product(&[&left], gamma);
+    let right_product = multiset_product(&[&right], gamma);
+    let left_denominator = log_derivative_denominators(&left, gamma);
+    let right_denominator = log_derivative_denominators(&right, gamma);
+    let left_numerator = vec![FieldElement::ONE; left_denominator.len()];
+    let right_numerator = vec![FieldElement::ONE; right_denominator.len()];
+    verify_rational_sumcheck_with_transcript(
+        &left_numerator,
+        &left_denominator,
+        proof.left_log_derivative.claimed_sum,
+        &proof.left_log_derivative,
+        transcript,
+    )?;
+    verify_rational_sumcheck_with_transcript(
+        &right_numerator,
+        &right_denominator,
+        proof.right_log_derivative.claimed_sum,
+        &proof.right_log_derivative,
+        transcript,
+    )?;
+    if proof.left_product == left_product
+        && proof.right_product == right_product
+        && left_product == right_product
+        && proof.left_log_derivative.claimed_sum == proof.right_log_derivative.claimed_sum
+    {
         Ok(())
     } else {
         Err(SumcheckError::InvalidProof)
@@ -744,6 +905,20 @@ fn log_derivative_sum(
         sum += inv;
     }
     Ok(sum)
+}
+
+fn log_derivative_denominators(values: &[FieldElement], gamma: FieldElement) -> Vec<FieldElement> {
+    values.iter().map(|value| gamma + *value).collect()
+}
+
+fn multiset_product(chunks: &[&[FieldElement]], gamma: FieldElement) -> FieldElement {
+    let mut product = FieldElement::ONE;
+    for chunk in chunks {
+        for value in *chunk {
+            product *= gamma + *value;
+        }
+    }
+    product
 }
 
 fn absorb_polynomial<T: Transcript>(poly: &MultilinearPolynomial, transcript: &mut T) {
@@ -781,6 +956,16 @@ fn absorb_multiset_statement<T: Transcript>(
     absorb_labeled_values(transcript, b"f2", f2);
     absorb_labeled_values(transcript, b"g1", g1);
     absorb_labeled_values(transcript, b"g2", g2);
+}
+
+fn absorb_rational_statement<T: Transcript>(
+    numerator: &[FieldElement],
+    denominator: &[FieldElement],
+    transcript: &mut T,
+) {
+    transcript.absorb_domain(b"rational-sumcheck-v1");
+    absorb_labeled_values(transcript, b"rational-numerator", numerator);
+    absorb_labeled_values(transcript, b"rational-denominator", denominator);
 }
 
 fn inner_product(left: &[FieldElement], right: &[FieldElement]) -> FieldElement {
@@ -1105,6 +1290,9 @@ mod tests {
         let numerator = vec![1_u64.into(), 2_u64.into()];
         let denominator = vec![1_u64.into(), 4_u64.into()];
         let proof = prove_rational_sumcheck(numerator.clone(), denominator.clone()).expect("proof");
+        assert_eq!(proof.len, numerator.len());
+        assert_eq!(proof.sumcheck.claimed_sum, proof.claimed_sum);
+        assert_eq!(proof.sumcheck.rounds.len(), 1);
         assert!(
             verify_rational_sumcheck(&numerator, &denominator, proof.claimed_sum, &proof).is_ok()
         );
@@ -1113,7 +1301,73 @@ mod tests {
             verify_rational_sumcheck(&forged_public, &denominator, proof.claimed_sum, &proof)
                 .is_err()
         );
+        let mut bad_len = proof;
+        bad_len.len += 1;
+        assert!(
+            verify_rational_sumcheck(&numerator, &denominator, bad_len.claimed_sum, &bad_len)
+                .is_err()
+        );
         assert!(prove_rational_sumcheck(vec![1_u64.into()], vec![FieldElement::ZERO]).is_err());
+    }
+
+    #[test]
+    fn rational_sumcheck_binds_transcript_and_public_inputs() {
+        let numerator = vec![1_u64.into(), 2_u64.into(), 5_u64.into(), 7_u64.into()];
+        let denominator = vec![1_u64.into(), 3_u64.into(), 4_u64.into(), 9_u64.into()];
+        let mut prover_tr = HashTranscript::new(b"rational-fs");
+        let proof =
+            prove_rational_sumcheck_with_transcript(&numerator, &denominator, &mut prover_tr)
+                .expect("proof");
+        let mut verifier_tr = HashTranscript::new(b"rational-fs");
+        verify_rational_sumcheck_with_transcript(
+            &numerator,
+            &denominator,
+            proof.claimed_sum,
+            &proof,
+            &mut verifier_tr,
+        )
+        .expect("verify");
+        assert_eq!(prover_tr.state(), verifier_tr.state());
+
+        let mut bad_challenge = proof.clone();
+        bad_challenge.binding_challenge += FieldElement::ONE;
+        let mut verifier_tr = HashTranscript::new(b"rational-fs");
+        assert_eq!(
+            verify_rational_sumcheck_with_transcript(
+                &numerator,
+                &denominator,
+                bad_challenge.claimed_sum,
+                &bad_challenge,
+                &mut verifier_tr,
+            ),
+            Err(SumcheckError::InvalidProof)
+        );
+
+        let mut bad_round = proof.clone();
+        bad_round.sumcheck.rounds[0].eval_at_0 += FieldElement::ONE;
+        let mut verifier_tr = HashTranscript::new(b"rational-fs");
+        assert_eq!(
+            verify_rational_sumcheck_with_transcript(
+                &numerator,
+                &denominator,
+                bad_round.claimed_sum,
+                &bad_round,
+                &mut verifier_tr,
+            ),
+            Err(SumcheckError::InvalidProof)
+        );
+
+        let mut changed_numerator = numerator.clone();
+        changed_numerator[0] += FieldElement::ONE;
+        let mut changed_tr = HashTranscript::new(b"rational-fs");
+        let changed_proof = prove_rational_sumcheck_with_transcript(
+            &changed_numerator,
+            &denominator,
+            &mut changed_tr,
+        )
+        .expect("changed proof");
+        assert_ne!(proof.binding_challenge, changed_proof.binding_challenge);
+        assert_ne!(prover_tr.state(), changed_tr.state());
     }
 
     #[test]
@@ -1124,6 +1378,10 @@ mod tests {
         let g2 = vec![2_u64.into(), 1_u64.into()];
         let mut prover_tr = HashTranscript::new(b"mset");
         let proof = prove_multiset_equality(&f1, &f2, &g1, &g2, &mut prover_tr).expect("proof");
+        assert_eq!(proof.f1_len, f1.len());
+        assert_eq!(proof.f2_len, f2.len());
+        assert_eq!(proof.g1_len, g1.len());
+        assert_eq!(proof.g2_len, g2.len());
         let mut different_statement_tr = HashTranscript::new(b"mset");
         let different = prove_multiset_equality(
             &[9_u64.into(), 2_u64.into()],
@@ -1141,9 +1399,75 @@ mod tests {
         assert!(
             verify_multiset_equality(&forged_f1, &f2, &g1, &g2, &proof, &mut verifier_tr).is_err()
         );
+        let mut bad_length = proof.clone();
+        bad_length.g2_len += 1;
+        let mut verifier_tr = HashTranscript::new(b"mset");
+        assert!(
+            verify_multiset_equality(&f1, &f2, &g1, &g2, &bad_length, &mut verifier_tr).is_err()
+        );
+        let mut bad_sum = proof;
+        bad_sum.left_sum += FieldElement::ONE;
+        let mut verifier_tr = HashTranscript::new(b"mset");
+        assert!(verify_multiset_equality(&f1, &f2, &g1, &g2, &bad_sum, &mut verifier_tr).is_err());
 
         let left = vec![1_u64.into(), 2_u64.into(), 3_u64.into()];
         let right = vec![3_u64.into(), 1_u64.into(), 2_u64.into()];
         assert!(verify_multiset_by_sort(&left, &right).is_ok());
+    }
+
+    #[test]
+    fn product_multiset_checks_do_not_carry_input_vectors() {
+        let f1 = vec![1_u64.into(), 2_u64.into()];
+        let f2 = vec![3_u64.into()];
+        let g1 = vec![3_u64.into()];
+        let g2 = vec![2_u64.into(), 1_u64.into()];
+        let mut prover_tr = HashTranscript::new(b"product-mset");
+        let proof =
+            prove_product_multiset_equality(&f1, &f2, &g1, &g2, &mut prover_tr).expect("proof");
+        assert_eq!(proof.f1_len, 2);
+        assert_eq!(proof.f2_len, 1);
+        assert_eq!(proof.g1_len, 1);
+        assert_eq!(proof.g2_len, 2);
+        assert_eq!(proof.left_product, proof.right_product);
+        assert_eq!(
+            proof.left_log_derivative.claimed_sum,
+            proof.right_log_derivative.claimed_sum
+        );
+        assert!(!proof.left_log_derivative.sumcheck.rounds.is_empty());
+
+        let mut verifier_tr = HashTranscript::new(b"product-mset");
+        verify_product_multiset_equality(&f1, &f2, &g1, &g2, &proof, &mut verifier_tr)
+            .expect("verify");
+        assert_eq!(prover_tr.state(), verifier_tr.state());
+
+        let forged_f1 = vec![9_u64.into(), 2_u64.into()];
+        let mut verifier_tr = HashTranscript::new(b"product-mset");
+        assert!(
+            verify_product_multiset_equality(&forged_f1, &f2, &g1, &g2, &proof, &mut verifier_tr)
+                .is_err()
+        );
+
+        let mut bad_product = proof.clone();
+        bad_product.left_product += FieldElement::ONE;
+        let mut verifier_tr = HashTranscript::new(b"product-mset");
+        assert!(
+            verify_product_multiset_equality(&f1, &f2, &g1, &g2, &bad_product, &mut verifier_tr)
+                .is_err()
+        );
+
+        let mut bad_log_derivative = proof.clone();
+        bad_log_derivative.left_log_derivative.sumcheck.rounds[0].eval_at_0 += FieldElement::ONE;
+        let mut verifier_tr = HashTranscript::new(b"product-mset");
+        assert!(
+            verify_product_multiset_equality(
+                &f1,
+                &f2,
+                &g1,
+                &g2,
+                &bad_log_derivative,
+                &mut verifier_tr
+            )
+            .is_err()
+        );
     }
 }

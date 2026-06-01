@@ -1,32 +1,38 @@
 use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Child, Command, Stdio};
+use std::thread;
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
-use pq_core::{FieldElement, R1CS, SparseMatrix};
+use pq_core::{FieldElement, Partition, R1CS, SparseEntry, SparseMatrix};
 use pq_net::{
-    TcpWorkerRuntime, WorkerRuntime, pcs_worker_commit, pcs_worker_open, ping, register,
-    run_worker, spawn_loopback_worker,
+    Message, R1csSparkClaimRequest, Response, TcpWorkerRuntime, WorkerRuntime, message_wire_bytes,
+    pcs_worker_commit, pcs_worker_open, ping, r1cs_spark_worker_claim, register,
+    response_wire_bytes, run_worker, spawn_loopback_worker,
 };
 use pq_pcs::{
-    DistributedBrakedown, DistributedCommitment, DistributedOpening, DistributedPcs,
-    DistributedPcsParams, PcsError, WorkerCommitment, WorkerOpening,
-    communication_bytes as pcs_communication_bytes,
+    CompactDistributedOpening, DistributedBrakedown, DistributedCommitment, DistributedPcs,
+    DistributedPcsParams, PcsError, WorkerOpening, WorkerOpeningRequest,
 };
 use pq_piop_plonkish::{
-    PlonkishInstance, PlonkishPiopError, PlonkishPiopProof, prove_plonkish_with_pcs_hooks,
+    PlonkishInstance, PlonkishPcsOpening, PlonkishPiopError, PlonkishPiopProof,
+    proof_communication_bytes as plonkish_proof_communication_bytes, prove_plonkish_with_pcs_hooks,
     prove_plonkish_with_pcs_params, sample_plonkish_instance, verify_plonkish_with_pcs_params,
 };
 use pq_piop_r1cs::{
-    R1csPiopError, R1csPiopProof, proof_size_bytes as r1cs_proof_size_bytes,
-    prove_r1cs_with_pcs_hooks, prove_r1cs_with_pcs_params, verify_r1cs_with_pcs_params,
+    R1csBatchProverHooks, R1csPcsOpening, R1csPiopError, R1csPiopProof, SparkWorkerClaimRequest,
+    SparkWorkerShardClaim, proof_communication_bytes as r1cs_proof_communication_bytes,
+    proof_size_bytes as r1cs_proof_size_bytes, prove_r1cs_with_pcs_and_spark_batch_hooks,
+    prove_r1cs_with_pcs_params, verify_r1cs_with_pcs_params,
 };
-use pq_transcript::{HashTranscript, Transcript};
+use pq_transcript::{HashTranscript, Transcript, sha256};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Protocol {
@@ -70,6 +76,7 @@ struct Config {
     format: OutputFormat,
     case: CaseSelection,
     pcs_queries: usize,
+    worker_core_plan: Option<WorkerCorePlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,8 +112,158 @@ struct BenchmarkCommand {
     sizes: Vec<usize>,
     workers: Vec<usize>,
     pcs_queries: usize,
+    repeats: usize,
+    paper_preset: bool,
+    runner: BenchmarkRunner,
+    compile_figures: bool,
+    figure_compiler: FigureCompiler,
     out_dir: PathBuf,
+    host_logical_cores: Option<usize>,
+    worker_cores: Option<usize>,
+    worker_core_plan: Option<WorkerCorePlan>,
 }
+
+#[derive(Clone, Debug)]
+struct WorkerCorePlan {
+    host_logical_cores: usize,
+    max_workers: usize,
+    cores_per_worker: usize,
+}
+
+impl WorkerCorePlan {
+    fn core_ids_for_worker(&self, worker_id: usize) -> Vec<usize> {
+        let start = worker_id * self.cores_per_worker;
+        (start..start + self.cores_per_worker).collect()
+    }
+}
+
+fn worker_affinity_mode() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux-taskset"
+    } else if cfg!(target_os = "windows") {
+        "windows-powershell-processor-affinity"
+    } else {
+        "unsupported"
+    }
+}
+
+#[derive(Clone, Debug)]
+struct VerifyResultsCommand {
+    dir: PathBuf,
+    format: OutputFormat,
+    paper_quality: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ResultManifestEntry {
+    path: String,
+    bytes: usize,
+    sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct ResultManifestReport {
+    dir: PathBuf,
+    run_id: u64,
+    files_checked: usize,
+    bytes_checked: usize,
+    source_rows_checked: usize,
+    phase_rows_checked: usize,
+    summary_rows_checked: usize,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BenchmarkRunner {
+    Local,
+    Network,
+    Both,
+}
+
+impl BenchmarkRunner {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Network => "network",
+            Self::Both => "both",
+        }
+    }
+
+    fn variants(self) -> Vec<BenchmarkRunner> {
+        match self {
+            Self::Local => vec![Self::Local],
+            Self::Network => vec![Self::Network],
+            Self::Both => vec![Self::Local, Self::Network],
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum FigureCompiler {
+    Auto,
+    PdfLatex,
+    Tectonic,
+}
+
+impl FigureCompiler {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::PdfLatex => "pdflatex",
+            Self::Tectonic => "tectonic",
+        }
+    }
+}
+
+const BASE_BENCHMARK_ARTIFACTS: &[&str] = &[
+    "metadata.json",
+    RESULT_MANIFEST,
+    OVERVIEW_HTML,
+    "phase_timing.csv",
+    "phase_timing.json",
+    "source.csv",
+    "source.json",
+    "summary_stats.csv",
+    "summary.txt",
+    "prove_time_by_size.svg",
+    "prove_time_by_size.tex",
+    "verify_time_by_size.svg",
+    "verify_time_by_size.tex",
+    "proof_bytes_by_size.svg",
+    "proof_bytes_by_size.tex",
+    "network_bytes_by_size.svg",
+    "network_bytes_by_size.tex",
+    "runner_overhead_by_size.svg",
+    "runner_overhead_by_size.tex",
+    "worker_scaling_max_size.svg",
+    "worker_scaling_max_size.tex",
+    "paper_figures.tex",
+    "paper_figures_standalone.tex",
+];
+
+const COMPILED_PAPER_FIGURE: &str = "paper_figures_standalone.pdf";
+const RESULT_MANIFEST: &str = "result_manifest.json";
+const OVERVIEW_HTML: &str = "overview.html";
+const SOURCE_CSV_HEADER: &str = "protocol,runner,case,trial,workers,nv_power,size,constraints,pcs_queries,prove_ms,verify_ms,proof_bytes,communication_bytes,network_bytes,host_logical_cores,cores_per_worker,core_affinity,verified,failure_reason";
+const PHASE_TIMING_CSV_HEADER: &str =
+    "phase,detail,elapsed_ms,recorded_prove_ms,recorded_verify_ms,inferred_overhead_ms";
+const SUMMARY_STATS_CSV_HEADER: &str = "protocol,runner,case,workers,nv_power,size,constraints,pcs_queries,samples,verified_count,rejected_count,prove_ms_mean,prove_ms_stddev,verify_ms_mean,verify_ms_stddev,proof_bytes_mean,proof_bytes_stddev,communication_bytes_mean,communication_bytes_stddev,network_bytes_mean,network_bytes_stddev,failure_reasons";
+const PAPER_PRESET_NV_START: usize = 2;
+const PAPER_PRESET_NV_END: usize = 6;
+const PAPER_PRESET_WORKERS: &[usize] = &[1, 2, 4];
+const PAPER_PRESET_PCS_QUERIES: usize = 3;
+const BENCHMARK_REPEATS: usize = 1;
+
+const PGFPLOTS_PREAMBLE_COMMENT: &str =
+    "% Generated by pq-experiments from measured benchmark records; no fitted data.\n";
+
+const PGFPLOTS_COLOR_DEFINITIONS: [&str; 6] = [
+    "\\definecolor{pqR1CS}{HTML}{0072B2}",
+    "\\definecolor{pqPlonkish}{HTML}{D55E00}",
+    "\\definecolor{pqGreen}{HTML}{009E73}",
+    "\\definecolor{pqPurple}{HTML}{CC79A7}",
+    "\\definecolor{pqGold}{HTML}{E69F00}",
+    "\\definecolor{pqIdeal}{HTML}{6B7280}",
+];
 
 #[derive(Clone, Debug)]
 enum InteractiveSelection {
@@ -120,7 +277,9 @@ enum InteractiveSelection {
 #[derive(Clone, Debug)]
 struct MetricRecord {
     protocol: &'static str,
+    runner: &'static str,
     case_name: &'static str,
+    trial: usize,
     workers: usize,
     size: usize,
     constraints: usize,
@@ -130,8 +289,47 @@ struct MetricRecord {
     communication_bytes: usize,
     network_bytes: usize,
     pcs_queries: usize,
+    host_logical_cores: Option<usize>,
+    cores_per_worker: Option<usize>,
+    core_affinity: Option<&'static str>,
     verified: bool,
     failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PhaseTimingRecord {
+    phase: String,
+    detail: String,
+    elapsed_ms: f64,
+    recorded_prove_ms: f64,
+    recorded_verify_ms: f64,
+    inferred_overhead_ms: f64,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct MeanStddev {
+    mean: f64,
+    stddev: f64,
+}
+
+#[derive(Clone, Debug)]
+struct BenchmarkStatsRecord {
+    protocol: &'static str,
+    runner: &'static str,
+    case_name: &'static str,
+    workers: usize,
+    size: usize,
+    constraints: usize,
+    pcs_queries: usize,
+    samples: usize,
+    verified_count: usize,
+    rejected_count: usize,
+    prove_ms: MeanStddev,
+    verify_ms: MeanStddev,
+    proof_bytes: MeanStddev,
+    communication_bytes: MeanStddev,
+    network_bytes: MeanStddev,
+    failure_reasons: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +375,9 @@ fn run() -> Result<(), CliError> {
     if args.first().map(String::as_str) == Some("benchmark") {
         return run_benchmark_command(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("verify-results") {
+        return run_verify_results_command(&args[1..]);
+    }
 
     let config = parse_args(args)?;
     let records = match config.protocol {
@@ -204,6 +405,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, CliError> {
         format: OutputFormat::Json,
         case: CaseSelection::Both,
         pcs_queries: DistributedPcsParams::DEFAULT_QUERY_COUNT,
+        worker_core_plan: None,
     };
 
     let mut index = 1;
@@ -381,11 +583,26 @@ fn parse_net_demo_command(args: &[String]) -> Result<NetDemoCommand, CliError> {
 }
 
 fn parse_benchmark_command(args: &[String]) -> Result<BenchmarkCommand, CliError> {
+    let paper_preset = args.iter().any(|arg| arg == "--paper-preset");
     let mut command = BenchmarkCommand {
-        sizes: vec![4, 8, 16],
-        workers: vec![1, 2, 4],
-        pcs_queries: 3,
+        sizes: if paper_preset {
+            (PAPER_PRESET_NV_START..=PAPER_PRESET_NV_END)
+                .map(|power| 1_usize << power)
+                .collect()
+        } else {
+            vec![4, 8, 16]
+        },
+        workers: PAPER_PRESET_WORKERS.to_vec(),
+        pcs_queries: PAPER_PRESET_PCS_QUERIES,
+        repeats: BENCHMARK_REPEATS,
+        paper_preset,
+        runner: BenchmarkRunner::Local,
+        compile_figures: false,
+        figure_compiler: FigureCompiler::Auto,
         out_dir: PathBuf::from("results"),
+        host_logical_cores: None,
+        worker_cores: None,
+        worker_core_plan: None,
     };
 
     let mut index = 0;
@@ -412,8 +629,37 @@ fn parse_benchmark_command(args: &[String]) -> Result<BenchmarkCommand, CliError
                     "--pcs-queries",
                 )?;
             }
+            "--repeats" => {
+                command.repeats =
+                    parse_positive_usize(next_value(args, &mut index, "--repeats")?, "--repeats")?;
+            }
+            "--compile-figures" => {
+                command.compile_figures = true;
+            }
+            "--figure-compiler" => {
+                command.figure_compiler =
+                    parse_figure_compiler(next_value(args, &mut index, "--figure-compiler")?)?;
+            }
+            "--paper-preset" => {
+                command.paper_preset = true;
+            }
+            "--runner" => {
+                command.runner = parse_benchmark_runner(next_value(args, &mut index, "--runner")?)?;
+            }
             "--out" => {
                 command.out_dir = PathBuf::from(next_value(args, &mut index, "--out")?);
+            }
+            "--host-cores" => {
+                command.host_logical_cores = Some(parse_positive_usize(
+                    next_value(args, &mut index, "--host-cores")?,
+                    "--host-cores",
+                )?);
+            }
+            "--worker-cores" => {
+                command.worker_cores = Some(parse_positive_usize(
+                    next_value(args, &mut index, "--worker-cores")?,
+                    "--worker-cores",
+                )?);
             }
             "--help" | "-h" => return Err(CliError(usage())),
             other => return Err(CliError(format!("unknown benchmark argument '{other}'"))),
@@ -425,6 +671,64 @@ fn parse_benchmark_command(args: &[String]) -> Result<BenchmarkCommand, CliError
     normalize_unique(&mut command.workers);
     validate_benchmark_command(&command)?;
     Ok(command)
+}
+
+fn configure_benchmark_core_plan(command: &mut BenchmarkCommand) -> Result<(), CliError> {
+    let uses_network_runner = command
+        .runner
+        .variants()
+        .contains(&BenchmarkRunner::Network);
+    if !uses_network_runner {
+        return Ok(());
+    }
+    let max_workers = command
+        .workers
+        .iter()
+        .copied()
+        .max()
+        .ok_or_else(|| CliError("benchmark --workers must not be empty".to_owned()))?;
+    if command.workers.len() <= 1 && command.worker_cores.is_none() {
+        return Ok(());
+    }
+    let host_logical_cores = match command.host_logical_cores {
+        Some(value) => value,
+        None => std::thread::available_parallelism()
+            .map_err(|error| {
+                CliError(format!(
+                    "failed to detect host logical cores for network scaling: {error}"
+                ))
+            })?
+            .get(),
+    };
+    let auto_cores_per_worker = host_logical_cores / max_workers;
+    if auto_cores_per_worker == 0 {
+        return Err(CliError(format!(
+            "host has {host_logical_cores} logical cores but max workers is {max_workers}; cannot assign at least one core per worker"
+        )));
+    }
+    let cores_per_worker = command.worker_cores.unwrap_or(auto_cores_per_worker);
+    if cores_per_worker * max_workers > host_logical_cores {
+        return Err(CliError(format!(
+            "worker core allocation is impossible: host_logical_cores={host_logical_cores}, max_workers={max_workers}, cores_per_worker={cores_per_worker}"
+        )));
+    }
+    command.worker_core_plan = Some(WorkerCorePlan {
+        host_logical_cores,
+        max_workers,
+        cores_per_worker,
+    });
+    Ok(())
+}
+
+fn parse_benchmark_runner(value: &str) -> Result<BenchmarkRunner, CliError> {
+    match value {
+        "local" => Ok(BenchmarkRunner::Local),
+        "network" => Ok(BenchmarkRunner::Network),
+        "both" => Ok(BenchmarkRunner::Both),
+        other => Err(CliError(format!(
+            "unsupported --runner '{other}', expected local, network, or both"
+        ))),
+    }
 }
 
 fn validate_benchmark_command(command: &BenchmarkCommand) -> Result<(), CliError> {
@@ -457,7 +761,53 @@ fn validate_benchmark_command(command: &BenchmarkCommand) -> Result<(), CliError
             ));
         }
     }
+    if !command.workers.contains(&1) {
+        return Err(CliError(
+            "benchmark workers must include 1 for the non-distributed baseline".to_owned(),
+        ));
+    }
+    if command.repeats != BENCHMARK_REPEATS {
+        return Err(CliError(
+            "performance benchmark runs one end-to-end prove+verify per circuit; --repeats must be 1"
+                .to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn parse_verify_results_command(args: &[String]) -> Result<VerifyResultsCommand, CliError> {
+    let mut dir = None;
+    let mut format = OutputFormat::Json;
+    let mut paper_quality = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dir" => {
+                dir = Some(PathBuf::from(next_value(args, &mut index, "--dir")?));
+            }
+            "--format" => {
+                format = parse_format(next_value(args, &mut index, "--format")?)?;
+            }
+            "--paper-quality" => {
+                paper_quality = true;
+            }
+            "--help" | "-h" => return Err(CliError(usage())),
+            value if !value.starts_with('-') && dir.is_none() => {
+                dir = Some(PathBuf::from(value));
+            }
+            other => {
+                return Err(CliError(format!(
+                    "unknown verify-results argument '{other}'"
+                )));
+            }
+        }
+        index += 1;
+    }
+    Ok(VerifyResultsCommand {
+        dir: dir.ok_or_else(|| CliError("verify-results requires --dir <bench-dir>".to_owned()))?,
+        format,
+        paper_quality,
+    })
 }
 
 fn run_interactive_command() -> Result<(), CliError> {
@@ -484,69 +834,1728 @@ fn run_interactive_command() -> Result<(), CliError> {
 }
 
 fn run_benchmark_command(args: &[String]) -> Result<(), CliError> {
-    let command = parse_benchmark_command(args)?;
-    let run_dir = command
-        .out_dir
-        .join(format!("bench-{}", unix_timestamp_seconds()?));
-    fs::create_dir_all(&run_dir)
-        .map_err(|error| CliError(format!("create benchmark dir failed: {error}")))?;
+    let total_start = Instant::now();
+    let setup_start = Instant::now();
+    let mut command = parse_benchmark_command(args)?;
+    configure_benchmark_core_plan(&mut command)?;
+    let (run_id, run_dir) = create_benchmark_run_dir(&command.out_dir)?;
 
     let mut records = Vec::new();
-    let total_jobs =
-        [Protocol::R1cs, Protocol::Plonkish].len() * command.sizes.len() * command.workers.len();
+    let mut phase_timings = Vec::new();
+    let mut network_pools = BenchmarkNetworkPools::new();
+    push_phase_timing(
+        &mut phase_timings,
+        "setup",
+        "parse arguments, derive core plan, create output directory",
+        setup_start.elapsed(),
+        0.0,
+        0.0,
+    );
+    let runner_variants = command.runner.variants();
+    let total_jobs = benchmark_total_jobs(&command, runner_variants.len());
     let mut job_index = 0_usize;
     eprintln!("[benchmark] output directory: {}", run_dir.display());
-    for protocol in [Protocol::R1cs, Protocol::Plonkish] {
-        for size in &command.sizes {
-            for workers in &command.workers {
-                job_index += 1;
-                eprintln!(
-                    "[benchmark {job_index}/{total_jobs}] protocol={} n={} nv={} workers={} pcs_queries={}",
-                    protocol.as_str(),
-                    nv_power(*size),
-                    size,
-                    workers,
-                    command.pcs_queries
-                );
-                let config = Config {
-                    protocol,
-                    workers: *workers,
-                    size: *size,
-                    format: OutputFormat::Json,
-                    case: CaseSelection::Both,
-                    pcs_queries: command.pcs_queries,
-                };
-                let mut run_records = match protocol {
-                    Protocol::R1cs => run_r1cs(&config)?,
-                    Protocol::Plonkish => run_plonkish(&config)?,
-                };
-                let positives = run_records
-                    .iter()
-                    .filter(|record| record.case_name == "positive" && record.verified)
-                    .count();
-                let negatives = run_records
-                    .iter()
-                    .filter(|record| record.case_name == "negative" && !record.verified)
-                    .count();
-                eprintln!(
-                    "[benchmark {job_index}/{total_jobs}] done: positive_verified={positives} negative_rejected={negatives}"
-                );
-                records.append(&mut run_records);
+    for runner in &runner_variants {
+        for protocol in [Protocol::R1cs, Protocol::Plonkish] {
+            for size in &command.sizes {
+                for workers in &command.workers {
+                    for trial in 1..=command.repeats {
+                        job_index += 1;
+                        eprintln!(
+                            "[benchmark job {job_index}/{total_jobs}] {} start runner={} protocol={} n={} nv={} workers={} pcs_queries={} trial={}/{}",
+                            benchmark_progress(job_index - 1, total_jobs),
+                            runner.as_str(),
+                            protocol.as_str(),
+                            nv_power(*size),
+                            size,
+                            workers,
+                            command.pcs_queries,
+                            trial,
+                            command.repeats
+                        );
+                        let config = Config {
+                            protocol,
+                            workers: *workers,
+                            size: *size,
+                            format: OutputFormat::Json,
+                            case: CaseSelection::Positive,
+                            pcs_queries: command.pcs_queries,
+                            worker_core_plan: command.worker_core_plan.clone(),
+                        };
+                        let network_addrs = if *runner == BenchmarkRunner::Network {
+                            match network_pools.addrs_for(
+                                config.workers,
+                                &config.worker_core_plan,
+                                &mut phase_timings,
+                            ) {
+                                Ok(addrs) => Some(addrs),
+                                Err(error) => {
+                                    let _ = network_pools.shutdown_all(&mut phase_timings);
+                                    return Err(error);
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let job_start = Instant::now();
+                        let run_result = match runner {
+                            BenchmarkRunner::Local => match protocol {
+                                Protocol::R1cs => run_r1cs(&config),
+                                Protocol::Plonkish => run_plonkish(&config),
+                            },
+                            BenchmarkRunner::Network => match protocol {
+                                Protocol::R1cs => run_r1cs_network(
+                                    &config,
+                                    network_addrs.as_ref().expect("network addrs prepared"),
+                                ),
+                                Protocol::Plonkish => run_plonkish_network(
+                                    &config,
+                                    network_addrs.as_ref().expect("network addrs prepared"),
+                                ),
+                            },
+                            BenchmarkRunner::Both => unreachable!("expanded before benchmark loop"),
+                        };
+                        let mut run_records = match run_result {
+                            Ok(records) => records,
+                            Err(error) => {
+                                let _ = network_pools.shutdown_all(&mut phase_timings);
+                                return Err(error);
+                            }
+                        };
+                        let recorded_prove_ms =
+                            run_records.iter().map(|record| record.prove_ms).sum();
+                        let recorded_verify_ms =
+                            run_records.iter().map(|record| record.verify_ms).sum();
+                        push_phase_timing(
+                            &mut phase_timings,
+                            "job",
+                            format!(
+                                "runner={} protocol={} n={} nv={} workers={} pcs_queries={} trial={}/{}",
+                                runner.as_str(),
+                                protocol.as_str(),
+                                nv_power(*size),
+                                size,
+                                workers,
+                                command.pcs_queries,
+                                trial,
+                                command.repeats
+                            ),
+                            job_start.elapsed(),
+                            recorded_prove_ms,
+                            recorded_verify_ms,
+                        );
+                        for record in &mut run_records {
+                            record.trial = trial;
+                        }
+                        let positives = run_records
+                            .iter()
+                            .filter(|record| record.case_name == "positive" && record.verified)
+                            .count();
+                        validate_benchmark_job_records(
+                            protocol,
+                            *size,
+                            *workers,
+                            trial,
+                            &run_records,
+                        )?;
+                        eprintln!(
+                            "[benchmark job {job_index}/{total_jobs}] {} done positive_verified={positives}",
+                            benchmark_progress(job_index, total_jobs)
+                        );
+                        records.append(&mut run_records);
+                    }
+                }
             }
         }
     }
 
-    eprintln!("[benchmark] writing source data and SVG charts");
+    network_pools.shutdown_all(&mut phase_timings)?;
+    eprintln!("[benchmark] writing source data, SVG charts, and PGFPlots figures");
+    let artifact_start = Instant::now();
     write_text_file(&run_dir.join("source.csv"), &records_to_csv(&records))?;
     write_text_file(&run_dir.join("source.json"), &records_to_json(&records))?;
     write_text_file(
-        &run_dir.join("summary.txt"),
-        &benchmark_summary(&command, &records),
+        &run_dir.join("summary_stats.csv"),
+        &summary_stats_to_csv(&benchmark_stats(&records)),
     )?;
     write_benchmark_charts(&run_dir, &records)?;
+    push_phase_timing(
+        &mut phase_timings,
+        "source_and_chart_artifacts",
+        "write measured source data, aggregate CSV, SVG charts, and PGFPlots/TikZ figures",
+        artifact_start.elapsed(),
+        0.0,
+        0.0,
+    );
+    let mut figure_pdf_created = false;
+    if command.compile_figures {
+        eprintln!("[benchmark] compiling paper_figures_standalone.tex");
+        let figure_compile_start = Instant::now();
+        if let Err(error) = compile_paper_figures(&run_dir, command.figure_compiler) {
+            push_phase_timing(
+                &mut phase_timings,
+                "figure_compile_failed",
+                format!(
+                    "compile paper_figures_standalone.tex with {}",
+                    command.figure_compiler.as_str()
+                ),
+                figure_compile_start.elapsed(),
+                0.0,
+                0.0,
+            );
+            push_phase_timing(
+                &mut phase_timings,
+                "total_before_error",
+                "binary wall clock before returning figure compilation error",
+                total_start.elapsed(),
+                sum_record_prove_ms(&records),
+                sum_record_verify_ms(&records),
+            );
+            let provenance = BenchmarkProvenance::capture();
+            write_phase_timing_files(&run_dir, &phase_timings)?;
+            write_text_file(
+                &run_dir.join("summary.txt"),
+                &benchmark_summary(&command, &records, &phase_timings, false, &provenance),
+            )?;
+            write_benchmark_overview_html(&run_dir, run_id, &command, &records, false)?;
+            write_benchmark_metadata_and_manifest(
+                &run_dir,
+                run_id,
+                &command,
+                &records,
+                false,
+                &provenance,
+            )?;
+            let report = verify_benchmark_result_dir(&run_dir)?;
+            eprintln!(
+                "[benchmark] manifest verified: files={} bytes={}",
+                report.files_checked, report.bytes_checked
+            );
+            return Err(error);
+        }
+        push_phase_timing(
+            &mut phase_timings,
+            "figure_compile",
+            format!(
+                "compile paper_figures_standalone.tex with {}",
+                command.figure_compiler.as_str()
+            ),
+            figure_compile_start.elapsed(),
+            0.0,
+            0.0,
+        );
+        figure_pdf_created = true;
+    }
+    let final_output_start = Instant::now();
+    let provenance = BenchmarkProvenance::capture();
+    write_phase_timing_files(&run_dir, &phase_timings)?;
+    write_text_file(
+        &run_dir.join("summary.txt"),
+        &benchmark_summary(
+            &command,
+            &records,
+            &phase_timings,
+            figure_pdf_created,
+            &provenance,
+        ),
+    )?;
+    write_benchmark_overview_html(&run_dir, run_id, &command, &records, figure_pdf_created)?;
+    write_benchmark_metadata_and_manifest(
+        &run_dir,
+        run_id,
+        &command,
+        &records,
+        figure_pdf_created,
+        &provenance,
+    )?;
+    push_phase_timing(
+        &mut phase_timings,
+        "final_result_artifacts",
+        "first pass write of phase timing, summary, overview, metadata, and manifest; total phase includes final rewrite and manifest verification",
+        final_output_start.elapsed(),
+        0.0,
+        0.0,
+    );
+    push_phase_timing(
+        &mut phase_timings,
+        "total",
+        "binary wall clock through first manifest verification",
+        total_start.elapsed(),
+        sum_record_prove_ms(&records),
+        sum_record_verify_ms(&records),
+    );
+    write_phase_timing_files(&run_dir, &phase_timings)?;
+    write_text_file(
+        &run_dir.join("summary.txt"),
+        &benchmark_summary(
+            &command,
+            &records,
+            &phase_timings,
+            figure_pdf_created,
+            &provenance,
+        ),
+    )?;
+    write_benchmark_overview_html(&run_dir, run_id, &command, &records, figure_pdf_created)?;
+    write_benchmark_metadata_and_manifest(
+        &run_dir,
+        run_id,
+        &command,
+        &records,
+        figure_pdf_created,
+        &provenance,
+    )?;
+    let report = verify_benchmark_result_dir(&run_dir)?;
+    eprintln!(
+        "[benchmark] manifest verified: files={} bytes={}",
+        report.files_checked, report.bytes_checked
+    );
     eprintln!("[benchmark] complete");
     println!("{}", run_dir.display());
     Ok(())
+}
+
+fn benchmark_total_jobs(command: &BenchmarkCommand, runner_variant_count: usize) -> usize {
+    [Protocol::R1cs, Protocol::Plonkish].len()
+        * runner_variant_count
+        * command.sizes.len()
+        * command.workers.len()
+        * command.repeats
+}
+
+fn benchmark_progress(completed_jobs: usize, total_jobs: usize) -> String {
+    const WIDTH: usize = 24;
+    if total_jobs == 0 {
+        return "progress 0/0 100.0% [########################]".to_owned();
+    }
+    let completed = completed_jobs.min(total_jobs);
+    let filled = (completed * WIDTH + total_jobs / 2) / total_jobs;
+    let empty = WIDTH.saturating_sub(filled);
+    let percent = (completed as f64 * 100.0) / total_jobs as f64;
+    format!(
+        "progress {completed}/{total_jobs} {percent:5.1}% [{}{}]",
+        "#".repeat(filled),
+        "-".repeat(empty)
+    )
+}
+
+fn validate_benchmark_job_records(
+    protocol: Protocol,
+    size: usize,
+    workers: usize,
+    trial: usize,
+    records: &[MetricRecord],
+) -> Result<(), CliError> {
+    let positive_count = records
+        .iter()
+        .filter(|record| record.case_name == "positive")
+        .count();
+    let negative_count = records
+        .iter()
+        .filter(|record| record.case_name == "negative")
+        .count();
+    let positive_verified = records
+        .iter()
+        .filter(|record| record.case_name == "positive" && record.verified)
+        .count();
+    let negative_rejected = records
+        .iter()
+        .filter(|record| record.case_name == "negative" && !record.verified)
+        .count();
+
+    if positive_count == 1
+        && positive_verified == 1
+        && negative_count == 0
+        && negative_rejected == 0
+    {
+        return Ok(());
+    }
+
+    let details = records
+        .iter()
+        .map(|record| {
+            format!(
+                "{}:verified={} failure={}",
+                record.case_name,
+                record.verified,
+                record.failure_reason.as_deref().unwrap_or("<none>")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(CliError(format!(
+        "benchmark verification expectation failed for protocol={} n={} nv={} workers={} trial={}: expected exactly one verified positive performance record and no negative correctness records; got positives={} positive_verified={} negatives={} negative_rejected={}; records=[{}]",
+        protocol.as_str(),
+        nv_power(size),
+        size,
+        workers,
+        trial,
+        positive_count,
+        positive_verified,
+        negative_count,
+        negative_rejected,
+        details
+    )))
+}
+
+fn run_verify_results_command(args: &[String]) -> Result<(), CliError> {
+    let command = parse_verify_results_command(args)?;
+    let report = verify_benchmark_result_dir(&command.dir)?;
+    if command.paper_quality {
+        verify_benchmark_paper_quality(&command.dir)?;
+    }
+    match command.format {
+        OutputFormat::Json => {
+            println!(
+                "{{\"ok\":true,\"dir\":\"{}\",\"run_id\":{},\"files_checked\":{},\"bytes_checked\":{},\"source_rows_checked\":{},\"phase_rows_checked\":{},\"summary_rows_checked\":{},\"paper_quality_checked\":{}}}",
+                json_escape(&report.dir.display().to_string()),
+                report.run_id,
+                report.files_checked,
+                report.bytes_checked,
+                report.source_rows_checked,
+                report.phase_rows_checked,
+                report.summary_rows_checked,
+                command.paper_quality
+            );
+        }
+        OutputFormat::Csv => {
+            println!(
+                "ok,dir,run_id,files_checked,bytes_checked,source_rows_checked,phase_rows_checked,summary_rows_checked,paper_quality_checked"
+            );
+            println!(
+                "true,{},{},{},{},{},{},{},{}",
+                csv_escape(&report.dir.display().to_string()),
+                report.run_id,
+                report.files_checked,
+                report.bytes_checked,
+                report.source_rows_checked,
+                report.phase_rows_checked,
+                report.summary_rows_checked,
+                command.paper_quality
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_benchmark_result_dir(dir: &Path) -> Result<ResultManifestReport, CliError> {
+    let mut report = verify_benchmark_result_manifest(dir)?;
+    let semantic_report = verify_benchmark_result_semantics(dir, report.run_id)?;
+    report.source_rows_checked = semantic_report.source_rows_checked;
+    report.phase_rows_checked = semantic_report.phase_rows_checked;
+    report.summary_rows_checked = semantic_report.summary_rows_checked;
+    Ok(report)
+}
+
+fn verify_benchmark_result_manifest(dir: &Path) -> Result<ResultManifestReport, CliError> {
+    let manifest_path = dir.join(RESULT_MANIFEST);
+    let manifest = fs::read_to_string(&manifest_path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", manifest_path.display())))?;
+    if !manifest.contains("\"schema_version\": 1") {
+        return Err(CliError(format!(
+            "{} is not a schema_version=1 result manifest",
+            manifest_path.display()
+        )));
+    }
+    if !manifest.contains("\"self_artifact\": \"result_manifest.json\"") {
+        return Err(CliError(format!(
+            "{} does not declare its self artifact",
+            manifest_path.display()
+        )));
+    }
+    let run_id = parse_json_u64_field(&manifest, "run_id")?;
+    let expected_artifact_count = parse_json_usize_field(&manifest, "artifact_count")?;
+    let entries = parse_manifest_entries(&manifest)?;
+    if entries.len() != expected_artifact_count {
+        return Err(CliError(format!(
+            "manifest artifact_count mismatch: expected {}, parsed {}",
+            expected_artifact_count,
+            entries.len()
+        )));
+    }
+    if entries.iter().any(|entry| entry.path == RESULT_MANIFEST) {
+        return Err(CliError(
+            "manifest must not recursively list result_manifest.json".to_owned(),
+        ));
+    }
+    let mut expected_files = BTreeSet::new();
+    expected_files.insert(RESULT_MANIFEST.to_owned());
+    for entry in &entries {
+        if !expected_files.insert(entry.path.clone()) {
+            return Err(CliError(format!(
+                "manifest lists duplicate artifact '{}'",
+                entry.path
+            )));
+        }
+    }
+    let actual_files = benchmark_result_dir_entries(dir)?;
+    if let Some(actual) = actual_files.difference(&expected_files).next() {
+        return Err(CliError(format!(
+            "unexpected artifact '{}' in {}; rerun benchmark into a fresh result directory",
+            actual,
+            dir.display()
+        )));
+    }
+    if let Some(expected) = expected_files.difference(&actual_files).next() {
+        return Err(CliError(format!(
+            "missing manifest-listed artifact '{}' in {}",
+            expected,
+            dir.display()
+        )));
+    }
+    let mut bytes_checked = 0_usize;
+    for entry in &entries {
+        let artifact_path = dir.join(&entry.path);
+        let bytes = fs::read(&artifact_path).map_err(|error| {
+            CliError(format!("read {} failed: {error}", artifact_path.display()))
+        })?;
+        let digest = hex_digest(sha256(&bytes));
+        if bytes.len() != entry.bytes {
+            return Err(CliError(format!(
+                "{} byte-size mismatch: manifest={} actual={}",
+                artifact_path.display(),
+                entry.bytes,
+                bytes.len()
+            )));
+        }
+        if digest != entry.sha256 {
+            return Err(CliError(format!(
+                "{} sha256 mismatch: manifest={} actual={}",
+                artifact_path.display(),
+                entry.sha256,
+                digest
+            )));
+        }
+        bytes_checked += bytes.len();
+    }
+    Ok(ResultManifestReport {
+        dir: dir.to_path_buf(),
+        run_id,
+        files_checked: entries.len(),
+        bytes_checked,
+        source_rows_checked: 0,
+        phase_rows_checked: 0,
+        summary_rows_checked: 0,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct ResultSemanticReport {
+    source_rows_checked: usize,
+    phase_rows_checked: usize,
+    summary_rows_checked: usize,
+}
+
+fn verify_benchmark_result_semantics(
+    dir: &Path,
+    manifest_run_id: u64,
+) -> Result<ResultSemanticReport, CliError> {
+    let metadata_path = dir.join("metadata.json");
+    let metadata = fs::read_to_string(&metadata_path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", metadata_path.display())))?;
+    if parse_json_usize_field(&metadata, "schema_version")? != 7 {
+        return Err(CliError(format!(
+            "{} is not a schema_version=7 benchmark metadata file",
+            metadata_path.display()
+        )));
+    }
+    let metadata_run_id = parse_json_u64_field(&metadata, "run_id")?;
+    if metadata_run_id != manifest_run_id {
+        return Err(CliError(format!(
+            "metadata run_id {metadata_run_id} does not match manifest run_id {manifest_run_id}"
+        )));
+    }
+
+    let nv_powers = parse_json_usize_array_field(&metadata, "nv_powers")?;
+    let sizes = parse_json_usize_array_field(&metadata, "sizes")?;
+    let workers = parse_json_usize_array_field(&metadata, "workers")?;
+    let pcs_queries = parse_json_usize_field(&metadata, "pcs_queries")?;
+    let repeats = parse_json_usize_field(&metadata, "repeats")?;
+    if repeats != BENCHMARK_REPEATS {
+        return Err(CliError(format!(
+            "benchmark metadata repeats must be {BENCHMARK_REPEATS}, got {repeats}"
+        )));
+    }
+    if nv_powers.len() != sizes.len() {
+        return Err(CliError(format!(
+            "metadata nv_powers length {} does not match sizes length {}",
+            nv_powers.len(),
+            sizes.len()
+        )));
+    }
+    for (nv_power, size) in nv_powers.iter().zip(&sizes) {
+        if *size != (1_usize << *nv_power) {
+            return Err(CliError(format!(
+                "metadata size {size} does not equal 2^{nv_power}"
+            )));
+        }
+    }
+
+    let runner = parse_benchmark_runner(&parse_json_pretty_string_field(&metadata, "runner")?)?;
+    let runner_names = runner
+        .variants()
+        .into_iter()
+        .map(BenchmarkRunner::as_str)
+        .collect::<Vec<_>>();
+    let expected_record_count = nv_powers.len() * workers.len() * runner_names.len() * 2 * repeats;
+    let record_count = parse_json_usize_field(&metadata, "record_count")?;
+    if record_count != expected_record_count {
+        return Err(CliError(format!(
+            "metadata record_count {record_count} does not match expected performance grid {expected_record_count}"
+        )));
+    }
+    require_metadata_usize(&metadata, "positive_verified", expected_record_count)?;
+    require_metadata_usize(&metadata, "negative_rejected", 0)?;
+
+    let grid = BenchmarkGrid {
+        runner_names: &runner_names,
+        nv_powers: &nv_powers,
+        sizes: &sizes,
+        workers: &workers,
+        pcs_queries,
+        repeats,
+    };
+
+    let source_rows_checked =
+        verify_benchmark_source_csv_semantics(dir, &grid, expected_record_count)?;
+    verify_source_json_count(dir, expected_record_count)?;
+    let summary_rows_checked =
+        verify_summary_stats_csv_semantics(dir, &grid, expected_record_count)?;
+    let phase_rows_checked = verify_phase_timing_csv_semantics(dir, expected_record_count)?;
+    verify_overview_artifact_links(dir)?;
+    verify_benchmark_render_artifacts(dir)?;
+
+    Ok(ResultSemanticReport {
+        source_rows_checked,
+        phase_rows_checked,
+        summary_rows_checked,
+    })
+}
+
+struct BenchmarkGrid<'a> {
+    runner_names: &'a [&'static str],
+    nv_powers: &'a [usize],
+    sizes: &'a [usize],
+    workers: &'a [usize],
+    pcs_queries: usize,
+    repeats: usize,
+}
+
+fn verify_benchmark_source_csv_semantics(
+    dir: &Path,
+    grid: &BenchmarkGrid<'_>,
+    expected_records: usize,
+) -> Result<usize, CliError> {
+    let source_path = dir.join("source.csv");
+    let source = fs::read_to_string(&source_path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", source_path.display())))?;
+    let mut lines = source.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| CliError("source.csv is empty".to_owned()))?;
+    if header != SOURCE_CSV_HEADER {
+        return Err(CliError(format!(
+            "source.csv header mismatch: expected '{SOURCE_CSV_HEADER}', got '{header}'"
+        )));
+    }
+
+    let mut expected = BTreeSet::new();
+    for runner in grid.runner_names {
+        for protocol in ["r1cs", "plonkish"] {
+            for nv_power in grid.nv_powers {
+                for worker in grid.workers {
+                    for trial in 1..=grid.repeats {
+                        expected.insert((
+                            (*runner).to_owned(),
+                            protocol.to_owned(),
+                            *nv_power,
+                            *worker,
+                            trial,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut actual = BTreeSet::new();
+    let mut rows = 0_usize;
+    for (line_index, line) in lines.enumerate() {
+        let fields = split_csv_line(line).map_err(|error| {
+            CliError(format!(
+                "source.csv row {} could not be parsed: {}",
+                line_index + 2,
+                error.0
+            ))
+        })?;
+        verify_source_csv_row(&fields, line_index + 2, grid, &mut actual, "source.csv")?;
+        rows += 1;
+    }
+
+    if rows != expected_records {
+        return Err(CliError(format!(
+            "source.csv expected {expected_records} rows, got {rows}"
+        )));
+    }
+    if actual != expected {
+        if let Some(missing) = expected.difference(&actual).next() {
+            return Err(CliError(format!(
+                "source.csv missing runner={} protocol={} n={} workers={} trial={}",
+                missing.0, missing.1, missing.2, missing.3, missing.4
+            )));
+        }
+        if let Some(extra) = actual.difference(&expected).next() {
+            return Err(CliError(format!(
+                "source.csv has unexpected runner={} protocol={} n={} workers={} trial={}",
+                extra.0, extra.1, extra.2, extra.3, extra.4
+            )));
+        }
+    }
+    Ok(rows)
+}
+
+fn verify_source_csv_row(
+    fields: &[String],
+    row: usize,
+    grid: &BenchmarkGrid<'_>,
+    actual: &mut BTreeSet<(String, String, usize, usize, usize)>,
+    context: &str,
+) -> Result<(), CliError> {
+    if fields.len() != 19 {
+        return Err(CliError(format!(
+            "{context} row {row} has {} fields, expected 19",
+            fields.len()
+        )));
+    }
+    let protocol = fields[0].as_str();
+    let runner = fields[1].as_str();
+    let case = fields[2].as_str();
+    let trial = parse_csv_usize_context(&fields[3], "trial", row, context)?;
+    let row_workers = parse_csv_usize_context(&fields[4], "workers", row, context)?;
+    let nv_power = parse_csv_usize_context(&fields[5], "nv_power", row, context)?;
+    let size = parse_csv_usize_context(&fields[6], "size", row, context)?;
+    let constraints = parse_csv_usize_context(&fields[7], "constraints", row, context)?;
+    let row_pcs_queries = parse_csv_usize_context(&fields[8], "pcs_queries", row, context)?;
+    let prove_ms = parse_csv_f64_context(&fields[9], "prove_ms", row, context)?;
+    let verify_ms = parse_csv_f64_context(&fields[10], "verify_ms", row, context)?;
+    let proof_bytes = parse_csv_usize_context(&fields[11], "proof_bytes", row, context)?;
+    let communication_bytes =
+        parse_csv_usize_context(&fields[12], "communication_bytes", row, context)?;
+    let network_bytes = parse_csv_usize_context(&fields[13], "network_bytes", row, context)?;
+    let host_logical_cores = fields[14].as_str();
+    let cores_per_worker = fields[15].as_str();
+    let core_affinity = fields[16].as_str();
+    let verified = fields[17].as_str();
+    let failure_reason = fields[18].as_str();
+
+    if !["r1cs", "plonkish"].contains(&protocol) {
+        return Err(CliError(format!(
+            "{context} row {row} has unsupported protocol '{protocol}'"
+        )));
+    }
+    if !grid.runner_names.contains(&runner) {
+        return Err(CliError(format!(
+            "{context} row {row} has runner '{runner}' outside metadata runner set {:?}",
+            grid.runner_names
+        )));
+    }
+    if case != "positive" || verified != "true" || !failure_reason.is_empty() {
+        return Err(CliError(format!(
+            "{context} row {row} must be a verified positive performance run with empty failure_reason"
+        )));
+    }
+    if trial == 0 || trial > grid.repeats {
+        return Err(CliError(format!(
+            "{context} row {row} trial {trial} is outside 1..={}",
+            grid.repeats
+        )));
+    }
+    if !grid.workers.contains(&row_workers) {
+        return Err(CliError(format!(
+            "{context} row {row} workers {row_workers} is not listed in metadata"
+        )));
+    }
+    if !grid.nv_powers.contains(&nv_power) || !grid.sizes.contains(&size) {
+        return Err(CliError(format!(
+            "{context} row {row} n/size pair {nv_power}/{size} is not listed in metadata"
+        )));
+    }
+    if size != (1_usize << nv_power) {
+        return Err(CliError(format!(
+            "{context} row {row} size {size} does not equal 2^{nv_power}"
+        )));
+    }
+    if constraints == 0 || proof_bytes == 0 || communication_bytes == 0 {
+        return Err(CliError(format!(
+            "{context} row {row} has zero constraints, proof bytes, or communication bytes"
+        )));
+    }
+    if row_pcs_queries != grid.pcs_queries {
+        return Err(CliError(format!(
+            "{context} row {row} pcs_queries expected {}, got {row_pcs_queries}",
+            grid.pcs_queries
+        )));
+    }
+    if !prove_ms.is_finite() || !verify_ms.is_finite() || prove_ms <= 0.0 || verify_ms <= 0.0 {
+        return Err(CliError(format!(
+            "{context} row {row} has non-positive or non-finite timing"
+        )));
+    }
+    match runner {
+        "local"
+            if network_bytes != 0
+                || !host_logical_cores.is_empty()
+                || !cores_per_worker.is_empty()
+                || !core_affinity.is_empty() =>
+        {
+            return Err(CliError(format!(
+                "{context} row {row} local runner must have zero network bytes and empty affinity fields"
+            )));
+        }
+        "network"
+            if network_bytes == 0
+                || host_logical_cores.is_empty()
+                || cores_per_worker.is_empty()
+                || core_affinity.is_empty() =>
+        {
+            return Err(CliError(format!(
+                "{context} row {row} network runner must record network bytes and affinity fields"
+            )));
+        }
+        _ => {}
+    }
+    if !actual.insert((
+        runner.to_owned(),
+        protocol.to_owned(),
+        nv_power,
+        row_workers,
+        trial,
+    )) {
+        return Err(CliError(format!(
+            "{context} duplicates runner={runner} protocol={protocol} n={nv_power} workers={row_workers} trial={trial}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_source_json_count(dir: &Path, expected_records: usize) -> Result<(), CliError> {
+    let source_path = dir.join("source.json");
+    let source = fs::read_to_string(&source_path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", source_path.display())))?;
+    let rows = source.matches("\"protocol\"").count();
+    if rows != expected_records {
+        return Err(CliError(format!(
+            "source.json expected {expected_records} protocol records, got {rows}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_summary_stats_csv_semantics(
+    dir: &Path,
+    grid: &BenchmarkGrid<'_>,
+    expected_records: usize,
+) -> Result<usize, CliError> {
+    let summary_path = dir.join("summary_stats.csv");
+    let summary = fs::read_to_string(&summary_path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", summary_path.display())))?;
+    let mut lines = summary.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| CliError("summary_stats.csv is empty".to_owned()))?;
+    if header != SUMMARY_STATS_CSV_HEADER {
+        return Err(CliError(format!(
+            "summary_stats.csv header mismatch: expected '{SUMMARY_STATS_CSV_HEADER}', got '{header}'"
+        )));
+    }
+    let mut rows = 0_usize;
+    let mut actual = BTreeSet::new();
+    for (line_index, line) in lines.enumerate() {
+        let fields = split_csv_line(line).map_err(|error| {
+            CliError(format!(
+                "summary_stats.csv row {} could not be parsed: {}",
+                line_index + 2,
+                error.0
+            ))
+        })?;
+        if fields.len() != 22 {
+            return Err(CliError(format!(
+                "summary_stats.csv row {} has {} fields, expected 22",
+                line_index + 2,
+                fields.len()
+            )));
+        }
+        let protocol = fields[0].as_str();
+        let runner = fields[1].as_str();
+        let case = fields[2].as_str();
+        let row_workers =
+            parse_csv_usize_context(&fields[3], "workers", line_index + 2, "summary_stats.csv")?;
+        let nv_power =
+            parse_csv_usize_context(&fields[4], "nv_power", line_index + 2, "summary_stats.csv")?;
+        let size =
+            parse_csv_usize_context(&fields[5], "size", line_index + 2, "summary_stats.csv")?;
+        let row_pcs_queries = parse_csv_usize_context(
+            &fields[7],
+            "pcs_queries",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let samples =
+            parse_csv_usize_context(&fields[8], "samples", line_index + 2, "summary_stats.csv")?;
+        let verified_count = parse_csv_usize_context(
+            &fields[9],
+            "verified_count",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let rejected_count = parse_csv_usize_context(
+            &fields[10],
+            "rejected_count",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let prove_ms = parse_csv_f64_context(
+            &fields[11],
+            "prove_ms_mean",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let verify_ms = parse_csv_f64_context(
+            &fields[13],
+            "verify_ms_mean",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        if !["r1cs", "plonkish"].contains(&protocol)
+            || !grid.runner_names.contains(&runner)
+            || case != "positive"
+            || !grid.workers.contains(&row_workers)
+            || !grid.nv_powers.contains(&nv_power)
+            || !grid.sizes.contains(&size)
+            || size != (1_usize << nv_power)
+            || row_pcs_queries != grid.pcs_queries
+            || samples != grid.repeats
+            || verified_count != grid.repeats
+            || rejected_count != 0
+            || prove_ms <= 0.0
+            || verify_ms <= 0.0
+        {
+            return Err(CliError(format!(
+                "summary_stats.csv row {} is inconsistent with metadata/source performance grid",
+                line_index + 2
+            )));
+        }
+        if !actual.insert((
+            runner.to_owned(),
+            protocol.to_owned(),
+            nv_power,
+            row_workers,
+            samples,
+        )) {
+            return Err(CliError(format!(
+                "summary_stats.csv duplicates runner={runner} protocol={protocol} n={nv_power} workers={row_workers}"
+            )));
+        }
+        rows += 1;
+    }
+    if rows != expected_records {
+        return Err(CliError(format!(
+            "summary_stats.csv expected {expected_records} rows, got {rows}"
+        )));
+    }
+    Ok(rows)
+}
+
+fn verify_phase_timing_csv_semantics(dir: &Path, expected_jobs: usize) -> Result<usize, CliError> {
+    let phase_path = dir.join("phase_timing.csv");
+    let phase = fs::read_to_string(&phase_path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", phase_path.display())))?;
+    let mut lines = phase.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| CliError("phase_timing.csv is empty".to_owned()))?;
+    if header != PHASE_TIMING_CSV_HEADER {
+        return Err(CliError(format!(
+            "phase_timing.csv header mismatch: expected '{PHASE_TIMING_CSV_HEADER}', got '{header}'"
+        )));
+    }
+    let mut rows = 0_usize;
+    let mut job_rows = 0_usize;
+    let mut has_source_artifacts = false;
+    let mut has_final_artifacts = false;
+    let mut has_total = false;
+    for (line_index, line) in lines.enumerate() {
+        let fields = split_csv_line(line).map_err(|error| {
+            CliError(format!(
+                "phase_timing.csv row {} could not be parsed: {}",
+                line_index + 2,
+                error.0
+            ))
+        })?;
+        if fields.len() != 6 {
+            return Err(CliError(format!(
+                "phase_timing.csv row {} has {} fields, expected 6",
+                line_index + 2,
+                fields.len()
+            )));
+        }
+        let phase_name = fields[0].as_str();
+        let elapsed_ms =
+            parse_csv_f64_context(&fields[2], "elapsed_ms", line_index + 2, "phase_timing.csv")?;
+        if !elapsed_ms.is_finite() || elapsed_ms < 0.0 {
+            return Err(CliError(format!(
+                "phase_timing.csv row {} has invalid elapsed_ms",
+                line_index + 2
+            )));
+        }
+        match phase_name {
+            "job" => {
+                job_rows += 1;
+                if elapsed_ms <= 0.0 {
+                    return Err(CliError(format!(
+                        "phase_timing.csv row {} job elapsed_ms must be positive",
+                        line_index + 2
+                    )));
+                }
+            }
+            "source_and_chart_artifacts" => has_source_artifacts = true,
+            "final_result_artifacts" => has_final_artifacts = true,
+            "total" => has_total = true,
+            "network_worker_pool_start" | "network_worker_pool_shutdown" => {
+                if elapsed_ms <= 0.0 {
+                    return Err(CliError(format!(
+                        "phase_timing.csv row {} network worker phase elapsed_ms must be positive",
+                        line_index + 2
+                    )));
+                }
+            }
+            "setup" => {}
+            other => {
+                return Err(CliError(format!(
+                    "phase_timing.csv row {} has unknown phase '{other}'",
+                    line_index + 2
+                )));
+            }
+        }
+        rows += 1;
+    }
+    if job_rows != expected_jobs {
+        return Err(CliError(format!(
+            "phase_timing.csv expected {expected_jobs} job rows, got {job_rows}"
+        )));
+    }
+    if !has_source_artifacts || !has_final_artifacts || !has_total {
+        return Err(CliError(
+            "phase_timing.csv must include source_and_chart_artifacts, final_result_artifacts, and total phases"
+                .to_owned(),
+        ));
+    }
+    Ok(rows)
+}
+
+fn verify_overview_artifact_links(dir: &Path) -> Result<(), CliError> {
+    let overview = fs::read_to_string(dir.join(OVERVIEW_HTML))
+        .map_err(|error| CliError(format!("read overview.html failed: {error}")))?;
+    for required in [
+        "All positive performance proofs verified",
+        "source.csv",
+        "summary_stats.csv",
+        "phase_timing.csv",
+        "result_manifest.json",
+        "worker_scaling_max_size.svg",
+        "Core Allocation",
+    ] {
+        if !overview.contains(required) {
+            return Err(CliError(format!(
+                "overview.html missing required benchmark marker '{required}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_benchmark_render_artifacts(dir: &Path) -> Result<(), CliError> {
+    for artifact in [
+        "prove_time_by_size.svg",
+        "verify_time_by_size.svg",
+        "proof_bytes_by_size.svg",
+        "network_bytes_by_size.svg",
+        "runner_overhead_by_size.svg",
+        "worker_scaling_max_size.svg",
+    ] {
+        verify_svg_artifact(dir, artifact, "benchmark")?;
+    }
+    for artifact in [
+        "prove_time_by_size.tex",
+        "verify_time_by_size.tex",
+        "proof_bytes_by_size.tex",
+        "network_bytes_by_size.tex",
+        "runner_overhead_by_size.tex",
+        "worker_scaling_max_size.tex",
+    ] {
+        verify_pgfplots_artifact(dir, artifact, "benchmark")?;
+    }
+    verify_paper_figures_tex(dir, "benchmark")?;
+    verify_standalone_tex(dir, "benchmark")?;
+    let compiled_figure = dir.join(COMPILED_PAPER_FIGURE);
+    if compiled_figure.exists() {
+        verify_pdf_artifact(dir, COMPILED_PAPER_FIGURE, "benchmark")?;
+    }
+    Ok(())
+}
+
+fn verify_svg_artifact(dir: &Path, artifact: &str, context: &str) -> Result<(), CliError> {
+    let svg = fs::read_to_string(dir.join(artifact))
+        .map_err(|error| CliError(format!("read {artifact} failed: {error}")))?;
+    for required in ["<svg", "</svg>", "<style>", "class=\"title\""] {
+        if !svg.contains(required) {
+            return Err(CliError(format!(
+                "{context} {artifact} missing required SVG marker '{required}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_pgfplots_artifact(dir: &Path, artifact: &str, context: &str) -> Result<(), CliError> {
+    let tex = fs::read_to_string(dir.join(artifact))
+        .map_err(|error| CliError(format!("read {artifact} failed: {error}")))?;
+    for required in [
+        "Generated by pq-experiments",
+        "\\begin{tikzpicture}",
+        "\\begin{axis}",
+        "source.csv",
+    ] {
+        if !tex.contains(required) {
+            return Err(CliError(format!(
+                "{context} {artifact} missing required PGFPlots marker '{required}'"
+            )));
+        }
+    }
+    if artifact != "runner_overhead_by_size.tex" && !tex.contains("\\addplot") {
+        return Err(CliError(format!(
+            "{context} {artifact} missing required PGFPlots marker '\\addplot'"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_paper_figures_tex(dir: &Path, context: &str) -> Result<(), CliError> {
+    let paper_tex = fs::read_to_string(dir.join("paper_figures.tex"))
+        .map_err(|error| CliError(format!("read paper_figures.tex failed: {error}")))?;
+    for required in [
+        "Generated by pq-experiments",
+        "Source data: source.csv/source.json",
+        "\\begin{groupplot}",
+        "Perfect upper bound",
+    ] {
+        if !paper_tex.contains(required) {
+            return Err(CliError(format!(
+                "{context} paper_figures.tex missing required marker '{required}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_standalone_tex(dir: &Path, context: &str) -> Result<(), CliError> {
+    let standalone = fs::read_to_string(dir.join("paper_figures_standalone.tex"))
+        .map_err(|error| CliError(format!("read paper_figures_standalone.tex failed: {error}")))?;
+    for required in [
+        "\\documentclass",
+        "\\input{paper_figures.tex}",
+        "\\end{document}",
+    ] {
+        if !standalone.contains(required) {
+            return Err(CliError(format!(
+                "{context} paper_figures_standalone.tex missing required marker '{required}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_pdf_artifact(dir: &Path, artifact: &str, context: &str) -> Result<(), CliError> {
+    let pdf = fs::read(dir.join(artifact))
+        .map_err(|error| CliError(format!("read {artifact} failed: {error}")))?;
+    if !pdf.starts_with(b"%PDF") {
+        return Err(CliError(format!("{context} {artifact} is not a PDF file")));
+    }
+    Ok(())
+}
+
+fn verify_benchmark_paper_quality(dir: &Path) -> Result<(), CliError> {
+    let metadata_path = dir.join("metadata.json");
+    let metadata = fs::read_to_string(&metadata_path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", metadata_path.display())))?;
+    if parse_json_usize_field(&metadata, "schema_version")? != 7 {
+        return Err(CliError(format!(
+            "{} is not a schema_version=7 benchmark metadata file",
+            metadata_path.display()
+        )));
+    }
+
+    let expected_nv_powers = (PAPER_PRESET_NV_START..=PAPER_PRESET_NV_END).collect::<Vec<_>>();
+    require_metadata_string(&metadata, "build_profile", "release")?;
+    require_metadata_bool(&metadata, "paper_preset", true)?;
+    require_metadata_string(&metadata, "runner", "both")?;
+    require_metadata_bool(&metadata, "compile_figures_requested", true)?;
+    require_metadata_bool(&metadata, "compile_figures_succeeded", true)?;
+    require_metadata_usize_array(&metadata, "nv_powers", &expected_nv_powers)?;
+    require_metadata_usize_array(&metadata, "workers", PAPER_PRESET_WORKERS)?;
+
+    let repeats = parse_json_usize_field(&metadata, "repeats")?;
+    if repeats != BENCHMARK_REPEATS {
+        return Err(CliError(format!(
+            "paper-quality performance benchmark requires repeats={}, got {}",
+            BENCHMARK_REPEATS, repeats
+        )));
+    }
+    let pcs_queries = parse_json_usize_field(&metadata, "pcs_queries")?;
+    if pcs_queries < PAPER_PRESET_PCS_QUERIES {
+        return Err(CliError(format!(
+            "paper-quality benchmark requires pcs_queries >= {}, got {}",
+            PAPER_PRESET_PCS_QUERIES, pcs_queries
+        )));
+    }
+
+    let expected_positive = expected_nv_powers.len() * PAPER_PRESET_WORKERS.len() * 2 * 2 * repeats;
+    let expected_records = expected_positive;
+    require_metadata_usize(&metadata, "record_count", expected_records)?;
+    require_metadata_usize(&metadata, "positive_verified", expected_positive)?;
+    require_metadata_usize(&metadata, "negative_rejected", 0)?;
+
+    let compiled_figure = dir.join(COMPILED_PAPER_FIGURE);
+    if !compiled_figure.is_file() {
+        return Err(CliError(format!(
+            "paper-quality benchmark requires compiled figure {}",
+            compiled_figure.display()
+        )));
+    }
+    verify_paper_quality_source_csv(
+        dir,
+        &expected_nv_powers,
+        PAPER_PRESET_WORKERS,
+        pcs_queries,
+        repeats,
+        expected_records,
+    )?;
+    verify_paper_quality_phase_timing(dir, expected_records)?;
+    verify_paper_quality_figure_artifacts(dir)?;
+    Ok(())
+}
+
+fn verify_paper_quality_source_csv(
+    dir: &Path,
+    expected_nv_powers: &[usize],
+    expected_workers: &[usize],
+    pcs_queries: usize,
+    repeats: usize,
+    expected_records: usize,
+) -> Result<(), CliError> {
+    let source_path = dir.join("source.csv");
+    let source = fs::read_to_string(&source_path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", source_path.display())))?;
+    let mut lines = source.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| CliError("paper-quality source.csv is empty".to_owned()))?;
+    if header != SOURCE_CSV_HEADER {
+        return Err(CliError(format!(
+            "paper-quality source.csv header mismatch: expected '{SOURCE_CSV_HEADER}', got '{header}'"
+        )));
+    }
+
+    let expected_protocols = ["r1cs", "plonkish"];
+    let expected_runners = ["local", "network"];
+    let mut expected = BTreeSet::new();
+    for runner in expected_runners {
+        for protocol in expected_protocols {
+            for nv_power in expected_nv_powers {
+                for worker in expected_workers {
+                    for trial in 1..=repeats {
+                        expected.insert((
+                            runner.to_owned(),
+                            protocol.to_owned(),
+                            *nv_power,
+                            *worker,
+                            trial,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut actual = BTreeSet::new();
+    let mut rows = 0_usize;
+    for (line_index, line) in lines.enumerate() {
+        let fields = split_csv_line(line).map_err(|error| {
+            CliError(format!(
+                "paper-quality source.csv row {} could not be parsed: {}",
+                line_index + 2,
+                error.0
+            ))
+        })?;
+        if fields.len() != 19 {
+            return Err(CliError(format!(
+                "paper-quality source.csv row {} has {} fields, expected 19",
+                line_index + 2,
+                fields.len()
+            )));
+        }
+        let protocol = fields[0].as_str();
+        let runner = fields[1].as_str();
+        let case = fields[2].as_str();
+        let trial = parse_csv_usize(&fields[3], "trial", line_index + 2)?;
+        let workers = parse_csv_usize(&fields[4], "workers", line_index + 2)?;
+        let nv_power = parse_csv_usize(&fields[5], "nv_power", line_index + 2)?;
+        let size = parse_csv_usize(&fields[6], "size", line_index + 2)?;
+        let row_pcs_queries = parse_csv_usize(&fields[8], "pcs_queries", line_index + 2)?;
+        let prove_ms = parse_csv_f64(&fields[9], "prove_ms", line_index + 2)?;
+        let verify_ms = parse_csv_f64(&fields[10], "verify_ms", line_index + 2)?;
+        let proof_bytes = parse_csv_usize(&fields[11], "proof_bytes", line_index + 2)?;
+        let communication_bytes =
+            parse_csv_usize(&fields[12], "communication_bytes", line_index + 2)?;
+        let network_bytes = parse_csv_usize(&fields[13], "network_bytes", line_index + 2)?;
+        let verified = fields[17].as_str();
+        let failure_reason = fields[18].as_str();
+
+        if !expected_protocols.contains(&protocol) || !expected_runners.contains(&runner) {
+            return Err(CliError(format!(
+                "paper-quality source.csv row {} has unexpected runner/protocol {runner}/{protocol}",
+                line_index + 2
+            )));
+        }
+        if case != "positive" || verified != "true" || !failure_reason.is_empty() {
+            return Err(CliError(format!(
+                "paper-quality source.csv row {} must be a verified positive performance run",
+                line_index + 2
+            )));
+        }
+        if row_pcs_queries != pcs_queries {
+            return Err(CliError(format!(
+                "paper-quality source.csv row {} pcs_queries expected {}, got {}",
+                line_index + 2,
+                pcs_queries,
+                row_pcs_queries
+            )));
+        }
+        if size != (1_usize << nv_power) {
+            return Err(CliError(format!(
+                "paper-quality source.csv row {} size {} does not equal 2^{}",
+                line_index + 2,
+                size,
+                nv_power
+            )));
+        }
+        if !prove_ms.is_finite()
+            || !verify_ms.is_finite()
+            || prove_ms <= 0.0
+            || verify_ms <= 0.0
+            || proof_bytes == 0
+            || communication_bytes == 0
+        {
+            return Err(CliError(format!(
+                "paper-quality source.csv row {} has non-positive timing or size metrics",
+                line_index + 2
+            )));
+        }
+        if runner == "network" && network_bytes == 0 {
+            return Err(CliError(format!(
+                "paper-quality source.csv row {} network run must record network_bytes",
+                line_index + 2
+            )));
+        }
+        if runner == "local" && network_bytes != 0 {
+            return Err(CliError(format!(
+                "paper-quality source.csv row {} local run must have zero network_bytes",
+                line_index + 2
+            )));
+        }
+
+        if !actual.insert((
+            runner.to_owned(),
+            protocol.to_owned(),
+            nv_power,
+            workers,
+            trial,
+        )) {
+            return Err(CliError(format!(
+                "paper-quality source.csv duplicates runner={runner} protocol={protocol} n={nv_power} workers={workers} trial={trial}"
+            )));
+        }
+        rows += 1;
+    }
+
+    if rows != expected_records {
+        return Err(CliError(format!(
+            "paper-quality source.csv expected {expected_records} rows, got {rows}"
+        )));
+    }
+    if actual != expected {
+        if let Some(missing) = expected.difference(&actual).next() {
+            return Err(CliError(format!(
+                "paper-quality source.csv missing runner={} protocol={} n={} workers={} trial={}",
+                missing.0, missing.1, missing.2, missing.3, missing.4
+            )));
+        }
+        if let Some(extra) = actual.difference(&expected).next() {
+            return Err(CliError(format!(
+                "paper-quality source.csv has unexpected runner={} protocol={} n={} workers={} trial={}",
+                extra.0, extra.1, extra.2, extra.3, extra.4
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_paper_quality_phase_timing(dir: &Path, expected_jobs: usize) -> Result<(), CliError> {
+    let phase_path = dir.join("phase_timing.csv");
+    let phase = fs::read_to_string(&phase_path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", phase_path.display())))?;
+    let mut lines = phase.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| CliError("paper-quality phase_timing.csv is empty".to_owned()))?;
+    if header != PHASE_TIMING_CSV_HEADER {
+        return Err(CliError(
+            "paper-quality phase_timing.csv header mismatch".to_owned(),
+        ));
+    }
+    let mut job_rows = 0_usize;
+    let mut has_source_artifacts = false;
+    let mut has_final_artifacts = false;
+    let mut has_total = false;
+    for line in lines {
+        let phase_name = line.split(',').next().unwrap_or_default();
+        match phase_name {
+            "job" => job_rows += 1,
+            "source_and_chart_artifacts" => has_source_artifacts = true,
+            "final_result_artifacts" => has_final_artifacts = true,
+            "total" => has_total = true,
+            _ => {}
+        }
+    }
+    if job_rows != expected_jobs {
+        return Err(CliError(format!(
+            "paper-quality phase_timing.csv expected {expected_jobs} job rows, got {job_rows}"
+        )));
+    }
+    if !has_source_artifacts || !has_final_artifacts || !has_total {
+        return Err(CliError(
+            "paper-quality phase_timing.csv must include source_and_chart_artifacts, final_result_artifacts, and total phases"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_paper_quality_figure_artifacts(dir: &Path) -> Result<(), CliError> {
+    verify_benchmark_render_artifacts(dir)?;
+
+    let overview = fs::read_to_string(dir.join(OVERVIEW_HTML))
+        .map_err(|error| CliError(format!("read overview.html failed: {error}")))?;
+    for required in [
+        "All positive performance proofs verified",
+        "source.csv",
+        "worker_scaling_max_size.svg",
+        "Core Allocation",
+    ] {
+        if !overview.contains(required) {
+            return Err(CliError(format!(
+                "paper-quality overview.html missing required marker '{required}'"
+            )));
+        }
+    }
+
+    verify_pdf_artifact(dir, COMPILED_PAPER_FIGURE, "paper-quality")
+}
+
+fn parse_csv_usize(value: &str, field: &str, row: usize) -> Result<usize, CliError> {
+    parse_csv_usize_context(value, field, row, "paper-quality source.csv")
+}
+
+fn parse_csv_f64(value: &str, field: &str, row: usize) -> Result<f64, CliError> {
+    parse_csv_f64_context(value, field, row, "paper-quality source.csv")
+}
+
+fn parse_csv_usize_context(
+    value: &str,
+    field: &str,
+    row: usize,
+    context: &str,
+) -> Result<usize, CliError> {
+    value.parse::<usize>().map_err(|error| {
+        CliError(format!(
+            "{context} row {row} field {field} is not usize: {error}"
+        ))
+    })
+}
+
+fn parse_csv_f64_context(
+    value: &str,
+    field: &str,
+    row: usize,
+    context: &str,
+) -> Result<f64, CliError> {
+    value.parse::<f64>().map_err(|error| {
+        CliError(format!(
+            "{context} row {row} field {field} is not f64: {error}"
+        ))
+    })
+}
+
+fn split_csv_line(line: &str) -> Result<Vec<String>, CliError> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(character) = chars.next() {
+        if in_quotes {
+            match character {
+                '"' => {
+                    if chars.peek() == Some(&'"') {
+                        current.push('"');
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                }
+                _ => current.push(character),
+            }
+        } else {
+            match character {
+                ',' => {
+                    fields.push(current);
+                    current = String::new();
+                }
+                '"' if current.is_empty() => in_quotes = true,
+                '"' => return Err(CliError("unexpected quote in unquoted field".to_owned())),
+                _ => current.push(character),
+            }
+        }
+    }
+    if in_quotes {
+        return Err(CliError("unterminated quoted field".to_owned()));
+    }
+    fields.push(current);
+    Ok(fields)
+}
+
+fn require_metadata_string(metadata: &str, field: &str, expected: &str) -> Result<(), CliError> {
+    let actual = parse_json_pretty_string_field(metadata, field)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(CliError(format!(
+            "metadata field '{field}' expected '{expected}', got '{actual}'"
+        )))
+    }
+}
+
+fn require_metadata_bool(metadata: &str, field: &str, expected: bool) -> Result<(), CliError> {
+    let actual = parse_json_bool_field(metadata, field)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(CliError(format!(
+            "metadata field '{field}' expected {expected}, got {actual}"
+        )))
+    }
+}
+
+fn require_metadata_usize(metadata: &str, field: &str, expected: usize) -> Result<(), CliError> {
+    let actual = parse_json_usize_field(metadata, field)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(CliError(format!(
+            "metadata field '{field}' expected {expected}, got {actual}"
+        )))
+    }
+}
+
+fn require_metadata_usize_array(
+    metadata: &str,
+    field: &str,
+    expected: &[usize],
+) -> Result<(), CliError> {
+    let actual = parse_json_usize_array_field(metadata, field)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(CliError(format!(
+            "metadata field '{field}' expected {:?}, got {:?}",
+            expected, actual
+        )))
+    }
+}
+
+fn benchmark_result_dir_entries(dir: &Path) -> Result<BTreeSet<String>, CliError> {
+    let mut files = BTreeSet::new();
+    for entry in fs::read_dir(dir).map_err(|error| {
+        CliError(format!(
+            "read benchmark dir {} failed: {error}",
+            dir.display()
+        ))
+    })? {
+        let entry =
+            entry.map_err(|error| CliError(format!("read benchmark dir entry failed: {error}")))?;
+        let file_type = entry.file_type().map_err(|error| {
+            CliError(format!(
+                "read file type for {} failed: {error}",
+                entry.path().display()
+            ))
+        })?;
+        let name = entry.file_name().into_string().map_err(|name| {
+            CliError(format!(
+                "benchmark artifact name is not valid UTF-8: {:?}",
+                name
+            ))
+        })?;
+        if !file_type.is_file() {
+            return Err(CliError(format!(
+                "unexpected non-file artifact '{}' in {}",
+                name,
+                dir.display()
+            )));
+        }
+        files.insert(name);
+    }
+    Ok(files)
+}
+
+fn parse_manifest_entries(manifest: &str) -> Result<Vec<ResultManifestEntry>, CliError> {
+    let mut entries = Vec::new();
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("{\"path\":") {
+            continue;
+        }
+        let path = parse_json_string_field(trimmed, "path")?;
+        let bytes = parse_json_usize_field(trimmed, "bytes")?;
+        let sha256 = parse_json_string_field(trimmed, "sha256")?;
+        if path.contains("..") || path.contains('/') || path.contains('\\') {
+            return Err(CliError(format!(
+                "manifest artifact path must be a filename, got '{path}'"
+            )));
+        }
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(CliError(format!(
+                "manifest artifact '{path}' has invalid sha256"
+            )));
+        }
+        entries.push(ResultManifestEntry {
+            path,
+            bytes,
+            sha256,
+        });
+    }
+    if entries.is_empty() {
+        return Err(CliError("manifest contains no file entries".to_owned()));
+    }
+    Ok(entries)
+}
+
+fn parse_json_string_field(input: &str, field: &str) -> Result<String, CliError> {
+    let marker = format!("\"{field}\":\"");
+    let start = input
+        .find(&marker)
+        .ok_or_else(|| CliError(format!("missing JSON string field '{field}'")))?
+        + marker.len();
+    let rest = &input[start..];
+    let end = rest
+        .find('"')
+        .ok_or_else(|| CliError(format!("unterminated JSON string field '{field}'")))?;
+    Ok(rest[..end].to_owned())
+}
+
+fn parse_json_pretty_string_field(input: &str, field: &str) -> Result<String, CliError> {
+    let marker = format!("\"{field}\":");
+    let start = input
+        .find(&marker)
+        .ok_or_else(|| CliError(format!("missing JSON string field '{field}'")))?
+        + marker.len();
+    let rest = input[start..].trim_start();
+    let rest = rest
+        .strip_prefix('"')
+        .ok_or_else(|| CliError(format!("JSON field '{field}' is not a string")))?;
+    let end = rest
+        .find('"')
+        .ok_or_else(|| CliError(format!("unterminated JSON string field '{field}'")))?;
+    Ok(rest[..end].to_owned())
+}
+
+fn parse_json_bool_field(input: &str, field: &str) -> Result<bool, CliError> {
+    let marker = format!("\"{field}\":");
+    let start = input
+        .find(&marker)
+        .ok_or_else(|| CliError(format!("missing JSON bool field '{field}'")))?
+        + marker.len();
+    let rest = input[start..].trim_start();
+    if rest.starts_with("true") {
+        Ok(true)
+    } else if rest.starts_with("false") {
+        Ok(false)
+    } else {
+        Err(CliError(format!("JSON field '{field}' is not boolean")))
+    }
+}
+
+fn parse_json_usize_array_field(input: &str, field: &str) -> Result<Vec<usize>, CliError> {
+    let marker = format!("\"{field}\":");
+    let start = input
+        .find(&marker)
+        .ok_or_else(|| CliError(format!("missing JSON array field '{field}'")))?
+        + marker.len();
+    let rest = input[start..].trim_start();
+    let rest = rest
+        .strip_prefix('[')
+        .ok_or_else(|| CliError(format!("JSON field '{field}' is not an array")))?;
+    let end = rest
+        .find(']')
+        .ok_or_else(|| CliError(format!("unterminated JSON array field '{field}'")))?;
+    let body = rest[..end].trim();
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    body.split(',')
+        .map(|item| {
+            item.trim().parse::<usize>().map_err(|_| {
+                CliError(format!(
+                    "JSON array field '{field}' contains non-usize item"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn parse_json_usize_field(input: &str, field: &str) -> Result<usize, CliError> {
+    let value = parse_json_unsigned_field(input, field)?;
+    usize::try_from(value).map_err(|_| CliError(format!("JSON field '{field}' is too large")))
+}
+
+fn parse_json_u64_field(input: &str, field: &str) -> Result<u64, CliError> {
+    parse_json_unsigned_field(input, field)
+}
+
+fn parse_json_unsigned_field(input: &str, field: &str) -> Result<u64, CliError> {
+    let marker = format!("\"{field}\":");
+    let start = input
+        .find(&marker)
+        .ok_or_else(|| CliError(format!("missing JSON numeric field '{field}'")))?
+        + marker.len();
+    let digits = input[start..]
+        .trim_start()
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return Err(CliError(format!("JSON field '{field}' is not numeric")));
+    }
+    digits
+        .parse::<u64>()
+        .map_err(|_| CliError(format!("JSON field '{field}' is too large")))
 }
 
 fn prompt_interactive_selection<R: BufRead, W: Write>(
@@ -614,6 +2623,7 @@ fn prompt_interactive_selection<R: BufRead, W: Write>(
             format: output_format,
             case,
             pcs_queries,
+            worker_core_plan: None,
         },
     })
 }
@@ -732,6 +2742,17 @@ fn parse_case(value: &str) -> Result<CaseSelection, CliError> {
         "both" => Ok(CaseSelection::Both),
         other => Err(CliError(format!(
             "unsupported --case '{other}', expected positive, negative, or both"
+        ))),
+    }
+}
+
+fn parse_figure_compiler(value: &str) -> Result<FigureCompiler, CliError> {
+    match value {
+        "auto" => Ok(FigureCompiler::Auto),
+        "pdflatex" => Ok(FigureCompiler::PdfLatex),
+        "tectonic" => Ok(FigureCompiler::Tectonic),
+        other => Err(CliError(format!(
+            "unsupported --figure-compiler '{other}', expected auto, pdflatex, or tectonic"
         ))),
     }
 }
@@ -874,6 +2895,7 @@ fn run_network_proof_master(command: MasterCommand) -> Result<(), CliError> {
         format: command.format,
         case: command.case,
         pcs_queries: command.pcs_queries,
+        worker_core_plan: None,
     };
     let result = match protocol {
         Protocol::R1cs => run_r1cs_network(&config, &command.addrs),
@@ -952,8 +2974,7 @@ fn run_loopback_network_proof(config: &Config) -> Result<Vec<MetricRecord>, CliE
     let mut addrs = Vec::with_capacity(config.workers);
     let mut handles = Vec::with_capacity(config.workers);
     for worker_id in 0..config.workers {
-        let (addr, handle) = spawn_loopback_worker(worker_id)
-            .map_err(|error| CliError(format!("spawn worker {worker_id} failed: {error:?}")))?;
+        let (addr, handle) = spawn_loopback_worker_for_config(worker_id, &config.worker_core_plan)?;
         addrs.push(addr);
         handles.push(handle);
     }
@@ -972,11 +2993,343 @@ fn run_loopback_network_proof(config: &Config) -> Result<Vec<MetricRecord>, CliE
 
     let shutdown_result = TcpWorkerRuntime::shutdown(&addrs)
         .map_err(|error| CliError(format!("shutdown failed: {error:?}")));
-    let join_result = join_workers(handles);
+    let join_result = join_loopback_workers(handles);
     let records = result?;
     shutdown_result?;
     join_result?;
     Ok(records)
+}
+
+enum LoopbackWorkerHandle {
+    Thread(std::thread::JoinHandle<pq_net::NetResult<()>>),
+    Process(Child),
+}
+
+struct BenchmarkNetworkPool {
+    addrs: Vec<String>,
+    handles: Vec<LoopbackWorkerHandle>,
+}
+
+struct BenchmarkNetworkPools {
+    pools: HashMap<usize, BenchmarkNetworkPool>,
+}
+
+impl BenchmarkNetworkPools {
+    fn new() -> Self {
+        Self {
+            pools: HashMap::new(),
+        }
+    }
+
+    fn addrs_for(
+        &mut self,
+        workers: usize,
+        core_plan: &Option<WorkerCorePlan>,
+        phase_timings: &mut Vec<PhaseTimingRecord>,
+    ) -> Result<Vec<String>, CliError> {
+        if let Entry::Vacant(entry) = self.pools.entry(workers) {
+            let start = Instant::now();
+            let pool = spawn_benchmark_network_pool(workers, core_plan)?;
+            let addrs = pool.addrs.clone();
+            entry.insert(pool);
+            push_phase_timing(
+                phase_timings,
+                "network_worker_pool_start",
+                format!("spawn and register {workers} reusable loopback workers"),
+                start.elapsed(),
+                0.0,
+                0.0,
+            );
+            return Ok(addrs);
+        }
+        Ok(self
+            .pools
+            .get(&workers)
+            .expect("pool exists after contains_key")
+            .addrs
+            .clone())
+    }
+
+    fn shutdown_all(&mut self, phase_timings: &mut Vec<PhaseTimingRecord>) -> Result<(), CliError> {
+        if self.pools.is_empty() {
+            return Ok(());
+        }
+        let start = Instant::now();
+        let pools = std::mem::take(&mut self.pools);
+        let pool_count = pools.len();
+        let mut first_error = None;
+        for (_, pool) in pools {
+            match shutdown_benchmark_network_pool(pool) {
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                _ => {}
+            }
+        }
+        push_phase_timing(
+            phase_timings,
+            "network_worker_pool_shutdown",
+            format!("shutdown {pool_count} reusable loopback worker pools"),
+            start.elapsed(),
+            0.0,
+            0.0,
+        );
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+fn spawn_benchmark_network_pool(
+    workers: usize,
+    core_plan: &Option<WorkerCorePlan>,
+) -> Result<BenchmarkNetworkPool, CliError> {
+    let mut addrs = Vec::with_capacity(workers);
+    let mut handles = Vec::with_capacity(workers);
+    for worker_id in 0..workers {
+        match spawn_loopback_worker_for_config(worker_id, core_plan) {
+            Ok((addr, handle)) => {
+                addrs.push(addr);
+                handles.push(handle);
+            }
+            Err(error) => {
+                let _ = TcpWorkerRuntime::shutdown(&addrs);
+                let _ = join_loopback_workers(handles);
+                return Err(error);
+            }
+        }
+    }
+    for (worker_id, addr) in addrs.iter().enumerate() {
+        if let Err(error) = ping(addr) {
+            let _ = TcpWorkerRuntime::shutdown(&addrs);
+            let _ = join_loopback_workers(handles);
+            return Err(CliError(format!("ping {addr} failed: {error:?}")));
+        }
+        if let Err(error) = register(addr, worker_id) {
+            let _ = TcpWorkerRuntime::shutdown(&addrs);
+            let _ = join_loopback_workers(handles);
+            return Err(CliError(format!("register {addr} failed: {error:?}")));
+        }
+    }
+    Ok(BenchmarkNetworkPool { addrs, handles })
+}
+
+fn shutdown_benchmark_network_pool(pool: BenchmarkNetworkPool) -> Result<(), CliError> {
+    let shutdown_result = TcpWorkerRuntime::shutdown(&pool.addrs)
+        .map_err(|error| CliError(format!("shutdown failed: {error:?}")));
+    let join_result = join_loopback_workers(pool.handles);
+    shutdown_result?;
+    join_result
+}
+
+fn spawn_loopback_worker_for_config(
+    worker_id: usize,
+    core_plan: &Option<WorkerCorePlan>,
+) -> Result<(String, LoopbackWorkerHandle), CliError> {
+    if let Some(plan) = core_plan {
+        let core_ids = plan.core_ids_for_worker(worker_id);
+        let (addr, mut child) = spawn_affinity_worker_process(worker_id, &core_ids)?;
+        if let Err(error) = wait_for_loopback_worker(&addr) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok((addr, LoopbackWorkerHandle::Process(child)))
+    } else {
+        let (addr, handle) = spawn_loopback_worker(worker_id)
+            .map_err(|error| CliError(format!("spawn worker {worker_id} failed: {error:?}")))?;
+        Ok((addr, LoopbackWorkerHandle::Thread(handle)))
+    }
+}
+
+fn reserve_loopback_addr() -> Result<String, CliError> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|error| CliError(format!("reserve loopback port failed: {error}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|error| CliError(format!("read loopback port failed: {error}")))?
+        .to_string();
+    drop(listener);
+    Ok(addr)
+}
+
+fn wait_for_loopback_worker(addr: &str) -> Result<(), CliError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if ping(addr).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(CliError(format!(
+        "affinity-controlled worker did not start listening at {addr}"
+    )))
+}
+
+fn spawn_affinity_worker_process(
+    worker_id: usize,
+    core_ids: &[usize],
+) -> Result<(String, Child), CliError> {
+    let addr = reserve_loopback_addr()?;
+    let exe = env::current_exe()
+        .map_err(|error| CliError(format!("resolve current executable failed: {error}")))?;
+    let child = spawn_platform_affinity_worker(&exe, &addr, worker_id, core_ids)?;
+    Ok((addr, child))
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_platform_affinity_worker(
+    exe: &Path,
+    addr: &str,
+    worker_id: usize,
+    core_ids: &[usize],
+) -> Result<Child, CliError> {
+    let core_list = core_ids
+        .iter()
+        .map(|core| core.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    Command::new("taskset")
+        .arg("-c")
+        .arg(&core_list)
+        .arg(exe)
+        .arg("worker")
+        .arg("--addr")
+        .arg(addr)
+        .arg("--id")
+        .arg(worker_id.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            CliError(format!(
+                "spawn Linux affinity worker with taskset -c {core_list} failed: {error}"
+            ))
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_platform_affinity_worker(
+    exe: &Path,
+    addr: &str,
+    worker_id: usize,
+    core_ids: &[usize],
+) -> Result<Child, CliError> {
+    let mask = windows_affinity_mask(core_ids)?;
+    let args = [
+        "worker".to_owned(),
+        "--addr".to_owned(),
+        addr.to_owned(),
+        "--id".to_owned(),
+        worker_id.to_string(),
+    ];
+    let command = format!(
+        "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath {} -ArgumentList {} -WindowStyle Hidden -PassThru; $p.ProcessorAffinity = [IntPtr]{}; $p.WaitForExit(); exit $p.ExitCode",
+        powershell_quote(&exe.display().to_string()),
+        powershell_array(&args),
+        mask
+    );
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            CliError(format!(
+                "spawn Windows affinity worker with ProcessorAffinity mask {mask} failed: {error}"
+            ))
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn spawn_platform_affinity_worker(
+    _exe: &Path,
+    _addr: &str,
+    _worker_id: usize,
+    _core_ids: &[usize],
+) -> Result<Child, CliError> {
+    Err(CliError(format!(
+        "worker core affinity is not implemented for {}",
+        env::consts::OS
+    )))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_affinity_mask(core_ids: &[usize]) -> Result<u64, CliError> {
+    let mut mask = 0_u64;
+    for core_id in core_ids {
+        if *core_id >= 63 {
+            return Err(CliError(format!(
+                "Windows ProcessorAffinity wrapper supports logical core ids 0..62 in this prototype; got {core_id}"
+            )));
+        }
+        mask |= 1_u64 << core_id;
+    }
+    Ok(mask)
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_array(values: &[String]) -> String {
+    let quoted = values
+        .iter()
+        .map(|value| powershell_quote(value))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("@({quoted})")
+}
+
+fn join_loopback_workers(handles: Vec<LoopbackWorkerHandle>) -> Result<(), CliError> {
+    for handle in handles {
+        match handle {
+            LoopbackWorkerHandle::Thread(handle) => {
+                handle
+                    .join()
+                    .map_err(|_| CliError("worker thread panicked".to_string()))?
+                    .map_err(|error| CliError(format!("worker failed: {error:?}")))?;
+            }
+            LoopbackWorkerHandle::Process(mut child) => {
+                wait_for_worker_process(&mut child, Duration::from_secs(5))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_worker_process(child: &mut Child, timeout: Duration) -> Result<(), CliError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| CliError(format!("poll worker process failed: {error}")))?
+        {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(CliError(format!(
+                "worker process exited with status {status}"
+            )));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CliError(
+                "worker process did not exit after shutdown".to_owned(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn join_workers(
@@ -1043,7 +3396,9 @@ fn run_r1cs_case(
 
     Ok(MetricRecord {
         protocol: Protocol::R1cs.as_str(),
+        runner: BenchmarkRunner::Local.as_str(),
         case_name,
+        trial: 1,
         workers: config.workers,
         size: config.size,
         constraints: instance.num_constraints(),
@@ -1053,6 +3408,9 @@ fn run_r1cs_case(
         communication_bytes,
         network_bytes: 0,
         pcs_queries: config.pcs_queries,
+        host_logical_cores: None,
+        cores_per_worker: None,
+        core_affinity: None,
         verified,
         failure_reason,
     })
@@ -1067,28 +3425,44 @@ fn run_r1cs_case_network(
     let (instance, witness) = sample_r1cs(config.size)?;
     let backend = RefCell::new(NetworkPcsClient::new(
         addrs.to_vec(),
-        format!("r1cs-{case_name}"),
+        format!(
+            "r1cs-{case_name}-nv{}-w{}-q{}",
+            config.size, config.workers, config.pcs_queries
+        ),
     ));
 
     let prove_start = Instant::now();
     let mut transcript = HashTranscript::new(b"pq-experiments-r1cs");
-    let proof = prove_r1cs_with_pcs_hooks(
+    let proof = prove_r1cs_with_pcs_and_spark_batch_hooks(
         &instance,
         &witness,
         config.workers,
         DistributedPcsParams::new(config.pcs_queries),
         &mut transcript,
-        |evaluations, workers| {
-            backend
-                .borrow_mut()
-                .commit(evaluations, workers)
-                .map_err(|_| R1csPiopError::Pcs)
-        },
-        |evaluations, commitment, point, params, transcript| {
-            backend
-                .borrow_mut()
-                .open(evaluations, commitment, point, params, transcript)
-                .map_err(|_| R1csPiopError::Pcs)
+        R1csBatchProverHooks {
+            commit_distributed: |evaluations: &[FieldElement], workers: usize| {
+                backend
+                    .borrow_mut()
+                    .commit(evaluations, workers)
+                    .map_err(|_| R1csPiopError::Pcs)
+            },
+            open_distributed: |evaluations: &[FieldElement],
+                               commitment: &DistributedCommitment,
+                               point: &[FieldElement],
+                               params: DistributedPcsParams,
+                               transcript: &mut HashTranscript| {
+                backend
+                    .borrow_mut()
+                    .open_compact(evaluations, commitment, point, params, transcript)
+                    .map(R1csPcsOpening::Compact)
+                    .map_err(|_| R1csPiopError::Pcs)
+            },
+            spark_worker_provider: |requests: &[SparkWorkerClaimRequest<'_>]| {
+                backend
+                    .borrow_mut()
+                    .r1cs_spark_claims(&instance, requests)
+                    .map_err(|_| R1csPiopError::InvalidProof)
+            },
         },
     )
     .map_err(|error| CliError(format!("network R1CS prove failed: {error:?}")))?;
@@ -1114,7 +3488,9 @@ fn run_r1cs_case_network(
 
     Ok(MetricRecord {
         protocol: Protocol::R1cs.as_str(),
+        runner: BenchmarkRunner::Network.as_str(),
         case_name,
+        trial: 1,
         workers: config.workers,
         size: config.size,
         constraints: instance.num_constraints(),
@@ -1124,6 +3500,18 @@ fn run_r1cs_case_network(
         communication_bytes,
         network_bytes,
         pcs_queries: config.pcs_queries,
+        host_logical_cores: config
+            .worker_core_plan
+            .as_ref()
+            .map(|plan| plan.host_logical_cores),
+        cores_per_worker: config
+            .worker_core_plan
+            .as_ref()
+            .map(|plan| plan.cores_per_worker),
+        core_affinity: config
+            .worker_core_plan
+            .as_ref()
+            .map(|_| worker_affinity_mode()),
         verified,
         failure_reason,
     })
@@ -1171,8 +3559,12 @@ fn tamper_r1cs_proof(proof: &R1csPiopProof) -> Result<R1csPiopProof, CliError> {
 }
 
 fn r1cs_fallback_metrics(proof: &R1csPiopProof) -> (usize, usize) {
-    let communication_bytes = pcs_communication_bytes(&proof.residual_opening);
+    let communication_bytes = r1cs_opening_communication_bytes(proof);
     (r1cs_proof_size_bytes(proof), communication_bytes)
+}
+
+fn r1cs_opening_communication_bytes(proof: &R1csPiopProof) -> usize {
+    r1cs_proof_communication_bytes(proof)
 }
 
 #[derive(Clone, Debug)]
@@ -1181,6 +3573,7 @@ struct NetworkPcsClient {
     session_prefix: String,
     round: usize,
     network_bytes: usize,
+    commit_sessions: HashMap<[u8; 32], String>,
 }
 
 impl NetworkPcsClient {
@@ -1190,6 +3583,7 @@ impl NetworkPcsClient {
             session_prefix,
             round: 0,
             network_bytes: 0,
+            commit_sessions: HashMap::new(),
         }
     }
 
@@ -1210,73 +3604,308 @@ impl NetworkPcsClient {
         let plan = DistributedBrakedown::partition(evaluations, workers)
             .map_err(|error| CliError(format!("network PCS partition failed: {error:?}")))?;
         let session = self.next_session("commit");
-        let mut commitments = Vec::with_capacity(workers);
         let addrs = self.addrs.clone();
-        for partition in plan.partitions() {
-            let row = &evaluations[partition.start..partition.end];
-            let commitment = pcs_worker_commit(
-                &addrs[partition.id],
-                &session,
-                partition.id,
-                partition.start,
-                row,
-            )
-            .map_err(|error| {
-                CliError(format!(
-                    "network PCS commit worker {} failed: {error:?}",
-                    partition.id
-                ))
-            })?;
-            self.network_bytes += row.len() * 8 + 8 + 8 + 8 + 40;
-            commitments.push(commitment);
+        let partitions = plan.partitions().to_vec();
+        let commit_results = thread::scope(|scope| {
+            let handles = partitions
+                .iter()
+                .map(|partition| {
+                    let addr = addrs[partition.id].clone();
+                    let session = session.clone();
+                    let row = &evaluations[partition.start..partition.end];
+                    scope.spawn(move || {
+                        let request_bytes = message_wire_bytes(&Message::PcsCommit {
+                            session: session.clone(),
+                            worker_id: partition.id,
+                            start: partition.start,
+                            values: row.to_vec(),
+                        });
+                        let commitment =
+                            pcs_worker_commit(&addr, &session, partition.id, partition.start, row)
+                                .map_err(|error| {
+                                    CliError(format!(
+                                        "network PCS commit worker {} failed: {error:?}",
+                                        partition.id
+                                    ))
+                                })?;
+                        let response_bytes = response_wire_bytes(&Response::PcsCommitResult {
+                            commitment: commitment.clone(),
+                        });
+                        Ok((partition.id, request_bytes + response_bytes, commitment))
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(result) => results.push(result?),
+                    Err(_) => {
+                        return Err(CliError(
+                            "network PCS commit worker thread panicked".to_owned(),
+                        ));
+                    }
+                }
+            }
+            Ok(results)
+        })?;
+        let mut commitments_by_worker = vec![None; workers];
+        for (worker_id, bytes, commitment) in commit_results {
+            self.network_bytes += bytes;
+            if worker_id >= commitments_by_worker.len() {
+                return Err(CliError(format!(
+                    "network PCS worker id {worker_id} out of range"
+                )));
+            }
+            commitments_by_worker[worker_id] = Some(commitment);
         }
-        DistributedBrakedown::commit_from_worker_commitments(commitments, evaluations.len())
-            .map_err(|error| CliError(format!("network PCS commitment invalid: {error:?}")))
+        let commitments = commitments_by_worker
+            .into_iter()
+            .enumerate()
+            .map(|(worker_id, commitment)| {
+                commitment.ok_or_else(|| {
+                    CliError(format!(
+                        "network PCS worker {worker_id} did not return a commitment"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let commitment =
+            DistributedBrakedown::commit_from_worker_commitments(commitments, evaluations.len())
+                .map_err(|error| CliError(format!("network PCS commitment invalid: {error:?}")))?;
+        self.commit_sessions.insert(commitment.root, session);
+        Ok(commitment)
     }
 
-    fn open<T: Transcript>(
+    fn open_compact<T: Transcript>(
         &mut self,
         evaluations: &[FieldElement],
         commitment: &DistributedCommitment,
         point: &[FieldElement],
         params: DistributedPcsParams,
         transcript: &mut T,
-    ) -> Result<DistributedOpening, CliError> {
-        let session = self.next_session("open");
-        DistributedBrakedown::open_at_after_commitment_with_worker_provider(
+    ) -> Result<CompactDistributedOpening, CliError> {
+        let session = self
+            .commit_sessions
+            .get(&commitment.root)
+            .cloned()
+            .ok_or_else(|| CliError("network PCS commitment session not found".to_owned()))?;
+        DistributedBrakedown::open_compact_at_after_commitment_with_batch_worker_provider(
             evaluations,
             commitment,
             point,
             params,
             transcript,
-            |worker, row, query_indices| self.open_worker(&session, worker, row, query_indices),
+            |requests| self.open_workers(&session, requests),
         )
-        .map_err(|error| CliError(format!("network PCS opening failed: {error:?}")))
+        .map_err(|error| CliError(format!("network compact PCS opening failed: {error:?}")))
     }
 
-    fn open_worker(
+    fn open_workers(
         &mut self,
         session: &str,
-        worker: &WorkerCommitment,
-        row: &[FieldElement],
-        query_indices: &[usize],
-    ) -> Result<WorkerOpening, PcsError> {
-        let addr = self
-            .addrs
-            .get(worker.worker_id)
-            .ok_or(PcsError::InvalidWorker)?;
-        let opening = pcs_worker_open(
-            addr,
-            session,
-            worker.worker_id,
-            worker.range.0,
-            row,
-            query_indices,
-        )
-        .map_err(|_| PcsError::InvalidProof)?;
-        self.network_bytes +=
-            row.len() * 8 + query_indices.len() * 8 + worker_opening_application_bytes(&opening);
-        Ok(opening)
+        requests: &[WorkerOpeningRequest<'_>],
+    ) -> Result<Vec<WorkerOpening>, PcsError> {
+        let open_results = thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(requests.len());
+            for (request_index, request) in requests.iter().copied().enumerate() {
+                let addr = self
+                    .addrs
+                    .get(request.worker.worker_id)
+                    .cloned()
+                    .ok_or(PcsError::InvalidWorker)?;
+                let session = session.to_owned();
+                let worker = request.worker.clone();
+                let query_indices = request.query_indices.to_vec();
+                handles.push(scope.spawn(move || {
+                    let request_bytes = message_wire_bytes(&Message::PcsOpen {
+                        session: session.clone(),
+                        worker_id: worker.worker_id,
+                        start: worker.range.0,
+                        query_indices: query_indices.clone(),
+                    });
+                    let opening = pcs_worker_open(
+                        &addr,
+                        &session,
+                        worker.worker_id,
+                        worker.range.0,
+                        &query_indices,
+                    )
+                    .map_err(|_| PcsError::InvalidProof)?;
+                    let response_bytes = response_wire_bytes(&Response::PcsOpenResult {
+                        opening: opening.clone(),
+                    });
+                    Ok((request_index, request_bytes + response_bytes, opening))
+                }));
+            }
+
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(result) => results.push(result?),
+                    Err(_) => return Err(PcsError::InvalidProof),
+                }
+            }
+            Ok(results)
+        })?;
+
+        let mut openings_by_request = vec![None; requests.len()];
+        let mut network_bytes = 0_usize;
+        for (request_index, bytes, opening) in open_results {
+            network_bytes += bytes;
+            if request_index >= openings_by_request.len() {
+                return Err(PcsError::InvalidProof);
+            }
+            openings_by_request[request_index] = Some(opening);
+        }
+        self.network_bytes += network_bytes;
+        openings_by_request
+            .into_iter()
+            .map(|opening| opening.ok_or(PcsError::InvalidProof))
+            .collect()
+    }
+
+    fn r1cs_spark_claims(
+        &mut self,
+        instance: &R1CS,
+        requests: &[SparkWorkerClaimRequest<'_>],
+    ) -> Result<Vec<SparkWorkerShardClaim>, CliError> {
+        let mut jobs = Vec::with_capacity(requests.len());
+        for (request_index, request) in requests.iter().copied().enumerate() {
+            let addr = self
+                .addrs
+                .get(request.partition.id)
+                .cloned()
+                .ok_or_else(|| {
+                    CliError(format!(
+                        "network Spark worker {} has no configured address",
+                        request.partition.id
+                    ))
+                })?;
+            let session = self.next_session("spark");
+            let a_entries = partition_entries(instance.a(), request.partition);
+            let b_entries = partition_entries(instance.b(), request.partition);
+            let c_entries = partition_entries(instance.c(), request.partition);
+            let row_point = request.row_point.to_vec();
+            let col_point = request.col_point.to_vec();
+            let request_message = Message::R1csSparkClaim {
+                session: session.clone(),
+                worker_id: request.partition.id,
+                start: request.partition.start,
+                end: request.partition.end,
+                rows: instance.num_constraints(),
+                cols: instance.num_variables(),
+                a_entries: a_entries.clone(),
+                b_entries: b_entries.clone(),
+                c_entries: c_entries.clone(),
+                challenges: request.challenges,
+                row_point: row_point.clone(),
+                col_point: col_point.clone(),
+            };
+            let request_bytes = message_wire_bytes(&request_message);
+            jobs.push((
+                request_index,
+                addr,
+                session,
+                request.partition,
+                request.challenges,
+                a_entries,
+                b_entries,
+                c_entries,
+                row_point,
+                col_point,
+                request_bytes,
+            ));
+        }
+
+        let results = thread::scope(|scope| {
+            let handles = jobs
+                .into_iter()
+                .map(
+                    |(
+                        request_index,
+                        addr,
+                        session,
+                        partition,
+                        challenges,
+                        a_entries,
+                        b_entries,
+                        c_entries,
+                        row_point,
+                        col_point,
+                        request_bytes,
+                    )| {
+                        let rows = instance.num_constraints();
+                        let cols = instance.num_variables();
+                        scope.spawn(move || {
+                            let claim = r1cs_spark_worker_claim(
+                                &addr,
+                                R1csSparkClaimRequest {
+                                    session: &session,
+                                    worker_id: partition.id,
+                                    start: partition.start,
+                                    end: partition.end,
+                                    rows,
+                                    cols,
+                                    a_entries: &a_entries,
+                                    b_entries: &b_entries,
+                                    c_entries: &c_entries,
+                                    challenges,
+                                    row_point: &row_point,
+                                    col_point: &col_point,
+                                },
+                            )
+                            .map_err(|error| {
+                                CliError(format!(
+                                    "network Spark worker {} failed: {error:?}",
+                                    partition.id
+                                ))
+                            })?;
+                            let response_bytes =
+                                response_wire_bytes(&Response::R1csSparkClaimResult {
+                                    claim: claim.clone(),
+                                });
+                            Ok((request_index, request_bytes + response_bytes, claim))
+                        })
+                    },
+                )
+                .collect::<Vec<_>>();
+
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(result) => results.push(result?),
+                    Err(_) => {
+                        return Err(CliError("network Spark worker thread panicked".to_owned()));
+                    }
+                }
+            }
+            Ok(results)
+        })?;
+
+        let mut claims_by_request = vec![None; requests.len()];
+        let mut network_bytes = 0_usize;
+        for (request_index, bytes, claim) in results {
+            network_bytes += bytes;
+            if request_index >= claims_by_request.len() {
+                return Err(CliError(
+                    "network Spark worker returned an out-of-range request index".to_owned(),
+                ));
+            }
+            claims_by_request[request_index] = Some(claim);
+        }
+        self.network_bytes += network_bytes;
+        claims_by_request
+            .into_iter()
+            .enumerate()
+            .map(|(request_index, claim)| {
+                claim.ok_or_else(|| {
+                    CliError(format!(
+                        "network Spark request {request_index} did not return a claim"
+                    ))
+                })
+            })
+            .collect()
     }
 
     fn next_session(&mut self, label: &str) -> String {
@@ -1286,24 +3915,13 @@ impl NetworkPcsClient {
     }
 }
 
-fn worker_opening_application_bytes(opening: &WorkerOpening) -> usize {
-    8 + 16
-        + opening
-            .queries
-            .iter()
-            .map(|query| {
-                8 + opening_proof_application_bytes(&query.systematic)
-                    + opening_proof_application_bytes(&query.systematic_next)
-                    + opening_proof_application_bytes(&query.systematic_stride)
-                    + opening_proof_application_bytes(&query.adjacent_parity)
-                    + opening_proof_application_bytes(&query.stride_parity)
-                    + opening_proof_application_bytes(&query.blend_parity)
-            })
-            .sum::<usize>()
-}
-
-fn opening_proof_application_bytes(opening: &pq_pcs::OpeningProof) -> usize {
-    16 + opening.path.len() * 33
+fn partition_entries(matrix: &SparseMatrix, partition: Partition) -> Vec<SparseEntry> {
+    matrix
+        .entries()
+        .iter()
+        .copied()
+        .filter(|entry| partition.contains(entry.row))
+        .collect()
 }
 
 fn run_plonkish(config: &Config) -> Result<Vec<MetricRecord>, CliError> {
@@ -1340,41 +3958,65 @@ fn run_plonkish_case(
     let proof = prove_for_instance(&instance, config.workers, config.pcs_queries)?;
     let prove_time = prove_start.elapsed();
 
-    let verify_proof = if tamper {
-        tamper_plonkish_proof(&proof)?
-    } else {
-        proof.clone()
-    };
-    let verify_start = Instant::now();
-    let verification = verify_for_instance(&instance, &verify_proof, config.pcs_queries);
-    let verify_time = verify_start.elapsed();
-    let verified = verification.is_ok();
-    let failure_reason = verification
-        .as_ref()
-        .err()
-        .map(|error| format!("{error:?}"));
-    let (proof_bytes, communication_bytes, constraints) = match verification {
-        Ok(metrics) => (
-            metrics.proof_bytes,
-            metrics.communication_bytes,
-            metrics.constraints,
-        ),
-        Err(_) => {
+    let (verify_time, verified, failure_reason, proof_bytes, communication_bytes, constraints) =
+        if tamper {
+            let verify_start = Instant::now();
+            let failure_reason =
+                verify_plonkish_negative_variants(&instance, &proof, config.pcs_queries)?;
+            let verify_time = verify_start.elapsed();
             let residuals = instance
                 .constraint_residuals()
                 .map_err(|error| CliError(format!("Plonkish residuals failed: {error:?}")))?;
-            let communication_bytes = pcs_communication_bytes(&proof.constraint_opening);
             (
+                verify_time,
+                false,
+                Some(failure_reason),
                 pq_piop_plonkish::proof_size_bytes(&proof),
-                communication_bytes,
+                plonkish_proof_communication_bytes(&proof),
                 residuals.len(),
             )
-        }
-    };
+        } else {
+            let verify_start = Instant::now();
+            let verification = verify_for_instance(&instance, &proof, config.pcs_queries);
+            let verify_time = verify_start.elapsed();
+            let verified = verification.is_ok();
+            let failure_reason = verification
+                .as_ref()
+                .err()
+                .map(|error| format!("{error:?}"));
+            let (proof_bytes, communication_bytes, constraints) = match verification {
+                Ok(metrics) => (
+                    metrics.proof_bytes,
+                    metrics.communication_bytes,
+                    metrics.constraints,
+                ),
+                Err(_) => {
+                    let residuals = instance.constraint_residuals().map_err(|error| {
+                        CliError(format!("Plonkish residuals failed: {error:?}"))
+                    })?;
+                    let communication_bytes = plonkish_proof_communication_bytes(&proof);
+                    (
+                        pq_piop_plonkish::proof_size_bytes(&proof),
+                        communication_bytes,
+                        residuals.len(),
+                    )
+                }
+            };
+            (
+                verify_time,
+                verified,
+                failure_reason,
+                proof_bytes,
+                communication_bytes,
+                constraints,
+            )
+        };
 
     Ok(MetricRecord {
         protocol: Protocol::Plonkish.as_str(),
+        runner: BenchmarkRunner::Local.as_str(),
         case_name,
+        trial: 1,
         workers: config.workers,
         size: config.size,
         constraints,
@@ -1384,6 +4026,9 @@ fn run_plonkish_case(
         communication_bytes,
         network_bytes: 0,
         pcs_queries: config.pcs_queries,
+        host_logical_cores: None,
+        cores_per_worker: None,
+        core_affinity: None,
         verified,
         failure_reason,
     })
@@ -1399,7 +4044,10 @@ fn run_plonkish_case_network(
         .map_err(|error| CliError(format!("Plonkish sample failed: {error:?}")))?;
     let backend = RefCell::new(NetworkPcsClient::new(
         addrs.to_vec(),
-        format!("plonkish-{case_name}"),
+        format!(
+            "plonkish-{case_name}-nv{}-w{}-q{}",
+            config.size, config.workers, config.pcs_queries
+        ),
     ));
 
     let prove_start = Instant::now();
@@ -1418,7 +4066,8 @@ fn run_plonkish_case_network(
         |evaluations, commitment, point, params, transcript| {
             backend
                 .borrow_mut()
-                .open(evaluations, commitment, point, params, transcript)
+                .open_compact(evaluations, commitment, point, params, transcript)
+                .map(PlonkishPcsOpening::Compact)
                 .map_err(|_| PlonkishPiopError::InvalidProof)
         },
     )
@@ -1426,41 +4075,65 @@ fn run_plonkish_case_network(
     let prove_time = prove_start.elapsed();
     let network_bytes = backend.borrow().bytes();
 
-    let verify_proof = if tamper {
-        tamper_plonkish_proof(&proof)?
-    } else {
-        proof.clone()
-    };
-    let verify_start = Instant::now();
-    let verification = verify_for_instance(&instance, &verify_proof, config.pcs_queries);
-    let verify_time = verify_start.elapsed();
-    let verified = verification.is_ok();
-    let failure_reason = verification
-        .as_ref()
-        .err()
-        .map(|error| format!("{error:?}"));
-    let (proof_bytes, communication_bytes, constraints) = match verification {
-        Ok(metrics) => (
-            metrics.proof_bytes,
-            metrics.communication_bytes,
-            metrics.constraints,
-        ),
-        Err(_) => {
+    let (verify_time, verified, failure_reason, proof_bytes, communication_bytes, constraints) =
+        if tamper {
+            let verify_start = Instant::now();
+            let failure_reason =
+                verify_plonkish_negative_variants(&instance, &proof, config.pcs_queries)?;
+            let verify_time = verify_start.elapsed();
             let residuals = instance
                 .constraint_residuals()
                 .map_err(|error| CliError(format!("Plonkish residuals failed: {error:?}")))?;
-            let communication_bytes = pcs_communication_bytes(&proof.constraint_opening);
             (
+                verify_time,
+                false,
+                Some(failure_reason),
                 pq_piop_plonkish::proof_size_bytes(&proof),
-                communication_bytes,
+                plonkish_proof_communication_bytes(&proof),
                 residuals.len(),
             )
-        }
-    };
+        } else {
+            let verify_start = Instant::now();
+            let verification = verify_for_instance(&instance, &proof, config.pcs_queries);
+            let verify_time = verify_start.elapsed();
+            let verified = verification.is_ok();
+            let failure_reason = verification
+                .as_ref()
+                .err()
+                .map(|error| format!("{error:?}"));
+            let (proof_bytes, communication_bytes, constraints) = match verification {
+                Ok(metrics) => (
+                    metrics.proof_bytes,
+                    metrics.communication_bytes,
+                    metrics.constraints,
+                ),
+                Err(_) => {
+                    let residuals = instance.constraint_residuals().map_err(|error| {
+                        CliError(format!("Plonkish residuals failed: {error:?}"))
+                    })?;
+                    let communication_bytes = plonkish_proof_communication_bytes(&proof);
+                    (
+                        pq_piop_plonkish::proof_size_bytes(&proof),
+                        communication_bytes,
+                        residuals.len(),
+                    )
+                }
+            };
+            (
+                verify_time,
+                verified,
+                failure_reason,
+                proof_bytes,
+                communication_bytes,
+                constraints,
+            )
+        };
 
     Ok(MetricRecord {
         protocol: Protocol::Plonkish.as_str(),
+        runner: BenchmarkRunner::Network.as_str(),
         case_name,
+        trial: 1,
         workers: config.workers,
         size: config.size,
         constraints,
@@ -1470,20 +4143,94 @@ fn run_plonkish_case_network(
         communication_bytes,
         network_bytes,
         pcs_queries: config.pcs_queries,
+        host_logical_cores: config
+            .worker_core_plan
+            .as_ref()
+            .map(|plan| plan.host_logical_cores),
+        cores_per_worker: config
+            .worker_core_plan
+            .as_ref()
+            .map(|plan| plan.cores_per_worker),
+        core_affinity: config
+            .worker_core_plan
+            .as_ref()
+            .map(|_| worker_affinity_mode()),
         verified,
         failure_reason,
     })
 }
 
-fn tamper_plonkish_proof(proof: &PlonkishPiopProof) -> Result<PlonkishPiopProof, CliError> {
-    let mut proof = proof.clone();
-    let query = proof
+fn verify_plonkish_negative_variants(
+    instance: &PlonkishInstance,
+    proof: &PlonkishPiopProof,
+    pcs_queries: usize,
+) -> Result<String, CliError> {
+    let variants = tampered_plonkish_proof_variants(proof)?;
+    if variants.is_empty() {
+        return Err(CliError(
+            "Plonkish negative case did not generate tampered proof variants".to_owned(),
+        ));
+    }
+
+    let mut failures = Vec::with_capacity(variants.len());
+    for (label, tampered) in variants {
+        match verify_for_instance(instance, &tampered, pcs_queries) {
+            Ok(_) => {
+                return Err(CliError(format!(
+                    "Plonkish negative variant '{label}' unexpectedly verified"
+                )));
+            }
+            Err(error) => failures.push(format!("{label}:{error:?}")),
+        }
+    }
+    Ok(failures.join(";"))
+}
+
+fn tampered_plonkish_proof_variants(
+    proof: &PlonkishPiopProof,
+) -> Result<Vec<(&'static str, PlonkishPiopProof)>, CliError> {
+    let mut variants = Vec::new();
+
+    let mut accumulator = proof.clone();
+    accumulator
         .permutation_accumulator
         .recurrence_queries
         .first_mut()
-        .ok_or_else(|| CliError("Plonkish accumulator query unexpectedly empty".to_owned()))?;
-    query.numerator_next.value += FieldElement::ONE;
-    Ok(proof)
+        .ok_or_else(|| CliError("Plonkish accumulator query unexpectedly empty".to_owned()))?
+        .numerator_next
+        .value += FieldElement::ONE;
+    variants.push(("accumulator-recurrence", accumulator));
+
+    let mut gate_query = proof.clone();
+    gate_query
+        .gate_queries
+        .first_mut()
+        .ok_or_else(|| CliError("Plonkish gate query unexpectedly empty".to_owned()))?
+        .a
+        .value += FieldElement::ONE;
+    variants.push(("gate-query", gate_query));
+
+    let mut permutation_query = proof.clone();
+    permutation_query
+        .permutation_queries
+        .first_mut()
+        .ok_or_else(|| CliError("Plonkish permutation query unexpectedly empty".to_owned()))?
+        .target_value
+        .value += FieldElement::ONE;
+    variants.push(("permutation-query", permutation_query));
+
+    let mut gate_subclaim = proof.clone();
+    gate_subclaim.gate_subclaim.virtual_gate_value += FieldElement::ONE;
+    variants.push(("gate-subclaim", gate_subclaim));
+
+    let mut constraint_opening = proof.clone();
+    match &mut constraint_opening.constraint_opening {
+        PlonkishPcsOpening::Full(opening) => opening.claimed_value += FieldElement::ONE,
+        PlonkishPcsOpening::Compact(opening) => opening.claimed_value += FieldElement::ONE,
+    }
+    variants.push(("constraint-pcs-opening", constraint_opening));
+
+    Ok(variants)
 }
 
 fn prove_for_instance(
@@ -1597,9 +4344,11 @@ fn records_to_json(records: &[MetricRecord]) -> String {
         let comma = if index + 1 == records.len() { "" } else { "," };
         let failure_reason = json_optional_string(record.failure_reason.as_deref());
         out.push_str(&format!(
-            "  {{\"protocol\":\"{}\",\"case\":\"{}\",\"workers\":{},\"nv_power\":{},\"size\":{},\"constraints\":{},\"pcs_queries\":{},\"prove_ms\":{:.3},\"verify_ms\":{:.3},\"proof_bytes\":{},\"communication_bytes\":{},\"network_bytes\":{},\"verified\":{},\"failure_reason\":{}}}{}\n",
+            "  {{\"protocol\":\"{}\",\"runner\":\"{}\",\"case\":\"{}\",\"trial\":{},\"workers\":{},\"nv_power\":{},\"size\":{},\"constraints\":{},\"pcs_queries\":{},\"prove_ms\":{:.3},\"verify_ms\":{:.3},\"proof_bytes\":{},\"communication_bytes\":{},\"network_bytes\":{},\"host_logical_cores\":{},\"cores_per_worker\":{},\"core_affinity\":{},\"verified\":{},\"failure_reason\":{}}}{}\n",
             record.protocol,
+            record.runner,
             record.case_name,
+            record.trial,
             record.workers,
             nv_power(record.size),
             record.size,
@@ -1610,6 +4359,9 @@ fn records_to_json(records: &[MetricRecord]) -> String {
             record.proof_bytes,
             record.communication_bytes,
             record.network_bytes,
+            json_optional_usize(record.host_logical_cores),
+            json_optional_usize(record.cores_per_worker),
+            json_optional_string(record.core_affinity),
             record.verified,
             failure_reason,
             comma
@@ -1620,9 +4372,7 @@ fn records_to_json(records: &[MetricRecord]) -> String {
 }
 
 fn records_to_csv(records: &[MetricRecord]) -> String {
-    let mut out = String::from(
-        "protocol,case,workers,nv_power,size,constraints,pcs_queries,prove_ms,verify_ms,proof_bytes,communication_bytes,network_bytes,verified,failure_reason\n",
-    );
+    let mut out = format!("{SOURCE_CSV_HEADER}\n");
     for record in records {
         let failure_reason = record
             .failure_reason
@@ -1630,9 +4380,11 @@ fn records_to_csv(records: &[MetricRecord]) -> String {
             .map(csv_escape)
             .unwrap_or_default();
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{}\n",
             record.protocol,
+            record.runner,
             record.case_name,
+            record.trial,
             record.workers,
             nv_power(record.size),
             record.size,
@@ -1643,11 +4395,264 @@ fn records_to_csv(records: &[MetricRecord]) -> String {
             record.proof_bytes,
             record.communication_bytes,
             record.network_bytes,
+            record
+                .host_logical_cores
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .cores_per_worker
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record.core_affinity.map(csv_escape).unwrap_or_default(),
             record.verified,
             failure_reason
         ));
     }
     out
+}
+
+fn push_phase_timing(
+    timings: &mut Vec<PhaseTimingRecord>,
+    phase: impl Into<String>,
+    detail: impl Into<String>,
+    elapsed: Duration,
+    recorded_prove_ms: f64,
+    recorded_verify_ms: f64,
+) {
+    let elapsed_ms = millis(elapsed);
+    let inferred_overhead_ms = (elapsed_ms - recorded_prove_ms - recorded_verify_ms).max(0.0);
+    timings.push(PhaseTimingRecord {
+        phase: phase.into(),
+        detail: detail.into(),
+        elapsed_ms,
+        recorded_prove_ms,
+        recorded_verify_ms,
+        inferred_overhead_ms,
+    });
+}
+
+fn sum_record_prove_ms(records: &[MetricRecord]) -> f64 {
+    records.iter().map(|record| record.prove_ms).sum()
+}
+
+fn sum_record_verify_ms(records: &[MetricRecord]) -> f64 {
+    records.iter().map(|record| record.verify_ms).sum()
+}
+
+fn write_phase_timing_files(run_dir: &Path, timings: &[PhaseTimingRecord]) -> Result<(), CliError> {
+    write_text_file(
+        &run_dir.join("phase_timing.csv"),
+        &phase_timing_to_csv(timings),
+    )?;
+    write_text_file(
+        &run_dir.join("phase_timing.json"),
+        &phase_timing_to_json(timings),
+    )
+}
+
+fn phase_timing_to_csv(timings: &[PhaseTimingRecord]) -> String {
+    let mut out = format!("{PHASE_TIMING_CSV_HEADER}\n");
+    for timing in timings {
+        out.push_str(&format!(
+            "{},{},{:.3},{:.3},{:.3},{:.3}\n",
+            csv_escape(&timing.phase),
+            csv_escape(&timing.detail),
+            timing.elapsed_ms,
+            timing.recorded_prove_ms,
+            timing.recorded_verify_ms,
+            timing.inferred_overhead_ms
+        ));
+    }
+    out
+}
+
+fn phase_timing_to_json(timings: &[PhaseTimingRecord]) -> String {
+    let mut out = String::from("[\n");
+    for (index, timing) in timings.iter().enumerate() {
+        let comma = if index + 1 == timings.len() { "" } else { "," };
+        out.push_str(&format!(
+            "  {{\"phase\":\"{}\",\"detail\":\"{}\",\"elapsed_ms\":{:.3},\"recorded_prove_ms\":{:.3},\"recorded_verify_ms\":{:.3},\"inferred_overhead_ms\":{:.3}}}{}\n",
+            json_escape(&timing.phase),
+            json_escape(&timing.detail),
+            timing.elapsed_ms,
+            timing.recorded_prove_ms,
+            timing.recorded_verify_ms,
+            timing.inferred_overhead_ms,
+            comma
+        ));
+    }
+    out.push_str("]\n");
+    out
+}
+
+fn phase_timing_summary(timings: &[PhaseTimingRecord]) -> String {
+    let mut out = String::new();
+    if timings.is_empty() {
+        return out;
+    }
+    out.push_str("\nphase_timing:\n");
+    for timing in timings {
+        out.push_str(&format!(
+            "  phase={} elapsed_ms={:.3} recorded_prove_ms={:.3} recorded_verify_ms={:.3} inferred_overhead_ms={:.3} detail={}\n",
+            timing.phase,
+            timing.elapsed_ms,
+            timing.recorded_prove_ms,
+            timing.recorded_verify_ms,
+            timing.inferred_overhead_ms,
+            timing.detail
+        ));
+    }
+    out
+}
+
+fn benchmark_stats(records: &[MetricRecord]) -> Vec<BenchmarkStatsRecord> {
+    let mut groups: Vec<Vec<&MetricRecord>> = Vec::new();
+    for record in records {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            let first = group[0];
+            first.protocol == record.protocol
+                && first.runner == record.runner
+                && first.case_name == record.case_name
+                && first.workers == record.workers
+                && first.size == record.size
+                && first.constraints == record.constraints
+                && first.pcs_queries == record.pcs_queries
+        }) {
+            group.push(record);
+        } else {
+            groups.push(vec![record]);
+        }
+    }
+    let mut stats = groups
+        .into_iter()
+        .map(|mut group| {
+            group.sort_by_key(|record| record.trial);
+            let first = group[0];
+            let samples = group.len();
+            let verified_count = group.iter().filter(|record| record.verified).count();
+            let rejected_count = group.iter().filter(|record| !record.verified).count();
+            let mut failure_reasons = group
+                .iter()
+                .filter_map(|record| record.failure_reason.as_deref())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            failure_reasons.sort();
+            failure_reasons.dedup();
+            BenchmarkStatsRecord {
+                protocol: first.protocol,
+                runner: first.runner,
+                case_name: first.case_name,
+                workers: first.workers,
+                size: first.size,
+                constraints: first.constraints,
+                pcs_queries: first.pcs_queries,
+                samples,
+                verified_count,
+                rejected_count,
+                prove_ms: mean_stddev(group.iter().map(|record| record.prove_ms)),
+                verify_ms: mean_stddev(group.iter().map(|record| record.verify_ms)),
+                proof_bytes: mean_stddev(group.iter().map(|record| record.proof_bytes as f64)),
+                communication_bytes: mean_stddev(
+                    group.iter().map(|record| record.communication_bytes as f64),
+                ),
+                network_bytes: mean_stddev(group.iter().map(|record| record.network_bytes as f64)),
+                failure_reasons,
+            }
+        })
+        .collect::<Vec<_>>();
+    stats.sort_by(|left, right| {
+        runner_sort_key(left.runner)
+            .cmp(&runner_sort_key(right.runner))
+            .then(protocol_sort_key(left.protocol).cmp(&protocol_sort_key(right.protocol)))
+            .then(left.case_name.cmp(right.case_name))
+            .then(left.size.cmp(&right.size))
+            .then(left.workers.cmp(&right.workers))
+    });
+    stats
+}
+
+fn mean_stddev(values: impl Iterator<Item = f64>) -> MeanStddev {
+    let values = values.collect::<Vec<_>>();
+    if values.is_empty() {
+        return MeanStddev {
+            mean: 0.0,
+            stddev: 0.0,
+        };
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let stddev = if values.len() > 1 {
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / (values.len() - 1) as f64;
+        variance.sqrt()
+    } else {
+        0.0
+    };
+    MeanStddev { mean, stddev }
+}
+
+fn summary_stats_to_csv(stats: &[BenchmarkStatsRecord]) -> String {
+    let mut out = format!("{SUMMARY_STATS_CSV_HEADER}\n");
+    for record in stats {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{}\n",
+            record.protocol,
+            record.runner,
+            record.case_name,
+            record.workers,
+            nv_power(record.size),
+            record.size,
+            record.constraints,
+            record.pcs_queries,
+            record.samples,
+            record.verified_count,
+            record.rejected_count,
+            record.prove_ms.mean,
+            record.prove_ms.stddev,
+            record.verify_ms.mean,
+            record.verify_ms.stddev,
+            record.proof_bytes.mean,
+            record.proof_bytes.stddev,
+            record.communication_bytes.mean,
+            record.communication_bytes.stddev,
+            record.network_bytes.mean,
+            record.network_bytes.stddev,
+            csv_escape(&record.failure_reasons.join("|"))
+        ));
+    }
+    out
+}
+
+fn mean_positive_records(records: &[MetricRecord]) -> Vec<MetricRecord> {
+    benchmark_stats(records)
+        .into_iter()
+        .filter(|record| record.case_name == "positive" && record.verified_count > 0)
+        .map(|record| MetricRecord {
+            protocol: record.protocol,
+            runner: record.runner,
+            case_name: record.case_name,
+            trial: 0,
+            workers: record.workers,
+            size: record.size,
+            constraints: record.constraints,
+            prove_ms: record.prove_ms.mean,
+            verify_ms: record.verify_ms.mean,
+            proof_bytes: record.proof_bytes.mean.round() as usize,
+            communication_bytes: record.communication_bytes.mean.round() as usize,
+            network_bytes: record.network_bytes.mean.round() as usize,
+            pcs_queries: record.pcs_queries,
+            host_logical_cores: None,
+            cores_per_worker: None,
+            core_affinity: None,
+            verified: true,
+            failure_reason: None,
+        })
+        .collect()
 }
 
 fn millis(duration: Duration) -> f64 {
@@ -1666,10 +4671,60 @@ fn json_escape(input: &str) -> String {
         .replace('\r', "\\r")
 }
 
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 fn json_optional_string(value: Option<&str>) -> String {
     value
         .map(|value| format!("\"{}\"", json_escape(value)))
         .unwrap_or_else(|| "null".to_owned())
+}
+
+fn json_optional_bool(value: Option<bool>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn json_optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn json_string_array(values: &[impl AsRef<str>]) -> String {
+    let items = values
+        .iter()
+        .map(|value| format!("\"{}\"", json_escape(value.as_ref())))
+        .collect::<Vec<_>>();
+    format!("[{}]", items.join(","))
+}
+
+fn json_usize_array(values: &[usize]) -> String {
+    let items = values.iter().map(ToString::to_string).collect::<Vec<_>>();
+    format!("[{}]", items.join(","))
+}
+
+fn json_usize_matrix(values: &[Vec<usize>]) -> String {
+    let rows = values
+        .iter()
+        .map(|row| json_usize_array(row))
+        .collect::<Vec<_>>();
+    format!("[{}]", rows.join(","))
+}
+
+fn benchmark_artifacts(compile_figures: bool) -> Vec<&'static str> {
+    let mut artifacts = BASE_BENCHMARK_ARTIFACTS.to_vec();
+    if compile_figures {
+        artifacts.push(COMPILED_PAPER_FIGURE);
+    }
+    artifacts
 }
 
 fn csv_escape(input: &str) -> String {
@@ -1683,11 +4738,38 @@ fn csv_escape(input: &str) -> String {
     }
 }
 
-fn unix_timestamp_seconds() -> Result<u64, CliError> {
-    SystemTime::now()
+fn create_benchmark_run_dir(out_dir: &Path) -> Result<(u64, PathBuf), CliError> {
+    fs::create_dir_all(out_dir)
+        .map_err(|error| CliError(format!("create benchmark root failed: {error}")))?;
+    for attempt in 0..128_u64 {
+        let run_id = unix_timestamp_nanos()?
+            .checked_add(attempt)
+            .ok_or_else(|| CliError("benchmark run id overflowed".to_owned()))?;
+        let run_dir = out_dir.join(format!("bench-{run_id}"));
+        match fs::create_dir(&run_dir) {
+            Ok(()) => return Ok((run_id, run_dir)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(CliError(format!(
+                    "create benchmark dir {} failed: {error}",
+                    run_dir.display()
+                )));
+            }
+        }
+    }
+    Err(CliError(format!(
+        "could not create a fresh benchmark directory under {} after repeated run-id collisions",
+        out_dir.display()
+    )))
+}
+
+fn unix_timestamp_nanos() -> Result<u64, CliError> {
+    let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .map_err(|error| CliError(format!("system clock before UNIX epoch: {error}")))
+        .map(|duration| duration.as_nanos())
+        .map_err(|error| CliError(format!("system clock before UNIX epoch: {error}")))?;
+    u64::try_from(nanos)
+        .map_err(|_| CliError("UNIX timestamp nanoseconds overflowed u64".to_owned()))
 }
 
 fn write_text_file(path: &Path, contents: &str) -> Result<(), CliError> {
@@ -1695,7 +4777,604 @@ fn write_text_file(path: &Path, contents: &str) -> Result<(), CliError> {
         .map_err(|error| CliError(format!("write {} failed: {error}", path.display())))
 }
 
-fn benchmark_summary(command: &BenchmarkCommand, records: &[MetricRecord]) -> String {
+fn write_benchmark_metadata_and_manifest(
+    run_dir: &Path,
+    run_id: u64,
+    command: &BenchmarkCommand,
+    records: &[MetricRecord],
+    figure_pdf_created: bool,
+    provenance: &BenchmarkProvenance,
+) -> Result<(), CliError> {
+    write_text_file(
+        &run_dir.join("metadata.json"),
+        &benchmark_metadata_json(run_id, command, records, figure_pdf_created, provenance),
+    )?;
+    let manifest = benchmark_result_manifest_json(run_dir, run_id, figure_pdf_created)?;
+    write_text_file(&run_dir.join(RESULT_MANIFEST), &manifest)
+}
+
+fn benchmark_result_manifest_json(
+    run_dir: &Path,
+    run_id: u64,
+    figure_pdf_created: bool,
+) -> Result<String, CliError> {
+    let artifacts = benchmark_artifacts(figure_pdf_created);
+    let mut entries = Vec::new();
+    for artifact in artifacts {
+        if artifact == RESULT_MANIFEST {
+            continue;
+        }
+        let path = run_dir.join(artifact);
+        let bytes = fs::read(&path)
+            .map_err(|error| CliError(format!("read {} failed: {error}", path.display())))?;
+        let digest = hex_digest(sha256(&bytes));
+        entries.push((artifact, bytes.len(), digest));
+    }
+
+    let mut out = String::from("{\n");
+    out.push_str("  \"schema_version\": 1,\n");
+    out.push_str("  \"generated_by\": \"pq-experiments benchmark manifest\",\n");
+    out.push_str(&format!("  \"run_id\": {run_id},\n"));
+    out.push_str(&format!("  \"artifact_count\": {},\n", entries.len()));
+    out.push_str(&format!(
+        "  \"self_artifact\": \"{}\",\n",
+        json_escape(RESULT_MANIFEST)
+    ));
+    out.push_str("  \"files\": [\n");
+    for (index, (path, bytes, digest)) in entries.iter().enumerate() {
+        let comma = if index + 1 == entries.len() { "" } else { "," };
+        out.push_str(&format!(
+            "    {{\"path\":\"{}\",\"bytes\":{},\"sha256\":\"{}\"}}{}\n",
+            json_escape(path),
+            bytes,
+            digest,
+            comma
+        ));
+    }
+    out.push_str("  ]\n");
+    out.push_str("}\n");
+    Ok(out)
+}
+
+fn hex_digest(digest: [u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn benchmark_metadata_json(
+    run_id: u64,
+    command: &BenchmarkCommand,
+    records: &[MetricRecord],
+    figure_pdf_created: bool,
+    provenance: &BenchmarkProvenance,
+) -> String {
+    let positives = records
+        .iter()
+        .filter(|record| record.case_name == "positive" && record.verified)
+        .count();
+    let negatives = records
+        .iter()
+        .filter(|record| record.case_name == "negative" && !record.verified)
+        .count();
+    let nv_powers = command
+        .sizes
+        .iter()
+        .map(|size| nv_power(*size))
+        .collect::<Vec<_>>();
+    let command_line = env::args().collect::<Vec<_>>();
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 7,\n",
+            "  \"run_id\": {},\n",
+            "  \"generated_by\": \"pq-experiments benchmark\",\n",
+            "  \"host_os\": \"{}\",\n",
+            "  \"host_arch\": \"{}\",\n",
+            "  \"build_profile\": \"{}\",\n",
+            "  \"package_version\": \"{}\",\n",
+            "  \"command_line\": {},\n",
+            "  \"out_dir\": \"{}\",\n",
+            "  \"nv_powers\": {},\n",
+            "  \"sizes\": {},\n",
+            "  \"workers\": {},\n",
+            "  \"pcs_queries\": {},\n",
+            "  \"repeats\": {},\n",
+            "  \"paper_preset\": {},\n",
+            "  \"runner\": \"{}\",\n",
+            "  \"figure_compiler\": \"{}\",\n",
+            "  \"compile_figures_requested\": {},\n",
+            "  \"compile_figures_succeeded\": {},\n",
+            "  \"record_count\": {},\n",
+            "  \"positive_verified\": {},\n",
+            "  \"negative_rejected\": {},\n",
+            "  \"artifacts\": {},\n",
+            "  \"core_allocation\": {},\n",
+            "  \"provenance\": {}\n",
+            "}}\n"
+        ),
+        run_id,
+        json_escape(env::consts::OS),
+        json_escape(env::consts::ARCH),
+        build_profile(),
+        json_escape(env!("CARGO_PKG_VERSION")),
+        json_string_array(&command_line),
+        json_escape(&command.out_dir.display().to_string()),
+        json_usize_array(&nv_powers),
+        json_usize_array(&command.sizes),
+        json_usize_array(&command.workers),
+        command.pcs_queries,
+        command.repeats,
+        command.paper_preset,
+        command.runner.as_str(),
+        command.figure_compiler.as_str(),
+        command.compile_figures,
+        figure_pdf_created,
+        records.len(),
+        positives,
+        negatives,
+        json_string_array(&benchmark_artifacts(figure_pdf_created)),
+        benchmark_core_allocation_json(command),
+        provenance.to_json()
+    )
+}
+
+fn benchmark_core_allocation_json(command: &BenchmarkCommand) -> String {
+    let Some(plan) = &command.worker_core_plan else {
+        return "null".to_owned();
+    };
+    let worker_core_ids = (0..plan.max_workers)
+        .map(|worker_id| plan.core_ids_for_worker(worker_id))
+        .collect::<Vec<_>>();
+    format!(
+        concat!(
+            "{{",
+            "\"host_logical_cores\":{},",
+            "\"max_workers\":{},",
+            "\"cores_per_worker\":{},",
+            "\"affinity_mode\":\"{}\",",
+            "\"worker_core_ids\":{}",
+            "}}"
+        ),
+        plan.host_logical_cores,
+        plan.max_workers,
+        plan.cores_per_worker,
+        worker_affinity_mode(),
+        json_usize_matrix(&worker_core_ids)
+    )
+}
+
+fn benchmark_core_allocation_summary(command: &BenchmarkCommand) -> String {
+    command
+        .worker_core_plan
+        .as_ref()
+        .map(|plan| {
+            format!(
+                "host_logical_cores={},max_workers={},cores_per_worker={},affinity_mode={}",
+                plan.host_logical_cores,
+                plan.max_workers,
+                plan.cores_per_worker,
+                worker_affinity_mode()
+            )
+        })
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+fn write_benchmark_overview_html(
+    run_dir: &Path,
+    run_id: u64,
+    command: &BenchmarkCommand,
+    records: &[MetricRecord],
+    figure_pdf_created: bool,
+) -> Result<(), CliError> {
+    write_text_file(
+        &run_dir.join(OVERVIEW_HTML),
+        &benchmark_overview_html(run_id, command, records, figure_pdf_created),
+    )
+}
+
+fn benchmark_overview_html(
+    run_id: u64,
+    command: &BenchmarkCommand,
+    records: &[MetricRecord],
+    figure_pdf_created: bool,
+) -> String {
+    let positives_verified = records
+        .iter()
+        .filter(|record| record.case_name == "positive" && record.verified)
+        .count();
+    let negatives_rejected = records
+        .iter()
+        .filter(|record| record.case_name == "negative" && !record.verified)
+        .count();
+    let positive_total = records
+        .iter()
+        .filter(|record| record.case_name == "positive")
+        .count();
+    let negative_total = records
+        .iter()
+        .filter(|record| record.case_name == "negative")
+        .count();
+    let correctness_ok =
+        positives_verified == positive_total && negative_total == 0 && negatives_rejected == 0;
+    let stats = benchmark_stats(records);
+    let scaling_rows = benchmark_overview_scaling_rows(&stats, command);
+    let stats_rows = benchmark_overview_stats_rows(&stats);
+    let artifact_rows = benchmark_overview_artifact_rows(figure_pdf_created);
+    let chart_cards = benchmark_overview_chart_cards();
+    let core_allocation = benchmark_overview_core_allocation(command);
+    let nv_powers = command
+        .sizes
+        .iter()
+        .map(|size| nv_power(*size).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sizes = command
+        .sizes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let workers = command
+        .workers
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let status_class = if correctness_ok { "ok" } else { "fail" };
+    let status_text = if correctness_ok {
+        "All positive performance proofs verified; no negative correctness rows are included."
+    } else {
+        "Performance benchmark gate failed; inspect source rows before using these results."
+    };
+    format!(
+        concat!(
+            "<!doctype html>\n",
+            "<html lang=\"en\">\n",
+            "<head>\n",
+            "  <meta charset=\"utf-8\">\n",
+            "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
+            "  <title>pq_dSNARK benchmark overview {run_id}</title>\n",
+            "  <style>{css}</style>\n",
+            "</head>\n",
+            "<body>\n",
+            "  <main class=\"shell\">\n",
+            "    <section class=\"hero\">\n",
+            "      <div>\n",
+            "        <p class=\"label\">pq_dSNARK benchmark overview</p>\n",
+            "        <h1>Run {run_id}</h1>\n",
+            "        <p class=\"summary\">Measured end-to-end prover cost, verifier cost, proof size, network bytes, and worker scaling from the real protocol path. No fitted or synthetic data is used.</p>\n",
+            "      </div>\n",
+            "      <div class=\"status {status_class}\">{status_text}</div>\n",
+            "    </section>\n",
+            "    <section class=\"cards\">\n",
+            "      <article><span>records</span><strong>{records}</strong><small>one prove+verify per row</small></article>\n",
+            "      <article><span>positive verified</span><strong>{positives_verified}/{positive_total}</strong><small>required performance path</small></article>\n",
+            "      <article><span>negative rows</span><strong>{negative_total}</strong><small>excluded from benchmark</small></article>\n",
+            "      <article><span>runner</span><strong>{runner}</strong><small>selected benchmark mode</small></article>\n",
+            "    </section>\n",
+            "    <section class=\"panel grid2\">\n",
+            "      <div>\n",
+            "        <h2>Configuration</h2>\n",
+            "        <dl class=\"kv\">",
+            "          <dt>nv powers</dt><dd>{nv_powers}</dd>",
+            "          <dt>sizes</dt><dd>{sizes}</dd>",
+            "          <dt>workers</dt><dd>{workers}</dd>",
+            "          <dt>PCS queries</dt><dd>{pcs_queries}</dd>",
+            "          <dt>per config</dt><dd>one prove+verify</dd>",
+            "          <dt>build profile</dt><dd>{build_profile}</dd>",
+            "          <dt>figure PDF</dt><dd>{figure_pdf}</dd>",
+            "        </dl>",
+            "      </div>\n",
+            "      <div>{core_allocation}</div>\n",
+            "    </section>\n",
+            "    <section class=\"panel\">\n",
+            "      <h2>Paper Figures</h2>\n",
+            "      <div class=\"charts\">{chart_cards}</div>\n",
+            "    </section>\n",
+            "    <section class=\"panel\">\n",
+            "      <h2>Scaling Check</h2>\n",
+            "      <p class=\"note\">The dashed reference is a perfect-linear upper bound against the workers=1 baseline for the same protocol, runner, and largest tested size, not a prediction for this correctness prototype. Small circuits and serial master, transcript, verifier, and PCS-orchestration work can dominate; superlinear or missing-baseline claims should be treated as suspicious.</p>\n",
+            "      <div class=\"table-wrap\"><table><thead><tr><th>runner</th><th>protocol</th><th>workers</th><th>speedup</th><th>efficiency</th><th>serial+overhead</th><th>assessment</th></tr></thead><tbody>{scaling_rows}</tbody></table></div>\n",
+            "    </section>\n",
+            "    <section class=\"panel\">\n",
+            "      <h2>Summary Statistics</h2>\n",
+            "      <div class=\"table-wrap\"><table><thead><tr><th>runner</th><th>protocol</th><th>case</th><th>n</th><th>workers</th><th>samples</th><th>prove ms</th><th>verify ms</th><th>proof bytes</th><th>network bytes</th></tr></thead><tbody>{stats_rows}</tbody></table></div>\n",
+            "    </section>\n",
+            "    <section class=\"panel\">\n",
+            "      <h2>Artifacts</h2>\n",
+            "      <div class=\"artifact-grid\">{artifact_rows}</div>\n",
+            "    </section>\n",
+            "  </main>\n",
+            "</body>\n",
+            "</html>\n"
+        ),
+        run_id = run_id,
+        css = benchmark_overview_css(),
+        status_class = status_class,
+        status_text = html_escape(status_text),
+        records = records.len(),
+        positives_verified = positives_verified,
+        positive_total = positive_total,
+        negative_total = negative_total,
+        runner = html_escape(command.runner.as_str()),
+        nv_powers = html_escape(&nv_powers),
+        sizes = html_escape(&sizes),
+        workers = html_escape(&workers),
+        pcs_queries = command.pcs_queries,
+        build_profile = html_escape(build_profile()),
+        figure_pdf = if figure_pdf_created {
+            "created"
+        } else {
+            "not created"
+        },
+        core_allocation = core_allocation,
+        chart_cards = chart_cards,
+        scaling_rows = scaling_rows,
+        stats_rows = stats_rows,
+        artifact_rows = artifact_rows
+    )
+}
+
+fn benchmark_overview_css() -> &'static str {
+    r#"
+:root { color-scheme: light; --bg: #f6f7fb; --ink: #111827; --muted: #64748b; --line: #d8dde8; --panel: #ffffff; --blue: #1d4ed8; --green: #047857; --red: #b91c1c; --amber: #b45309; --shadow: 0 18px 50px rgba(15, 23, 42, .10); }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.45; }
+a { color: inherit; text-decoration: none; }
+.shell { width: min(1180px, calc(100vw - 40px)); margin: 0 auto; padding: 40px 0 56px; }
+.hero { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 28px; align-items: end; padding: 34px; color: #fff; background: linear-gradient(135deg, #111827 0%, #123f7c 58%, #0f766e 100%); border-radius: 8px; box-shadow: var(--shadow); }
+.label { margin: 0 0 12px; color: #bfdbfe; font-size: 13px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+h1 { margin: 0; font-size: 42px; line-height: 1.05; letter-spacing: 0; }
+h2 { margin: 0 0 18px; font-size: 20px; letter-spacing: 0; }
+.summary { max-width: 760px; margin: 16px 0 0; color: #dbeafe; font-size: 16px; }
+.status { padding: 18px; border: 1px solid rgba(255,255,255,.24); border-radius: 8px; background: rgba(255,255,255,.10); font-weight: 700; }
+.status.ok { border-color: rgba(187,247,208,.48); }
+.status.fail { border-color: rgba(254,202,202,.7); }
+.cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+.cards article, .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 10px 30px rgba(15, 23, 42, .06); }
+.cards article { padding: 18px; }
+.cards span { display: block; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }
+.cards strong { display: block; margin-top: 8px; font-size: 30px; line-height: 1; letter-spacing: 0; }
+.cards small { display: block; margin-top: 10px; color: var(--muted); }
+.panel { padding: 24px; margin-top: 18px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+.kv { display: grid; grid-template-columns: 150px 1fr; gap: 9px 18px; margin: 0; }
+.kv dt { color: var(--muted); font-weight: 700; }
+.kv dd { margin: 0; font-weight: 650; }
+.note { color: var(--muted); max-width: 880px; margin: -4px 0 18px; }
+.charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.chart-card { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: #fbfdff; }
+.chart-card img { display: block; width: 100%; height: 260px; object-fit: contain; background: #fff; border-bottom: 1px solid var(--line); }
+.chart-card div { padding: 14px 16px; display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.chart-card strong { font-size: 14px; }
+.chart-card span { color: var(--muted); font-size: 13px; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+table { width: 100%; border-collapse: collapse; min-width: 760px; background: #fff; }
+th, td { padding: 11px 13px; border-bottom: 1px solid #e8edf5; text-align: left; font-size: 13px; white-space: nowrap; }
+th { color: #334155; background: #f8fafc; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+tr:last-child td { border-bottom: 0; }
+.tag { display: inline-block; padding: 3px 8px; border-radius: 999px; font-weight: 700; font-size: 12px; }
+.tag.ok { color: var(--green); background: #dcfce7; }
+.tag.warn { color: var(--amber); background: #fef3c7; }
+.tag.fail { color: var(--red); background: #fee2e2; }
+.artifact-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.artifact-grid a { display: block; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fbfdff; font-size: 13px; font-weight: 650; }
+.artifact-grid a:hover { border-color: #93c5fd; background: #eff6ff; }
+@media (max-width: 900px) { .hero, .grid2, .charts { grid-template-columns: 1fr; } .cards, .artifact-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .shell { width: min(100vw - 24px, 1180px); padding-top: 20px; } .hero { padding: 22px; } h1 { font-size: 32px; } .cards, .artifact-grid { grid-template-columns: 1fr; } .chart-card img { height: 210px; } }
+"#
+}
+
+fn benchmark_overview_core_allocation(command: &BenchmarkCommand) -> String {
+    let Some(plan) = &command.worker_core_plan else {
+        return concat!(
+            "<h2>Core Allocation</h2>",
+            "<p class=\"note\">No worker affinity was requested. Local-only runs and single-worker network runs use the host scheduler.</p>"
+        )
+        .to_owned();
+    };
+    let rows = (0..plan.max_workers)
+        .map(|worker_id| {
+            let ids = plan
+                .core_ids_for_worker(worker_id)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "<dt>worker {}</dt><dd>{}</dd>",
+                worker_id,
+                html_escape(&ids)
+            )
+        })
+        .collect::<String>();
+    format!(
+        concat!(
+            "<h2>Core Allocation</h2>",
+            "<dl class=\"kv\">",
+            "<dt>host logical cores</dt><dd>{}</dd>",
+            "<dt>max workers</dt><dd>{}</dd>",
+            "<dt>cores per worker</dt><dd>{}</dd>",
+            "<dt>affinity mode</dt><dd>{}</dd>",
+            "{}",
+            "</dl>"
+        ),
+        plan.host_logical_cores,
+        plan.max_workers,
+        plan.cores_per_worker,
+        html_escape(worker_affinity_mode()),
+        rows
+    )
+}
+
+fn benchmark_overview_chart_cards() -> String {
+    [
+        (
+            "Proving Time",
+            "prove_time_by_size.svg",
+            "Mean prover time by size and worker count",
+        ),
+        (
+            "Verifier Time",
+            "verify_time_by_size.svg",
+            "Mean verifier time by size and worker count",
+        ),
+        (
+            "Proof Bytes",
+            "proof_bytes_by_size.svg",
+            "Proof size across protocols",
+        ),
+        (
+            "Worker Scaling",
+            "worker_scaling_max_size.svg",
+            "Speedup and perfect-scaling bound",
+        ),
+    ]
+    .iter()
+    .map(|(title, path, subtitle)| {
+        format!(
+            "<a class=\"chart-card\" href=\"{path}\"><img src=\"{path}\" alt=\"{title}\"><div><strong>{title}</strong><span>{subtitle}</span></div></a>",
+            path = html_escape(path),
+            title = html_escape(title),
+            subtitle = html_escape(subtitle)
+        )
+    })
+    .collect::<String>()
+}
+
+fn benchmark_overview_scaling_rows(
+    stats: &[BenchmarkStatsRecord],
+    command: &BenchmarkCommand,
+) -> String {
+    let Some(max_size) = command.sizes.iter().copied().max() else {
+        return "<tr><td colspan=\"6\">No size data.</td></tr>".to_owned();
+    };
+    let positives = stats
+        .iter()
+        .filter(|record| {
+            record.case_name == "positive"
+                && record.size == max_size
+                && record.verified_count > 0
+                && record.prove_ms.mean > 0.0
+        })
+        .collect::<Vec<_>>();
+    let mut rows = String::new();
+    for record in &positives {
+        if record.workers == 1 {
+            continue;
+        }
+        let baseline = positives.iter().find(|candidate| {
+            candidate.runner == record.runner
+                && candidate.protocol == record.protocol
+                && candidate.workers == 1
+        });
+        let Some(baseline) = baseline else {
+            rows.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td colspan=\"4\"><span class=\"tag fail\">missing baseline</span></td></tr>",
+                html_escape(record.runner),
+                html_escape(record.protocol),
+                record.workers
+            ));
+            continue;
+        };
+        let speedup = baseline.prove_ms.mean / record.prove_ms.mean;
+        let efficiency = speedup / record.workers as f64;
+        let serial_overhead = amdahl_serial_overhead_fraction(speedup, record.workers);
+        let (class, label) = scaling_assessment(speedup, record.workers);
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td><span class=\"tag {}\">{}</span></td></tr>",
+            html_escape(record.runner),
+            html_escape(record.protocol),
+            record.workers,
+            speedup,
+            efficiency,
+            serial_overhead,
+            class,
+            html_escape(label)
+        ));
+    }
+    if rows.is_empty() {
+        "<tr><td colspan=\"7\">Only workers=1 was measured, so the scaling panel is a baseline integrity check rather than a speedup claim.</td></tr>".to_owned()
+    } else {
+        rows
+    }
+}
+
+fn amdahl_serial_overhead_fraction(speedup: f64, workers: usize) -> f64 {
+    if workers <= 1 || !speedup.is_finite() || speedup <= 0.0 {
+        return 1.0;
+    }
+    let worker_count = workers as f64;
+    let estimate = ((1.0 / speedup) - (1.0 / worker_count)) / (1.0 - (1.0 / worker_count));
+    estimate.clamp(0.0, 1.0)
+}
+
+fn scaling_assessment(speedup: f64, workers: usize) -> (&'static str, &'static str) {
+    if workers <= 1 {
+        return ("ok", "baseline");
+    }
+    let efficiency = speedup / workers as f64;
+    if speedup > workers as f64 * 1.25 {
+        ("fail", "suspicious superlinear")
+    } else if speedup < 0.95 {
+        ("warn", "slowdown/no scaling")
+    } else if efficiency < 0.35 {
+        ("warn", "serial-dominated prototype")
+    } else if efficiency < 0.60 {
+        ("warn", "limited prototype scaling")
+    } else {
+        ("ok", "scaling visible")
+    }
+}
+
+fn benchmark_overview_stats_rows(stats: &[BenchmarkStatsRecord]) -> String {
+    stats
+        .iter()
+        .map(|record| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(record.runner),
+                html_escape(record.protocol),
+                html_escape(record.case_name),
+                nv_power(record.size),
+                record.workers,
+                record.samples,
+                record.prove_ms.mean,
+                record.verify_ms.mean,
+                format_bytes(record.proof_bytes.mean),
+                format_bytes(record.network_bytes.mean)
+            )
+        })
+        .collect::<String>()
+}
+
+fn benchmark_overview_artifact_rows(figure_pdf_created: bool) -> String {
+    benchmark_artifacts(figure_pdf_created)
+        .into_iter()
+        .map(|path| format!("<a href=\"{path}\">{path}</a>", path = html_escape(path)))
+        .collect::<String>()
+}
+
+fn format_bytes(value: f64) -> String {
+    if value >= 1024.0 * 1024.0 {
+        format!("{:.2} MiB", value / (1024.0 * 1024.0))
+    } else if value >= 1024.0 {
+        format!("{:.2} KiB", value / 1024.0)
+    } else {
+        format!("{} B", value.round() as usize)
+    }
+}
+
+fn benchmark_summary(
+    command: &BenchmarkCommand,
+    records: &[MetricRecord],
+    phase_timings: &[PhaseTimingRecord],
+    figure_pdf_created: bool,
+    provenance: &BenchmarkProvenance,
+) -> String {
     let positives = records
         .iter()
         .filter(|record| record.case_name == "positive" && record.verified)
@@ -1705,7 +5384,7 @@ fn benchmark_summary(command: &BenchmarkCommand, records: &[MetricRecord]) -> St
         .filter(|record| record.case_name == "negative" && !record.verified)
         .count();
     let mut out = format!(
-        "nv_powers={:?}\nsizes={:?}\nworkers={:?}\npcs_queries={}\nrecords={}\npositive_verified={}\nnegative_rejected={}\ncharts=prove_time_by_size.svg,verify_time_by_size.svg,proof_bytes_by_size.svg,worker_scaling_max_size.svg\n",
+        "nv_powers={:?}\nsizes={:?}\nworkers={:?}\npcs_queries={}\nrepeats={}\npaper_preset={}\nrunner={}\nfigure_compiler={}\ncompile_figures_requested={}\ncompile_figures_succeeded={}\nbuild_profile={}\ncore_allocation={}\nrecords={}\npositive_verified={}\nnegative_rejected={}\nartifacts={}\n",
         command
             .sizes
             .iter()
@@ -1714,51 +5393,95 @@ fn benchmark_summary(command: &BenchmarkCommand, records: &[MetricRecord]) -> St
         command.sizes,
         command.workers,
         command.pcs_queries,
+        command.repeats,
+        command.paper_preset,
+        command.runner.as_str(),
+        command.figure_compiler.as_str(),
+        command.compile_figures,
+        figure_pdf_created,
+        build_profile(),
+        benchmark_core_allocation_summary(command),
         records.len(),
         positives,
-        negatives
+        negatives,
+        benchmark_artifacts(figure_pdf_created).join(",")
     );
+    out.push_str(&format!(
+        "git_commit={}\ngit_branch={}\ngit_dirty={}\nrustc_version={}\ncargo_version={}\nrustflags={}\ncargo_lock_sha256={}\nrust_toolchain_sha256={}\n",
+        provenance.git_commit.as_deref().unwrap_or("unavailable"),
+        provenance.git_branch.as_deref().unwrap_or("unavailable"),
+        provenance
+            .git_dirty
+            .map(|dirty| dirty.to_string())
+            .unwrap_or_else(|| "unavailable".to_owned()),
+        provenance
+            .rustc_version_line()
+            .unwrap_or("unavailable"),
+        provenance
+            .cargo_version_line()
+            .unwrap_or("unavailable"),
+        provenance.rustflags.as_deref().unwrap_or("unset"),
+        provenance
+            .cargo_lock_sha256
+            .as_deref()
+            .unwrap_or("unavailable"),
+        provenance
+            .rust_toolchain_sha256
+            .as_deref()
+            .unwrap_or("unavailable")
+    ));
+    out.push_str(&phase_timing_summary(phase_timings));
     out.push_str("\nscaling_analysis:\n");
+    out.push_str(&format!("  runner: {}\n", command.runner.as_str()));
+    out.push_str("  baseline: speedup is measured against the workers=1 run for the same runner, protocol, and size.\n");
     out.push_str(
-        "  baseline: workers=1 is the non-distributed local prover path for the same protocol and size.\n",
-    );
-    out.push_str(
-        "  theory: ideal distributed proving speedup is bounded by worker count; small prototypes may be below ideal because oracle consistency, transcript, and verification are still largely serial.\n",
+        "  theory: the perfect-linear worker line is an upper bound, not a prototype prediction; small circuits may stay near 1x because master orchestration, transcript, verification, and consistency checks are still largely serial.\n",
     );
     if let Some(max_size) = command.sizes.iter().copied().max() {
-        for protocol in [Protocol::R1cs, Protocol::Plonkish] {
-            if let Some(base) = records.iter().find(|record| {
-                record.protocol == protocol.as_str()
-                    && record.case_name == "positive"
-                    && record.verified
-                    && record.size == max_size
-                    && record.workers == 1
-            }) {
-                out.push_str(&format!(
-                    "  protocol={} size={} baseline_prove_ms={:.3}\n",
-                    protocol.as_str(),
-                    max_size,
-                    base.prove_ms
-                ));
-                for record in records.iter().filter(|record| {
-                    record.protocol == protocol.as_str()
+        let stats = benchmark_stats(records);
+        for runner in command.runner.variants() {
+            out.push_str(&format!("  runner_section={}\n", runner.as_str()));
+            for protocol in [Protocol::R1cs, Protocol::Plonkish] {
+                if let Some(base) = stats.iter().find(|record| {
+                    record.runner == runner.as_str()
+                        && record.protocol == protocol.as_str()
                         && record.case_name == "positive"
-                        && record.verified
+                        && record.verified_count > 0
                         && record.size == max_size
+                        && record.workers == 1
                 }) {
-                    let speedup = base.prove_ms / record.prove_ms.max(0.001);
-                    let efficiency = speedup / record.workers as f64;
-                    let status = if speedup > record.workers as f64 * 1.25 {
-                        "suspicious-superlinear"
-                    } else if record.workers > 1 && speedup < 0.05 {
-                        "suspicious-slowdown"
-                    } else {
-                        "plausible-prototype-overhead"
-                    };
                     out.push_str(&format!(
-                        "    workers={} prove_ms={:.3} speedup_vs_w1={:.3} efficiency={:.3} status={}\n",
-                        record.workers, record.prove_ms, speedup, efficiency, status
+                        "    protocol={} size={} baseline_prove_ms_mean={:.3} baseline_prove_ms_stddev={:.3}\n",
+                        protocol.as_str(),
+                        max_size,
+                        base.prove_ms.mean,
+                        base.prove_ms.stddev
                     ));
+                    for record in stats.iter().filter(|record| {
+                        record.runner == runner.as_str()
+                            && record.protocol == protocol.as_str()
+                            && record.case_name == "positive"
+                            && record.verified_count > 0
+                            && record.size == max_size
+                    }) {
+                        let speedup = base.prove_ms.mean / record.prove_ms.mean.max(0.001);
+                        let efficiency = speedup / record.workers as f64;
+                        let (_, status_label) = scaling_assessment(speedup, record.workers);
+                        let status = status_label.replace(' ', "-");
+                        let serial_overhead =
+                            amdahl_serial_overhead_fraction(speedup, record.workers);
+                        out.push_str(&format!(
+                            "      workers={} samples={} prove_ms_mean={:.3} prove_ms_stddev={:.3} speedup_vs_w1={:.3} efficiency={:.3} amdahl_serial_plus_overhead={:.3} status={}\n",
+                            record.workers,
+                            record.samples,
+                            record.prove_ms.mean,
+                            record.prove_ms.stddev,
+                            speedup,
+                            efficiency,
+                            serial_overhead,
+                            status
+                        ));
+                    }
                 }
             }
         }
@@ -1766,38 +5489,409 @@ fn benchmark_summary(command: &BenchmarkCommand, records: &[MetricRecord]) -> St
     out
 }
 
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BenchmarkProvenance {
+    current_dir: Option<String>,
+    rustflags: Option<String>,
+    cargo_target_dir: Option<String>,
+    git_commit: Option<String>,
+    git_branch: Option<String>,
+    git_dirty: Option<bool>,
+    git_status_sha256: Option<String>,
+    rustc_version: Option<String>,
+    cargo_version: Option<String>,
+    cargo_lock_sha256: Option<String>,
+    rust_toolchain_sha256: Option<String>,
+    spartan2_commit: Option<String>,
+    hyperplonk_commit: Option<String>,
+}
+
+impl BenchmarkProvenance {
+    fn capture() -> Self {
+        let (git_dirty, git_status_sha256) = git_status_fingerprint();
+        Self {
+            current_dir: env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string()),
+            rustflags: env::var("RUSTFLAGS").ok().filter(|value| !value.is_empty()),
+            cargo_target_dir: env::var("CARGO_TARGET_DIR")
+                .ok()
+                .filter(|value| !value.is_empty()),
+            git_commit: command_output("git", &["rev-parse", "HEAD"]),
+            git_branch: command_output("git", &["rev-parse", "--abbrev-ref", "HEAD"]),
+            git_dirty,
+            git_status_sha256,
+            rustc_version: command_output("rustc", &["--version", "--verbose"])
+                .or_else(|| command_output("rustc", &["--version"])),
+            cargo_version: command_output("cargo", &["--version", "--verbose"])
+                .or_else(|| command_output("cargo", &["--version"])),
+            cargo_lock_sha256: file_sha256_hex(Path::new("Cargo.lock")),
+            rust_toolchain_sha256: file_sha256_hex(Path::new("rust-toolchain.toml")),
+            spartan2_commit: third_party_pinned_commit("Spartan2")
+                .or_else(|| git_repo_commit(Path::new("third_party/Spartan2"))),
+            hyperplonk_commit: third_party_pinned_commit("HyperPlonk")
+                .or_else(|| git_repo_commit(Path::new("third_party/hyperplonk"))),
+        }
+    }
+
+    fn rustc_version_line(&self) -> Option<&str> {
+        self.rustc_version
+            .as_deref()
+            .and_then(|version| version.lines().next())
+    }
+
+    fn cargo_version_line(&self) -> Option<&str> {
+        self.cargo_version
+            .as_deref()
+            .and_then(|version| version.lines().next())
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{\n",
+                "    \"current_dir\": {},\n",
+                "    \"rustflags\": {},\n",
+                "    \"cargo_target_dir\": {},\n",
+                "    \"git_commit\": {},\n",
+                "    \"git_branch\": {},\n",
+                "    \"git_dirty\": {},\n",
+                "    \"git_status_sha256\": {},\n",
+                "    \"rustc_version\": {},\n",
+                "    \"cargo_version\": {},\n",
+                "    \"cargo_lock_sha256\": {},\n",
+                "    \"rust_toolchain_sha256\": {},\n",
+                "    \"third_party_spartan2_commit\": {},\n",
+                "    \"third_party_hyperplonk_commit\": {}\n",
+                "  }}"
+            ),
+            json_optional_string(self.current_dir.as_deref()),
+            json_optional_string(self.rustflags.as_deref()),
+            json_optional_string(self.cargo_target_dir.as_deref()),
+            json_optional_string(self.git_commit.as_deref()),
+            json_optional_string(self.git_branch.as_deref()),
+            json_optional_bool(self.git_dirty),
+            json_optional_string(self.git_status_sha256.as_deref()),
+            json_optional_string(self.rustc_version.as_deref()),
+            json_optional_string(self.cargo_version.as_deref()),
+            json_optional_string(self.cargo_lock_sha256.as_deref()),
+            json_optional_string(self.rust_toolchain_sha256.as_deref()),
+            json_optional_string(self.spartan2_commit.as_deref()),
+            json_optional_string(self.hyperplonk_commit.as_deref())
+        )
+    }
+}
+
+fn git_status_fingerprint() -> (Option<bool>, Option<String>) {
+    let commands = [
+        (
+            "unstaged",
+            vec![
+                "diff",
+                "--name-status",
+                "--",
+                ":!target",
+                ":!results/bench-*",
+            ],
+        ),
+        (
+            "staged",
+            vec![
+                "diff",
+                "--cached",
+                "--name-status",
+                "--",
+                ":!target",
+                ":!results/bench-*",
+            ],
+        ),
+        (
+            "untracked",
+            vec![
+                "ls-files",
+                "-o",
+                "--exclude-standard",
+                "--",
+                ":!target",
+                ":!results/bench-*",
+            ],
+        ),
+    ];
+    let mut combined = String::new();
+    let mut dirty = false;
+    for (label, args) in commands {
+        let Some(output) = command_output_allow_empty("git", &args) else {
+            return (None, None);
+        };
+        if !output.trim().is_empty() {
+            dirty = true;
+        }
+        combined.push_str(label);
+        combined.push('\n');
+        combined.push_str(&output);
+        if !output.ends_with('\n') {
+            combined.push('\n');
+        }
+    }
+    (Some(dirty), Some(hex_digest(sha256(combined.as_bytes()))))
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = process::Command::new(program).args(args).output().ok()?;
+    successful_stdout(output)
+}
+
+fn command_output_allow_empty(program: &str, args: &[&str]) -> Option<String> {
+    let output = process::Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+fn git_repo_commit(path: &Path) -> Option<String> {
+    let repo = fs::canonicalize(path).ok()?;
+    if !repo.join(".git").exists() {
+        return None;
+    }
+    let safe_directory = format!("safe.directory={}", repo.display());
+    let output = process::Command::new("git")
+        .arg("-c")
+        .arg(safe_directory)
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    successful_stdout(output)
+}
+
+fn third_party_pinned_commit(name: &str) -> Option<String> {
+    let pins = fs::read_to_string("third_party/PINS.md").ok()?;
+    parse_pinned_commit(&pins, name)
+}
+
+fn parse_pinned_commit(pins: &str, name: &str) -> Option<String> {
+    let heading = format!("## {name}");
+    let mut in_section = false;
+    for line in pins.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") {
+            in_section = trimmed == heading;
+            continue;
+        }
+        if in_section && trimmed.starts_with("- Pinned commit:") {
+            let commit = trimmed
+                .split_once('`')
+                .and_then(|(_, rest)| rest.split_once('`'))
+                .map(|(commit, _)| commit.trim())?;
+            if commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Some(commit.to_owned());
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn successful_stdout(output: process::Output) -> Option<String> {
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn file_sha256_hex(path: &Path) -> Option<String> {
+    fs::read(path).ok().map(|bytes| hex_digest(sha256(&bytes)))
+}
+
 fn write_benchmark_charts(run_dir: &Path, records: &[MetricRecord]) -> Result<(), CliError> {
+    let chart_records = mean_positive_records(records);
     write_text_file(
         &run_dir.join("prove_time_by_size.svg"),
         &line_chart_svg(
-            records,
+            &chart_records,
             "Prove time by circuit size",
             "Prover time (ms)",
             |record| record.prove_ms,
         ),
     )?;
     write_text_file(
+        &run_dir.join("prove_time_by_size.tex"),
+        &line_chart_pgfplots(
+            records,
+            "Prove time by circuit size",
+            "Prover time (ms)",
+            BenchmarkMetric::ProveMs,
+        ),
+    )?;
+    write_text_file(
         &run_dir.join("verify_time_by_size.svg"),
         &line_chart_svg(
-            records,
+            &chart_records,
             "Verify time by circuit size",
             "Verifier time (ms)",
             |record| record.verify_ms,
         ),
     )?;
     write_text_file(
+        &run_dir.join("verify_time_by_size.tex"),
+        &line_chart_pgfplots(
+            records,
+            "Verify time by circuit size",
+            "Verifier time (ms)",
+            BenchmarkMetric::VerifyMs,
+        ),
+    )?;
+    write_text_file(
         &run_dir.join("proof_bytes_by_size.svg"),
         &line_chart_svg(
-            records,
+            &chart_records,
             "Proof bytes by circuit size",
             "Proof size (bytes)",
             |record| record.proof_bytes as f64,
         ),
     )?;
     write_text_file(
+        &run_dir.join("proof_bytes_by_size.tex"),
+        &line_chart_pgfplots(
+            records,
+            "Proof bytes by circuit size",
+            "Proof size (KiB)",
+            BenchmarkMetric::ProofKiB,
+        ),
+    )?;
+    write_text_file(
+        &run_dir.join("network_bytes_by_size.svg"),
+        &line_chart_svg(
+            &chart_records,
+            "Network bytes by circuit size",
+            "Network bytes",
+            |record| record.network_bytes as f64,
+        ),
+    )?;
+    write_text_file(
+        &run_dir.join("network_bytes_by_size.tex"),
+        &line_chart_pgfplots(
+            records,
+            "Network bytes by circuit size",
+            "Network bytes (KiB)",
+            BenchmarkMetric::NetworkKiB,
+        ),
+    )?;
+    write_text_file(
+        &run_dir.join("runner_overhead_by_size.svg"),
+        &runner_overhead_svg(records),
+    )?;
+    write_text_file(
+        &run_dir.join("runner_overhead_by_size.tex"),
+        &runner_overhead_pgfplots(records),
+    )?;
+    write_text_file(
         &run_dir.join("worker_scaling_max_size.svg"),
-        &worker_scaling_svg(records),
+        &worker_scaling_svg(&chart_records),
+    )?;
+    write_text_file(
+        &run_dir.join("worker_scaling_max_size.tex"),
+        &worker_scaling_pgfplots(&chart_records),
+    )?;
+    write_text_file(
+        &run_dir.join("paper_figures.tex"),
+        &paper_figures_pgfplots(records),
+    )?;
+    write_text_file(
+        &run_dir.join("paper_figures_standalone.tex"),
+        &paper_figures_standalone_tex(),
     )
+}
+
+fn compile_paper_figures(run_dir: &Path, compiler: FigureCompiler) -> Result<(), CliError> {
+    let source = "paper_figures_standalone.tex";
+    let compiler = select_figure_compiler(compiler)?;
+    let args = match compiler {
+        "pdflatex" => vec!["-interaction=nonstopmode", "-halt-on-error", source],
+        "tectonic" => vec![source],
+        _ => unreachable!("selected compiler is constrained"),
+    };
+    let output = process::Command::new(compiler)
+        .args(&args)
+        .current_dir(run_dir)
+        .output()
+        .map_err(|error| CliError(format!("failed to launch {compiler}: {error}")))?;
+    if !output.status.success() {
+        return Err(CliError(format!(
+            "{compiler} failed while compiling paper_figures_standalone.tex\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let pdf = run_dir.join(COMPILED_PAPER_FIGURE);
+    if !pdf.is_file() {
+        return Err(CliError(format!(
+            "{compiler} succeeded but {} was not created",
+            pdf.display()
+        )));
+    }
+    Ok(())
+}
+
+fn select_figure_compiler(compiler: FigureCompiler) -> Result<&'static str, CliError> {
+    match compiler {
+        FigureCompiler::Auto => {
+            if command_available("tectonic") {
+                Ok("tectonic")
+            } else if command_available("pdflatex") {
+                Ok("pdflatex")
+            } else {
+                Err(CliError(
+                    "no LaTeX compiler found for --compile-figures; install pdflatex or tectonic"
+                        .to_owned(),
+                ))
+            }
+        }
+        FigureCompiler::PdfLatex => {
+            if command_available("pdflatex") {
+                Ok("pdflatex")
+            } else {
+                Err(CliError(
+                    "pdflatex was requested by --figure-compiler but was not found on PATH"
+                        .to_owned(),
+                ))
+            }
+        }
+        FigureCompiler::Tectonic => {
+            if command_available("tectonic") {
+                Ok("tectonic")
+            } else {
+                Err(CliError(
+                    "tectonic was requested by --figure-compiler but was not found on PATH"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
+}
+
+fn command_available(name: &str) -> bool {
+    process::Command::new(name)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn line_chart_svg<F>(records: &[MetricRecord], title: &str, y_label: &str, value: F) -> String
@@ -1819,9 +5913,11 @@ where
     let max_power = powers.iter().copied().max().unwrap_or(min_power);
     let mut series = positives
         .iter()
-        .map(|record| (record.protocol, record.workers))
+        .map(|record| (record.runner, record.protocol, record.workers))
         .collect::<Vec<_>>();
-    series.sort_by(|left, right| left.0.cmp(right.0).then(left.1.cmp(&right.1)));
+    series.sort_by(|left, right| {
+        series_sort_key(left.0, left.1, left.2).cmp(&series_sort_key(right.0, right.1, right.2))
+    });
     series.dedup();
     let raw_max_y = positives
         .iter()
@@ -1839,12 +5935,15 @@ where
     draw_y_grid(&mut svg, max_y, y_step);
     draw_x_power_ticks(&mut svg, &powers, &sizes, min_power, max_power);
     draw_legend_box(&mut svg, series.len());
-    for (series_index, (protocol, workers)) in series.iter().enumerate() {
-        let style = series_style(protocol, *workers, series_index);
+    for (series_index, (runner, protocol, workers)) in series.iter().enumerate() {
+        let style = series_style(protocol, runner, *workers, series_index);
         let mut line_points = Vec::new();
         for size in &sizes {
             if let Some(record) = positives.iter().find(|record| {
-                record.protocol == *protocol && record.workers == *workers && record.size == *size
+                record.runner == *runner
+                    && record.protocol == *protocol
+                    && record.workers == *workers
+                    && record.size == *size
             }) {
                 let x = plot_x_power(nv_power(*size), min_power, max_power);
                 let y = plot_y(value(record), max_y);
@@ -1873,7 +5972,7 @@ where
                 style.color,
                 stroke_dash_attr(style.dash),
                 marker_svg(12.0, 0.0, style.color, *workers),
-                xml_escape(&display_protocol(protocol)),
+                xml_escape(&display_series_name(protocol, runner)),
                 workers
             ));
         }
@@ -1883,69 +5982,69 @@ where
 }
 
 fn worker_scaling_svg(records: &[MetricRecord]) -> String {
-    let positives = records
-        .iter()
-        .filter(|record| record.case_name == "positive" && record.verified)
-        .collect::<Vec<_>>();
-    let max_size = positives
-        .iter()
-        .map(|record| record.size)
-        .max()
-        .unwrap_or(1);
-    let mut workers = positives
-        .iter()
-        .filter(|record| record.size == max_size)
-        .map(|record| record.workers)
-        .collect::<Vec<_>>();
-    workers.sort_unstable();
-    workers.dedup();
-    let min_worker = workers.iter().copied().min().unwrap_or(1) as f64;
-    let max_worker = workers.iter().copied().max().unwrap_or(1) as f64;
+    let scaling = worker_scaling_context(records);
+    let min_worker = scaling.workers.iter().copied().min().unwrap_or(1) as f64;
+    let max_worker = scaling.workers.iter().copied().max().unwrap_or(1) as f64;
     let mut observed_max = 1.0_f64;
-    for protocol in ["r1cs", "plonkish"] {
-        let base = positives
-            .iter()
-            .find(|record| {
-                record.protocol == protocol && record.size == max_size && record.workers == 1
-            })
-            .map(|record| record.prove_ms)
-            .unwrap_or(1.0);
-        for record in positives
-            .iter()
-            .filter(|record| record.protocol == protocol && record.size == max_size)
-        {
-            observed_max = observed_max.max(base / record.prove_ms.max(0.001));
+    for series in &scaling.series {
+        for point in &series.points {
+            observed_max = observed_max.max(point.speedup);
+        }
+        if let Some(serial_overhead) = series.serial_overhead {
+            for worker in &scaling.workers {
+                observed_max =
+                    observed_max.max(amdahl_diagnostic_speedup(*worker, serial_overhead));
+            }
         }
     }
     let raw_max_y = observed_max.max(max_worker).max(1.0);
     let y_step = nice_axis_step(raw_max_y, 5);
     let max_y = (raw_max_y / y_step).ceil() * y_step;
     let mut svg = paper_svg_start(
-        &format!("Worker scaling at n={} (nv={max_size})", nv_power(max_size)),
-        "Verified positive runs. Speedup is measured against the workers=1 baseline; dashed line is ideal linear speedup.",
+        &format!(
+            "Worker scaling at n={} (nv={})",
+            nv_power(scaling.max_size),
+            scaling.max_size
+        ),
+        "Solid=measured. Dotted=serial+overhead diagnostic from largest-worker point. Dashed=perfect upper bound.",
     );
     draw_plot_frame(&mut svg, "Speedup vs workers=1", "Workers");
     draw_y_grid(&mut svg, max_y, y_step);
-    draw_x_numeric_ticks(&mut svg, &workers, min_worker, max_worker);
-    draw_legend_box(&mut svg, 3);
-    for (series_index, protocol) in ["r1cs", "plonkish"].iter().enumerate() {
-        let base = positives
+    draw_x_numeric_ticks(&mut svg, &scaling.workers, min_worker, max_worker);
+    draw_legend_box(&mut svg, scaling.series.len() + 2);
+    for (series_index, series) in scaling.series.iter().enumerate() {
+        let style = series_style(series.protocol, series.runner, 1, series_index);
+        let line_points = series
+            .points
             .iter()
-            .find(|record| {
-                record.protocol == *protocol && record.size == max_size && record.workers == 1
+            .map(|point| {
+                (
+                    plot_x_numeric(point.worker as f64, min_worker, max_worker),
+                    plot_y(point.speedup, max_y),
+                )
             })
-            .map(|record| record.prove_ms)
-            .unwrap_or(1.0);
-        let style = series_style(protocol, 1, series_index);
-        let mut line_points = Vec::new();
-        for worker in &workers {
-            if let Some(record) = positives.iter().find(|record| {
-                record.protocol == *protocol && record.size == max_size && record.workers == *worker
-            }) {
-                let speedup = base / record.prove_ms.max(0.001);
-                let x = plot_x_numeric(*worker as f64, min_worker, max_worker);
-                let y = plot_y(speedup, max_y);
-                line_points.push((x, y));
+            .collect::<Vec<_>>();
+        if let Some(serial_overhead) = series.serial_overhead {
+            let diagnostic_points = scaling
+                .workers
+                .iter()
+                .map(|worker| {
+                    (
+                        plot_x_numeric(*worker as f64, min_worker, max_worker),
+                        plot_y(amdahl_diagnostic_speedup(*worker, serial_overhead), max_y),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if diagnostic_points.len() > 1 {
+                let points = diagnostic_points
+                    .iter()
+                    .map(|(x, y)| format!("{x:.1},{y:.1}"))
+                    .collect::<Vec<_>>();
+                svg.push_str(&format!(
+                    "<polyline class=\"diagnostic-line\" fill=\"none\" style=\"stroke:{}\" points=\"{}\" />\n",
+                    style.color,
+                    points.join(" ")
+                ));
             }
         }
         if !line_points.is_empty() {
@@ -1965,19 +6064,20 @@ fn worker_scaling_svg(records: &[MetricRecord]) -> String {
                     *x,
                     *y,
                     style.color,
-                    protocol_marker_key(protocol),
+                    protocol_marker_key(series.protocol),
                 ));
             }
             svg.push_str(&format!(
                 "<g class=\"legend-entry\" transform=\"translate(765,{})\"><line x1=\"0\" y1=\"0\" x2=\"24\" y2=\"0\" stroke=\"{}\" stroke-width=\"2.4\" />{}<text x=\"34\" y=\"4\">{}</text></g>\n",
                 88 + series_index * 24,
                 style.color,
-                marker_svg(12.0, 0.0, style.color, protocol_marker_key(protocol)),
-                xml_escape(&display_protocol(protocol))
+                marker_svg(12.0, 0.0, style.color, protocol_marker_key(series.protocol)),
+                xml_escape(&display_series_name(series.protocol, series.runner))
             ));
         }
     }
-    let ideal_points = workers
+    let ideal_points = scaling
+        .workers
         .iter()
         .map(|worker| {
             let x = plot_x_numeric(*worker as f64, min_worker, max_worker);
@@ -1991,11 +6091,895 @@ fn worker_scaling_svg(records: &[MetricRecord]) -> String {
             ideal_points.join(" ")
         ));
     }
-    svg.push_str(
-        "<g class=\"legend-entry\" transform=\"translate(765,136)\"><line x1=\"0\" y1=\"0\" x2=\"24\" y2=\"0\" class=\"ideal-line\"/><text x=\"34\" y=\"4\">Ideal linear</text></g>\n",
-    );
+    svg.push_str(&format!(
+        "<g class=\"legend-entry\" transform=\"translate(765,{})\"><line x1=\"0\" y1=\"0\" x2=\"24\" y2=\"0\" class=\"diagnostic-line\"/><text x=\"34\" y=\"4\">Serial+overhead diagnostic</text></g>\n",
+        88 + scaling.series.len() * 24
+    ));
+    svg.push_str(&format!(
+        "<g class=\"legend-entry\" transform=\"translate(765,{})\"><line x1=\"0\" y1=\"0\" x2=\"24\" y2=\"0\" class=\"ideal-line\"/><text x=\"34\" y=\"4\">Perfect upper bound</text></g>\n",
+        88 + (scaling.series.len() + 1) * 24
+    ));
     svg.push_str("</svg>\n");
     svg
+}
+
+#[derive(Clone, Debug)]
+struct WorkerScalingContext {
+    max_size: usize,
+    workers: Vec<usize>,
+    series: Vec<WorkerScalingSeries>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkerScalingSeries {
+    runner: &'static str,
+    protocol: &'static str,
+    points: Vec<WorkerScalingPoint>,
+    serial_overhead: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkerScalingPoint {
+    worker: usize,
+    speedup: f64,
+}
+
+fn worker_scaling_context(records: &[MetricRecord]) -> WorkerScalingContext {
+    let mean_records = mean_positive_records(records);
+    let positives = verified_positive_records(&mean_records);
+    let max_size = positives
+        .iter()
+        .map(|record| record.size)
+        .max()
+        .unwrap_or(1);
+    let mut workers = positives
+        .iter()
+        .filter(|record| record.size == max_size)
+        .map(|record| record.workers)
+        .collect::<Vec<_>>();
+    workers.sort_unstable();
+    workers.dedup();
+
+    let mut keys = positives
+        .iter()
+        .filter(|record| record.size == max_size)
+        .map(|record| (record.runner, record.protocol))
+        .collect::<Vec<_>>();
+    keys.sort_by(|left, right| {
+        runner_sort_key(left.0)
+            .cmp(&runner_sort_key(right.0))
+            .then(protocol_sort_key(left.1).cmp(&protocol_sort_key(right.1)))
+    });
+    keys.dedup();
+
+    let mut series = Vec::new();
+    for (runner, protocol) in keys {
+        let Some(base) = positives.iter().find(|record| {
+            record.runner == runner
+                && record.protocol == protocol
+                && record.size == max_size
+                && record.workers == 1
+        }) else {
+            continue;
+        };
+        let points = workers
+            .iter()
+            .filter_map(|worker| {
+                positives
+                    .iter()
+                    .find(|record| {
+                        record.runner == runner
+                            && record.protocol == protocol
+                            && record.size == max_size
+                            && record.workers == *worker
+                    })
+                    .map(|record| WorkerScalingPoint {
+                        worker: *worker,
+                        speedup: base.prove_ms / record.prove_ms.max(0.001),
+                    })
+            })
+            .collect::<Vec<_>>();
+        if points.is_empty() {
+            continue;
+        }
+        let serial_overhead = points
+            .iter()
+            .filter(|point| point.worker > 1 && point.speedup.is_finite())
+            .max_by_key(|point| point.worker)
+            .map(|point| amdahl_serial_overhead_fraction(point.speedup, point.worker));
+        series.push(WorkerScalingSeries {
+            runner,
+            protocol,
+            points,
+            serial_overhead,
+        });
+    }
+
+    WorkerScalingContext {
+        max_size,
+        workers,
+        series,
+    }
+}
+
+fn amdahl_diagnostic_speedup(workers: usize, serial_overhead: f64) -> f64 {
+    if workers <= 1 || !serial_overhead.is_finite() {
+        return 1.0;
+    }
+    let serial = serial_overhead.clamp(0.0, 1.0);
+    let parallel = 1.0 - serial;
+    1.0 / (serial + parallel / workers as f64)
+}
+
+fn line_chart_pgfplots(
+    records: &[MetricRecord],
+    title: &str,
+    y_label: &str,
+    metric: BenchmarkMetric,
+) -> String {
+    let positives = benchmark_stats(records)
+        .into_iter()
+        .filter(|record| record.case_name == "positive" && record.verified_count > 0)
+        .collect::<Vec<_>>();
+    let mut sizes = positives
+        .iter()
+        .map(|record| record.size)
+        .collect::<Vec<_>>();
+    sizes.sort_unstable();
+    sizes.dedup();
+    let powers = sizes.iter().map(|size| nv_power(*size)).collect::<Vec<_>>();
+    let mut series = positives
+        .iter()
+        .map(|record| (record.runner, record.protocol, record.workers))
+        .collect::<Vec<_>>();
+    series.sort_by(|left, right| {
+        series_sort_key(left.0, left.1, left.2).cmp(&series_sort_key(right.0, right.1, right.2))
+    });
+    series.dedup();
+
+    let mut tex = pgfplots_start(title, "Circuit exponent $n$ in $nv=2^n$", y_label, &powers);
+    for (series_index, (runner, protocol, workers)) in series.iter().enumerate() {
+        let coordinates = sizes
+            .iter()
+            .filter_map(|size| {
+                positives
+                    .iter()
+                    .find(|record| {
+                        record.runner == *runner
+                            && record.protocol == *protocol
+                            && record.workers == *workers
+                            && record.size == *size
+                    })
+                    .map(|record| {
+                        let point = metric.stats(record);
+                        format!(
+                            "({}, {}) +- (0, {})",
+                            nv_power(*size),
+                            format_pgfplots_number(point.mean),
+                            format_pgfplots_number(point.stddev)
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if coordinates.is_empty() {
+            continue;
+        }
+        tex.push_str(&format!(
+            "\\addplot+[{}, {}, {}, error bars/.cd, y dir=both, y explicit] coordinates {{{}}};\n",
+            pgfplots_color(protocol, runner, series_index),
+            pgfplots_dash(*workers),
+            pgfplots_marker(*workers),
+            coordinates.join(" ")
+        ));
+        tex.push_str(&format!(
+            "\\addlegendentry{{{}, w={}}}\n",
+            tex_escape(&display_series_name(protocol, runner)),
+            workers
+        ));
+    }
+    tex.push_str("\\end{axis}\n\\end{tikzpicture}\n");
+    tex
+}
+
+fn worker_scaling_pgfplots(records: &[MetricRecord]) -> String {
+    let scaling = worker_scaling_context(records);
+
+    let mut tex = pgfplots_start(
+        &format!(
+            "Worker scaling at n={} (nv={})",
+            nv_power(scaling.max_size),
+            scaling.max_size
+        ),
+        "Workers",
+        "Speedup vs workers=1",
+        &scaling.workers,
+    );
+    for (series_index, series) in scaling.series.iter().enumerate() {
+        if let Some(serial_overhead) = series.serial_overhead {
+            let diagnostic_coordinates = scaling
+                .workers
+                .iter()
+                .map(|worker| {
+                    format!(
+                        "({}, {})",
+                        worker,
+                        format_pgfplots_number(amdahl_diagnostic_speedup(*worker, serial_overhead))
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !diagnostic_coordinates.is_empty() {
+                tex.push_str(&format!(
+                    "\\addplot+[{}, densely dotted, mark=none, opacity=0.45] coordinates {{{}}};\n",
+                    pgfplots_color(series.protocol, series.runner, series_index),
+                    diagnostic_coordinates.join(" ")
+                ));
+            }
+        }
+        let coordinates = series
+            .points
+            .iter()
+            .map(|point| {
+                format!(
+                    "({}, {})",
+                    point.worker,
+                    format_pgfplots_number(point.speedup)
+                )
+            })
+            .collect::<Vec<_>>();
+        if coordinates.is_empty() {
+            continue;
+        }
+        tex.push_str(&format!(
+            "\\addplot+[{}, solid, {}] coordinates {{{}}};\n",
+            pgfplots_color(series.protocol, series.runner, series_index),
+            pgfplots_marker(protocol_marker_key(series.protocol)),
+            coordinates.join(" ")
+        ));
+        tex.push_str(&format!(
+            "\\addlegendentry{{{}}}\n",
+            tex_escape(&display_series_name(series.protocol, series.runner))
+        ));
+    }
+    let ideal_coordinates = scaling
+        .workers
+        .iter()
+        .map(|worker| format!("({}, {})", worker, worker))
+        .collect::<Vec<_>>();
+    if !ideal_coordinates.is_empty() {
+        tex.push_str("\\addlegendimage{black!55, densely dotted, mark=none, opacity=0.45}\n");
+        tex.push_str("\\addlegendentry{Serial+overhead diagnostic}\n");
+        tex.push_str(&format!(
+            "\\addplot+[pqIdeal, dashed, mark=none] coordinates {{{}}};\n",
+            ideal_coordinates.join(" ")
+        ));
+        tex.push_str("\\addlegendentry{Perfect upper bound}\n");
+    }
+    tex.push_str("\\end{axis}\n\\end{tikzpicture}\n");
+    tex
+}
+
+#[derive(Clone)]
+struct RunnerOverheadPoint {
+    protocol: &'static str,
+    workers: usize,
+    size: usize,
+    overhead: f64,
+}
+
+fn runner_overhead_points(records: &[MetricRecord]) -> Vec<RunnerOverheadPoint> {
+    let stats = benchmark_stats(records);
+    let mut points = Vec::new();
+    for network in stats.iter().filter(|record| {
+        record.runner == BenchmarkRunner::Network.as_str()
+            && record.case_name == "positive"
+            && record.verified_count > 0
+    }) {
+        if let Some(local) = stats.iter().find(|record| {
+            record.runner == BenchmarkRunner::Local.as_str()
+                && record.protocol == network.protocol
+                && record.case_name == "positive"
+                && record.verified_count > 0
+                && record.workers == network.workers
+                && record.size == network.size
+                && record.pcs_queries == network.pcs_queries
+        }) {
+            points.push(RunnerOverheadPoint {
+                protocol: network.protocol,
+                workers: network.workers,
+                size: network.size,
+                overhead: network.prove_ms.mean / local.prove_ms.mean.max(0.001),
+            });
+        }
+    }
+    points.sort_by(|left, right| {
+        protocol_sort_key(left.protocol)
+            .cmp(&protocol_sort_key(right.protocol))
+            .then(left.workers.cmp(&right.workers))
+            .then(left.size.cmp(&right.size))
+    });
+    points
+}
+
+fn runner_overhead_svg(records: &[MetricRecord]) -> String {
+    let points = runner_overhead_points(records);
+    let mut sizes = points.iter().map(|point| point.size).collect::<Vec<_>>();
+    sizes.sort_unstable();
+    sizes.dedup();
+    let powers = sizes.iter().map(|size| nv_power(*size)).collect::<Vec<_>>();
+    let min_power = powers.iter().copied().min().unwrap_or(0);
+    let max_power = powers.iter().copied().max().unwrap_or(min_power);
+    let mut series = points
+        .iter()
+        .map(|point| (point.protocol, point.workers))
+        .collect::<Vec<_>>();
+    series.sort_by(|left, right| {
+        protocol_sort_key(left.0)
+            .cmp(&protocol_sort_key(right.0))
+            .then(left.1.cmp(&right.1))
+    });
+    series.dedup();
+    let raw_max_y = points
+        .iter()
+        .map(|point| point.overhead)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let y_step = nice_axis_step(raw_max_y, 5);
+    let max_y = (raw_max_y / y_step).ceil() * y_step;
+
+    let mut svg = paper_svg_start(
+        "Network runner overhead by circuit size",
+        "Verified positive runs. Overhead is network prover time divided by local prover time for the same protocol, worker count, and size.",
+    );
+    draw_plot_frame(
+        &mut svg,
+        "Network/local prover time",
+        "Circuit exponent n (nv = 2^n)",
+    );
+    draw_y_grid(&mut svg, max_y, y_step);
+    draw_x_power_ticks(&mut svg, &powers, &sizes, min_power, max_power);
+    draw_legend_box(&mut svg, series.len() + 1);
+    for (series_index, (protocol, workers)) in series.iter().enumerate() {
+        let style = series_style(
+            protocol,
+            BenchmarkRunner::Network.as_str(),
+            *workers,
+            series_index,
+        );
+        let mut line_points = Vec::new();
+        for size in &sizes {
+            if let Some(point) = points.iter().find(|point| {
+                point.protocol == *protocol && point.workers == *workers && point.size == *size
+            }) {
+                let x = plot_x_power(nv_power(*size), min_power, max_power);
+                let y = plot_y(point.overhead, max_y);
+                line_points.push((x, y));
+            }
+        }
+        if !line_points.is_empty() {
+            let polyline = line_points
+                .iter()
+                .map(|(x, y)| format!("{x:.1},{y:.1}"))
+                .collect::<Vec<_>>();
+            if polyline.len() > 1 {
+                svg.push_str(&format!(
+                    "<polyline class=\"series-line\" fill=\"none\" stroke=\"{}\"{} points=\"{}\" />\n",
+                    style.color,
+                    stroke_dash_attr(style.dash),
+                    polyline.join(" ")
+                ));
+            }
+            for (x, y) in &line_points {
+                svg.push_str(&marker_svg(*x, *y, style.color, *workers));
+            }
+            svg.push_str(&format!(
+                "<g class=\"legend-entry\" transform=\"translate(765,{})\"><line x1=\"0\" y1=\"0\" x2=\"24\" y2=\"0\" stroke=\"{}\" stroke-width=\"2.4\"{} />{}<text x=\"34\" y=\"4\">{} w={}</text></g>\n",
+                88 + series_index * 24,
+                style.color,
+                stroke_dash_attr(style.dash),
+                marker_svg(12.0, 0.0, style.color, *workers),
+                xml_escape(&display_protocol(protocol)),
+                workers
+            ));
+        }
+    }
+    let parity_points = powers
+        .iter()
+        .map(|power| {
+            let x = plot_x_power(*power, min_power, max_power);
+            let y = plot_y(1.0, max_y);
+            format!("{x:.1},{y:.1}")
+        })
+        .collect::<Vec<_>>();
+    if parity_points.len() > 1 {
+        svg.push_str(&format!(
+            "<polyline class=\"ideal-line\" fill=\"none\" points=\"{}\" />\n",
+            parity_points.join(" ")
+        ));
+    }
+    svg.push_str(&format!(
+        "<g class=\"legend-entry\" transform=\"translate(765,{})\"><line x1=\"0\" y1=\"0\" x2=\"24\" y2=\"0\" class=\"ideal-line\"/><text x=\"34\" y=\"4\">Parity</text></g>\n",
+        88 + series.len() * 24
+    ));
+    svg.push_str("</svg>\n");
+    svg
+}
+
+fn runner_overhead_pgfplots(records: &[MetricRecord]) -> String {
+    let points = runner_overhead_points(records);
+    let mut sizes = points.iter().map(|point| point.size).collect::<Vec<_>>();
+    sizes.sort_unstable();
+    sizes.dedup();
+    let powers = sizes.iter().map(|size| nv_power(*size)).collect::<Vec<_>>();
+    let mut series = points
+        .iter()
+        .map(|point| (point.protocol, point.workers))
+        .collect::<Vec<_>>();
+    series.sort_by(|left, right| {
+        protocol_sort_key(left.0)
+            .cmp(&protocol_sort_key(right.0))
+            .then(left.1.cmp(&right.1))
+    });
+    series.dedup();
+
+    let mut tex = pgfplots_start(
+        "Network runner overhead by circuit size",
+        "Circuit exponent $n$ in $nv=2^n$",
+        "Network/local prover time",
+        &powers,
+    );
+    for (series_index, (protocol, workers)) in series.iter().enumerate() {
+        let coordinates = sizes
+            .iter()
+            .filter_map(|size| {
+                points
+                    .iter()
+                    .find(|point| {
+                        point.protocol == *protocol
+                            && point.workers == *workers
+                            && point.size == *size
+                    })
+                    .map(|point| {
+                        format!(
+                            "({}, {})",
+                            nv_power(*size),
+                            format_pgfplots_number(point.overhead)
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if coordinates.is_empty() {
+            continue;
+        }
+        tex.push_str(&format!(
+            "\\addplot+[{}, {}, {}] coordinates {{{}}};\n",
+            pgfplots_color(protocol, BenchmarkRunner::Network.as_str(), series_index),
+            pgfplots_dash(*workers),
+            pgfplots_marker(*workers),
+            coordinates.join(" ")
+        ));
+        tex.push_str(&format!(
+            "\\addlegendentry{{{}, w={}}}\n",
+            tex_escape(&display_protocol(protocol)),
+            workers
+        ));
+    }
+    let parity_coordinates = powers
+        .iter()
+        .map(|power| format!("({}, 1)", power))
+        .collect::<Vec<_>>();
+    if !parity_coordinates.is_empty() {
+        tex.push_str(&format!(
+            "\\addplot+[pqIdeal, densely dashed, mark=none] coordinates {{{}}};\n",
+            parity_coordinates.join(" ")
+        ));
+        tex.push_str("\\addlegendentry{Parity}\n");
+    }
+    tex.push_str("\\end{axis}\n\\end{tikzpicture}\n");
+    tex
+}
+
+#[derive(Copy, Clone)]
+enum BenchmarkMetric {
+    ProveMs,
+    VerifyMs,
+    ProofKiB,
+    NetworkKiB,
+}
+
+impl BenchmarkMetric {
+    fn stats(self, record: &BenchmarkStatsRecord) -> MeanStddev {
+        match self {
+            Self::ProveMs => record.prove_ms,
+            Self::VerifyMs => record.verify_ms,
+            Self::ProofKiB => MeanStddev {
+                mean: record.proof_bytes.mean / 1024.0,
+                stddev: record.proof_bytes.stddev / 1024.0,
+            },
+            Self::NetworkKiB => MeanStddev {
+                mean: record.network_bytes.mean / 1024.0,
+                stddev: record.network_bytes.stddev / 1024.0,
+            },
+        }
+    }
+}
+
+fn paper_figures_pgfplots(records: &[MetricRecord]) -> String {
+    let positives = benchmark_stats(records)
+        .into_iter()
+        .filter(|record| record.case_name == "positive" && record.verified_count > 0)
+        .collect::<Vec<_>>();
+    let mut powers = positives
+        .iter()
+        .map(|record| nv_power(record.size))
+        .collect::<Vec<_>>();
+    powers.sort_unstable();
+    powers.dedup();
+
+    let mut tex = String::new();
+    tex.push_str(PGFPLOTS_PREAMBLE_COMMENT);
+    tex.push_str(
+        "% Source data: source.csv/source.json; aggregated statistics: summary_stats.csv.\n",
+    );
+    tex.push_str("% Paper-ready grouped PGFPlots figure. Requires:\n");
+    tex.push_str("%   \\usepackage{pgfplots}\n");
+    tex.push_str("%   \\usepgfplotslibrary{groupplots}\n");
+    tex.push_str("%   \\pgfplotsset{compat=1.18}\n");
+    tex.push_str(&pgfplots_color_definitions());
+    tex.push_str("\\pgfplotsset{\n");
+    tex.push_str("  every axis/.append style={font=\\sffamily},\n");
+    tex.push_str("  pqPaperAxis/.style={\n");
+    tex.push_str("    width=0.44\\linewidth,\n");
+    tex.push_str("    height=0.305\\linewidth,\n");
+    tex.push_str("    axis background/.style={fill=white},\n");
+    tex.push_str("    grid=both,\n");
+    tex.push_str("    minor tick num=1,\n");
+    tex.push_str("    major grid style={draw=black!12, line width=0.22pt},\n");
+    tex.push_str("    minor grid style={draw=black!5, line width=0.18pt},\n");
+    tex.push_str("    axis line style={black!74, line width=0.42pt},\n");
+    tex.push_str("    tick align=outside,\n");
+    tex.push_str("    tick style={black!74, line width=0.42pt},\n");
+    tex.push_str("    tick label style={font=\\scriptsize},\n");
+    tex.push_str("    label style={font=\\footnotesize},\n");
+    tex.push_str("    title style={font=\\footnotesize\\bfseries, yshift=-0.6ex},\n");
+    tex.push_str("    xlabel near ticks,\n");
+    tex.push_str("    ylabel near ticks,\n");
+    tex.push_str("    ymin=0,\n");
+    tex.push_str("    enlarge x limits=0.08,\n");
+    tex.push_str("    enlarge y limits={upper,value=0.10},\n");
+    tex.push_str("    every axis plot/.append style={line width=0.95pt, mark options={scale=0.76, solid}, line join=round},\n");
+    tex.push_str("    legend cell align={left},\n");
+    tex.push_str("    legend style={draw=none, fill=white, font=\\scriptsize, /tikz/every even column/.append style={column sep=0.58em}},\n");
+    tex.push_str("    scaled ticks=false,\n");
+    tex.push_str("    unbounded coords=discard\n");
+    tex.push_str("  }\n");
+    tex.push_str("}\n");
+    tex.push_str("\\begin{tikzpicture}\n");
+    tex.push_str("\\begin{groupplot}[\n");
+    tex.push_str("  group style={group size=2 by 2, horizontal sep=0.095\\linewidth, vertical sep=0.115\\linewidth},\n");
+    tex.push_str("  pqPaperAxis\n");
+    tex.push_str("]\n");
+    append_metric_group_axis(
+        &mut tex,
+        records,
+        "(a) Proving time",
+        "Prover time (ms)",
+        BenchmarkMetric::ProveMs,
+        &powers,
+        true,
+    );
+    append_metric_group_axis(
+        &mut tex,
+        records,
+        "(b) Verification time",
+        "Verifier time (ms)",
+        BenchmarkMetric::VerifyMs,
+        &powers,
+        false,
+    );
+    append_metric_group_axis(
+        &mut tex,
+        records,
+        "(c) Proof size",
+        "Proof size (KiB)",
+        BenchmarkMetric::ProofKiB,
+        &powers,
+        false,
+    );
+    append_worker_scaling_group_axis(&mut tex, records, false);
+    tex.push_str("\\end{groupplot}\n");
+    tex.push_str(
+        "\\path (group c1r2.south west) -- node[below=0.70cm] {\\pgfplotslegendfromname{pqPaperLegend}} (group c2r2.south east);\n",
+    );
+    tex.push_str("\\end{tikzpicture}\n");
+    tex
+}
+
+fn append_metric_group_axis(
+    tex: &mut String,
+    records: &[MetricRecord],
+    title: &str,
+    y_label: &str,
+    metric: BenchmarkMetric,
+    x_ticks: &[usize],
+    add_legend: bool,
+) {
+    let stats = benchmark_stats(records)
+        .into_iter()
+        .filter(|record| record.case_name == "positive" && record.verified_count > 0)
+        .collect::<Vec<_>>();
+    let mut sizes = stats.iter().map(|record| record.size).collect::<Vec<_>>();
+    sizes.sort_unstable();
+    sizes.dedup();
+    let mut series = stats
+        .iter()
+        .map(|record| (record.runner, record.protocol, record.workers))
+        .collect::<Vec<_>>();
+    series.sort_by(|left, right| {
+        series_sort_key(left.0, left.1, left.2).cmp(&series_sort_key(right.0, right.1, right.2))
+    });
+    series.dedup();
+
+    append_group_axis_header(
+        tex,
+        title,
+        "Circuit exponent $n$",
+        y_label,
+        x_ticks,
+        add_legend,
+    );
+    for (series_index, (runner, protocol, workers)) in series.iter().enumerate() {
+        let coordinates = sizes
+            .iter()
+            .filter_map(|size| {
+                stats
+                    .iter()
+                    .find(|record| {
+                        record.runner == *runner
+                            && record.protocol == *protocol
+                            && record.workers == *workers
+                            && record.size == *size
+                    })
+                    .map(|record| {
+                        let point = metric.stats(record);
+                        format!(
+                            "({}, {}) +- (0, {})",
+                            nv_power(*size),
+                            format_pgfplots_number(point.mean),
+                            format_pgfplots_number(point.stddev)
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if coordinates.is_empty() {
+            continue;
+        }
+        tex.push_str(&format!(
+            "\\addplot+[{}, {}, {}, error bars/.cd, y dir=both, y explicit] coordinates {{{}}};\n",
+            pgfplots_color(protocol, runner, series_index),
+            pgfplots_dash(*workers),
+            pgfplots_marker(*workers),
+            coordinates.join(" ")
+        ));
+        if add_legend {
+            tex.push_str(&format!(
+                "\\addlegendentry{{{}, w={}}}\n",
+                tex_escape(&display_series_name(protocol, runner)),
+                workers
+            ));
+        }
+    }
+    if add_legend {
+        tex.push_str("\\addlegendimage{black!55, densely dotted, mark=none, opacity=0.45}\n");
+        tex.push_str("\\addlegendentry{Serial+overhead diagnostic}\n");
+        tex.push_str("\\addlegendimage{pqIdeal, densely dashed, mark=none}\n");
+        tex.push_str("\\addlegendentry{Perfect upper bound}\n");
+    }
+}
+
+fn append_worker_scaling_group_axis(tex: &mut String, records: &[MetricRecord], add_legend: bool) {
+    let scaling = worker_scaling_context(records);
+
+    append_group_axis_header(
+        tex,
+        &format!("(d) Worker scaling at $n={}$", nv_power(scaling.max_size)),
+        "Workers",
+        "Speedup vs w=1",
+        &scaling.workers,
+        add_legend,
+    );
+    for (series_index, series) in scaling.series.iter().enumerate() {
+        if let Some(serial_overhead) = series.serial_overhead {
+            let diagnostic_coordinates = scaling
+                .workers
+                .iter()
+                .map(|worker| {
+                    format!(
+                        "({}, {})",
+                        worker,
+                        format_pgfplots_number(amdahl_diagnostic_speedup(*worker, serial_overhead))
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !diagnostic_coordinates.is_empty() {
+                tex.push_str(&format!(
+                    "\\addplot+[{}, densely dotted, mark=none, opacity=0.45] coordinates {{{}}};\n",
+                    pgfplots_color(series.protocol, series.runner, series_index),
+                    diagnostic_coordinates.join(" ")
+                ));
+            }
+        }
+        let coordinates = series
+            .points
+            .iter()
+            .map(|point| {
+                format!(
+                    "({}, {})",
+                    point.worker,
+                    format_pgfplots_number(point.speedup)
+                )
+            })
+            .collect::<Vec<_>>();
+        if coordinates.is_empty() {
+            continue;
+        }
+        tex.push_str(&format!(
+            "\\addplot+[{}, solid, {}] coordinates {{{}}};\n",
+            pgfplots_color(series.protocol, series.runner, series_index),
+            pgfplots_marker(protocol_marker_key(series.protocol)),
+            coordinates.join(" ")
+        ));
+        if add_legend {
+            tex.push_str(&format!(
+                "\\addlegendentry{{{}}}\n",
+                tex_escape(&display_series_name(series.protocol, series.runner))
+            ));
+        }
+    }
+    let ideal_coordinates = scaling
+        .workers
+        .iter()
+        .map(|worker| format!("({}, {})", worker, worker))
+        .collect::<Vec<_>>();
+    if !ideal_coordinates.is_empty() {
+        tex.push_str(&format!(
+            "\\addplot+[pqIdeal, densely dashed, mark=none] coordinates {{{}}};\n",
+            ideal_coordinates.join(" ")
+        ));
+        if add_legend {
+            tex.push_str("\\addlegendimage{black!55, densely dotted, mark=none, opacity=0.45}\n");
+            tex.push_str("\\addlegendentry{Serial+overhead diagnostic}\n");
+            tex.push_str("\\addlegendentry{Perfect upper bound}\n");
+        }
+    }
+}
+
+fn append_group_axis_header(
+    tex: &mut String,
+    title: &str,
+    x_label: &str,
+    y_label: &str,
+    x_ticks: &[usize],
+    add_legend: bool,
+) {
+    tex.push_str("\\nextgroupplot[\n");
+    tex.push_str(&format!("  title={{{}}},\n", tex_escape(title)));
+    tex.push_str(&format!("  xlabel={{{}}},\n", x_label));
+    tex.push_str(&format!("  ylabel={{{}}},\n", tex_escape(y_label)));
+    if !x_ticks.is_empty() {
+        let ticks = x_ticks.iter().map(ToString::to_string).collect::<Vec<_>>();
+        tex.push_str(&format!("  xtick={{{}}},\n", ticks.join(",")));
+    }
+    if add_legend {
+        tex.push_str("  legend to name=pqPaperLegend,\n");
+        tex.push_str("  legend columns=4,\n");
+    }
+    tex.push_str("]\n");
+}
+
+fn paper_figures_standalone_tex() -> String {
+    [
+        "% Compile from this benchmark result directory.",
+        "\\documentclass[tikz,border=3pt]{standalone}",
+        "\\usepackage{pgfplots}",
+        "\\usepgfplotslibrary{groupplots}",
+        "\\pgfplotsset{compat=1.18}",
+        "\\begin{document}",
+        "\\input{paper_figures.tex}",
+        "\\end{document}",
+        "",
+    ]
+    .join("\n")
+}
+
+fn verified_positive_records(records: &[MetricRecord]) -> Vec<&MetricRecord> {
+    records
+        .iter()
+        .filter(|record| record.case_name == "positive" && record.verified)
+        .collect()
+}
+
+fn pgfplots_start(title: &str, x_label: &str, y_label: &str, x_ticks: &[usize]) -> String {
+    let mut tex = String::new();
+    tex.push_str(PGFPLOTS_PREAMBLE_COMMENT);
+    tex.push_str("% Source data: source.csv and source.json.\n");
+    tex.push_str("% Requires: \\usepackage{pgfplots} and \\pgfplotsset{compat=1.18}.\n");
+    tex.push_str(&pgfplots_color_definitions());
+    tex.push_str("\\begin{tikzpicture}\n");
+    tex.push_str("\\begin{axis}[\n");
+    tex.push_str("  width=0.74\\linewidth,\n");
+    tex.push_str("  height=0.46\\linewidth,\n");
+    tex.push_str(&format!("  title={{{}}},\n", tex_escape(title)));
+    tex.push_str(&format!("  xlabel={{{}}},\n", tex_escape(x_label)));
+    tex.push_str(&format!("  ylabel={{{}}},\n", tex_escape(y_label)));
+    tex.push_str("  axis background/.style={fill=white},\n");
+    tex.push_str("  grid=major,\n");
+    tex.push_str("  major grid style={draw=black!10, line width=0.25pt},\n");
+    tex.push_str("  axis line style={black!70, line width=0.45pt},\n");
+    tex.push_str("  tick align=outside,\n");
+    tex.push_str("  tick style={black!70, line width=0.45pt},\n");
+    tex.push_str("  tick label style={font=\\footnotesize},\n");
+    tex.push_str("  label style={font=\\small},\n");
+    tex.push_str("  title style={font=\\small, yshift=-0.5ex},\n");
+    tex.push_str("  legend cell align={left},\n");
+    tex.push_str("  legend columns=2,\n");
+    tex.push_str("  transpose legend,\n");
+    tex.push_str("  legend style={at={(0.02,0.98)}, anchor=north west, draw=black!15, line width=0.25pt, fill=white, text opacity=1, font=\\footnotesize},\n");
+    tex.push_str(
+        "  every axis plot/.append style={line width=0.95pt, mark options={scale=0.85, solid}},\n",
+    );
+    tex.push_str("  scaled ticks=false,\n");
+    tex.push_str("  unbounded coords=discard,\n");
+    if !x_ticks.is_empty() {
+        let ticks = x_ticks.iter().map(ToString::to_string).collect::<Vec<_>>();
+        tex.push_str(&format!("  xtick={{{}}},\n", ticks.join(",")));
+    }
+    tex.push_str("]\n");
+    tex
+}
+
+fn pgfplots_color_definitions() -> String {
+    format!("{}\n", PGFPLOTS_COLOR_DEFINITIONS.join("\n"))
+}
+
+fn pgfplots_color(protocol: &str, runner: &str, fallback_index: usize) -> &'static str {
+    match (runner, protocol) {
+        ("local", "r1cs") => "pqR1CS",
+        ("local", "plonkish") => "pqPlonkish",
+        ("network", "r1cs") => "pqGreen",
+        ("network", "plonkish") => "pqPurple",
+        _ => match fallback_index % 3 {
+            0 => "pqGreen",
+            1 => "pqPurple",
+            _ => "pqGold",
+        },
+    }
+}
+
+fn pgfplots_dash(workers: usize) -> &'static str {
+    match workers {
+        1 => "solid",
+        2 => "dashed",
+        4 => "densely dotted",
+        8 => "dash dot",
+        _ => "loosely dashed",
+    }
+}
+
+fn pgfplots_marker(marker_key: usize) -> &'static str {
+    match marker_key {
+        2 => "mark=square*",
+        4 => "mark=diamond*",
+        8 => "mark=triangle*",
+        _ => "mark=*",
+    }
+}
+
+fn format_pgfplots_number(value: f64) -> String {
+    if value.is_finite() {
+        trim_decimal_zeros(format!("{value:.6}"))
+    } else {
+        "0".to_owned()
+    }
 }
 
 const SVG_WIDTH: f64 = 980.0;
@@ -2008,7 +6992,7 @@ const PLOT_BOTTOM: f64 = PLOT_TOP + PLOT_HEIGHT;
 
 fn paper_svg_start(title: &str, subtitle: &str) -> String {
     format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{:.0}\" height=\"{:.0}\" viewBox=\"0 0 {:.0} {:.0}\" shape-rendering=\"geometricPrecision\">\n<style>\ntext {{ font-family: Arial, Helvetica, sans-serif; fill: #111827; }}\n.title {{ font-size: 18px; font-weight: 700; }}\n.subtitle {{ font-size: 11px; fill: #4b5563; }}\n.axis-label {{ font-size: 13px; font-weight: 600; fill: #111827; }}\n.tick-label {{ font-size: 11px; fill: #374151; }}\n.grid {{ stroke: #e5e7eb; stroke-width: 0.8; }}\n.axis {{ stroke: #111827; stroke-width: 1.3; }}\n.series-line {{ stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }}\n.ideal-line {{ stroke: #6b7280; stroke-width: 1.8; stroke-dasharray: 6 5; stroke-linecap: round; }}\n.marker {{ stroke-width: 2; }}\n.legend-box {{ fill: #ffffff; stroke: #d1d5db; stroke-width: 0.9; }}\n.legend-entry text {{ font-size: 12px; fill: #111827; }}\n</style>\n<rect width=\"100%\" height=\"100%\" fill=\"#ffffff\" />\n<text class=\"title\" x=\"{}\" y=\"34\">{}</text>\n<text class=\"subtitle\" x=\"{}\" y=\"54\">{}</text>\n",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{:.0}\" height=\"{:.0}\" viewBox=\"0 0 {:.0} {:.0}\" shape-rendering=\"geometricPrecision\">\n<style>\ntext {{ font-family: Arial, Helvetica, sans-serif; fill: #111827; }}\n.title {{ font-size: 18px; font-weight: 700; }}\n.subtitle {{ font-size: 11px; fill: #4b5563; }}\n.axis-label {{ font-size: 13px; font-weight: 600; fill: #111827; }}\n.tick-label {{ font-size: 11px; fill: #374151; }}\n.grid {{ stroke: #e5e7eb; stroke-width: 0.8; }}\n.axis {{ stroke: #111827; stroke-width: 1.3; }}\n.series-line {{ stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }}\n.diagnostic-line {{ stroke: #6b7280; stroke-width: 1.6; stroke-dasharray: 2 4; stroke-linecap: round; opacity: 0.48; }}\n.ideal-line {{ stroke: #6b7280; stroke-width: 1.8; stroke-dasharray: 6 5; stroke-linecap: round; }}\n.marker {{ stroke-width: 2; }}\n.legend-box {{ fill: #ffffff; stroke: #d1d5db; stroke-width: 0.9; }}\n.legend-entry text {{ font-size: 12px; fill: #111827; }}\n</style>\n<rect width=\"100%\" height=\"100%\" fill=\"#ffffff\" />\n<text class=\"title\" x=\"{}\" y=\"34\">{}</text>\n<text class=\"subtitle\" x=\"{}\" y=\"54\">{}</text>\n",
         SVG_WIDTH,
         SVG_HEIGHT,
         SVG_WIDTH,
@@ -2119,10 +7103,17 @@ struct ChartSeriesStyle {
     dash: &'static str,
 }
 
-fn series_style(protocol: &str, workers: usize, fallback_index: usize) -> ChartSeriesStyle {
-    let color = match protocol {
-        "r1cs" => "#0072B2",
-        "plonkish" => "#D55E00",
+fn series_style(
+    protocol: &str,
+    runner: &str,
+    workers: usize,
+    fallback_index: usize,
+) -> ChartSeriesStyle {
+    let color = match (runner, protocol) {
+        ("local", "r1cs") => "#0072B2",
+        ("local", "plonkish") => "#D55E00",
+        ("network", "r1cs") => "#009E73",
+        ("network", "plonkish") => "#CC79A7",
         _ => chart_color(fallback_index),
     };
     let dash = match workers {
@@ -2256,6 +7247,39 @@ fn display_protocol(protocol: &str) -> String {
     }
 }
 
+fn display_series_name(protocol: &str, runner: &str) -> String {
+    let protocol = display_protocol(protocol);
+    if runner == "local" {
+        protocol
+    } else {
+        format!("{protocol} {runner}")
+    }
+}
+
+fn series_sort_key(runner: &str, protocol: &str, workers: usize) -> (usize, usize, usize) {
+    (
+        runner_sort_key(runner),
+        protocol_sort_key(protocol),
+        workers,
+    )
+}
+
+fn runner_sort_key(runner: &str) -> usize {
+    match runner {
+        "local" => 0,
+        "network" => 1,
+        _ => 2,
+    }
+}
+
+fn protocol_sort_key(protocol: &str) -> usize {
+    match protocol {
+        "r1cs" => 0,
+        "plonkish" => 1,
+        _ => 2,
+    }
+}
+
 fn xml_escape(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -2264,11 +7288,29 @@ fn xml_escape(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn tex_escape(input: &str) -> String {
+    let mut escaped = String::new();
+    for character in input.chars() {
+        match character {
+            '\\' => escaped.push_str("\\textbackslash{}"),
+            '%' => escaped.push_str("\\%"),
+            '&' => escaped.push_str("\\&"),
+            '#' => escaped.push_str("\\#"),
+            '_' => escaped.push_str("\\_"),
+            '{' => escaped.push_str("\\{"),
+            '}' => escaped.push_str("\\}"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 fn usage() -> String {
     "usage:
   cargo run -p pq-experiments -- <r1cs|plonkish> [--workers N] [--size N] [--pcs-queries N] [--format json|csv] [--case positive|negative|both]
   cargo run -p pq-experiments -- interactive
-  cargo run -p pq-experiments -- benchmark [--sizes 4,8,16 | --nv-powers 2,3,4 | --nv-range 2..6] [--workers 1,2,4] [--pcs-queries N] [--out results]
+  cargo run -p pq-experiments -- benchmark [--paper-preset] [--runner local|network|both] [--sizes 4,8,16 | --nv-powers/--n-values 2,3,4 | --nv-range/--n-range 2..6] [--workers 1,2,4] [--pcs-queries N] [--host-cores N] [--worker-cores N] [--compile-figures] [--figure-compiler auto|pdflatex|tectonic] [--out results]
+  cargo run -p pq-experiments -- verify-results --dir results/bench-... [--format json|csv] [--paper-quality]
   cargo run -p pq-experiments -- net-demo [--workers N] [--format json|csv]
   cargo run -p pq-experiments -- worker --addr HOST:PORT --id N
   cargo run -p pq-experiments -- master --addrs A,B [--ids 0,1] [--session S] [--payload P] [--shutdown] [--format json|csv]
@@ -2368,6 +7410,10 @@ mod tests {
             "1,2".to_owned(),
             "--pcs-queries".to_owned(),
             "5".to_owned(),
+            "--host-cores".to_owned(),
+            "16".to_owned(),
+            "--worker-cores".to_owned(),
+            "4".to_owned(),
             "--out".to_owned(),
             "results/custom".to_owned(),
         ])
@@ -2376,7 +7422,265 @@ mod tests {
         assert_eq!(command.sizes, vec![4, 8]);
         assert_eq!(command.workers, vec![1, 2]);
         assert_eq!(command.pcs_queries, 5);
+        assert_eq!(command.host_logical_cores, Some(16));
+        assert_eq!(command.worker_cores, Some(4));
+        assert_eq!(command.repeats, 1);
+        assert_eq!(command.runner, BenchmarkRunner::Local);
+        assert!(!command.paper_preset);
+        assert!(!command.compile_figures);
+        assert_eq!(command.figure_compiler, FigureCompiler::Auto);
         assert_eq!(command.out_dir, PathBuf::from("results/custom"));
+
+        let repeated_error = parse_benchmark_command(&[
+            "--sizes".to_owned(),
+            "4".to_owned(),
+            "--workers".to_owned(),
+            "1".to_owned(),
+            "--repeats".to_owned(),
+            "3".to_owned(),
+            "--compile-figures".to_owned(),
+            "--figure-compiler".to_owned(),
+            "tectonic".to_owned(),
+        ])
+        .expect_err("performance benchmark must reject repeated samples");
+        assert!(repeated_error.0.contains("--repeats must be 1"));
+
+        let network = parse_benchmark_command(&[
+            "--sizes".to_owned(),
+            "4".to_owned(),
+            "--workers".to_owned(),
+            "1".to_owned(),
+            "--runner".to_owned(),
+            "network".to_owned(),
+        ])
+        .expect("network benchmark command");
+        assert_eq!(network.runner, BenchmarkRunner::Network);
+
+        let both = parse_benchmark_command(&[
+            "--sizes".to_owned(),
+            "4".to_owned(),
+            "--workers".to_owned(),
+            "1".to_owned(),
+            "--runner".to_owned(),
+            "both".to_owned(),
+        ])
+        .expect("combined benchmark command");
+        assert_eq!(both.runner, BenchmarkRunner::Both);
+        assert_eq!(
+            both.runner
+                .variants()
+                .iter()
+                .map(|runner| runner.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local", "network"]
+        );
+
+        let mut scaled = parse_benchmark_command(&[
+            "--sizes".to_owned(),
+            "4".to_owned(),
+            "--workers".to_owned(),
+            "1,2,4".to_owned(),
+            "--runner".to_owned(),
+            "network".to_owned(),
+            "--host-cores".to_owned(),
+            "10".to_owned(),
+        ])
+        .expect("network scaling benchmark command");
+        configure_benchmark_core_plan(&mut scaled).expect("core allocation");
+        let plan = scaled.worker_core_plan.expect("worker core plan");
+        assert_eq!(plan.host_logical_cores, 10);
+        assert_eq!(plan.max_workers, 4);
+        assert_eq!(plan.cores_per_worker, 2);
+        assert_eq!(plan.core_ids_for_worker(1), vec![2, 3]);
+
+        let preset =
+            parse_benchmark_command(&["--paper-preset".to_owned()]).expect("paper preset command");
+        assert!(preset.paper_preset);
+        assert_eq!(preset.sizes, vec![4, 8, 16, 32, 64]);
+        assert_eq!(preset.workers, vec![1, 2, 4]);
+        assert_eq!(preset.pcs_queries, 3);
+        assert_eq!(preset.repeats, 1);
+
+        let overridden_preset = parse_benchmark_command(&[
+            "--paper-preset".to_owned(),
+            "--n-range".to_owned(),
+            "2..3".to_owned(),
+        ])
+        .expect("overridden paper preset command");
+        assert!(overridden_preset.paper_preset);
+        assert_eq!(overridden_preset.sizes, vec![4, 8]);
+        assert_eq!(overridden_preset.repeats, 1);
+    }
+
+    #[test]
+    fn benchmark_progress_counts_real_jobs() {
+        let command = parse_benchmark_command(&[
+            "--runner".to_owned(),
+            "both".to_owned(),
+            "--n-range".to_owned(),
+            "2..3".to_owned(),
+            "--workers".to_owned(),
+            "1,2".to_owned(),
+        ])
+        .expect("benchmark command");
+
+        assert_eq!(command.sizes, vec![4, 8]);
+        assert_eq!(command.workers, vec![1, 2]);
+        assert_eq!(
+            benchmark_total_jobs(&command, command.runner.variants().len()),
+            16
+        );
+        assert_eq!(
+            benchmark_progress(0, 4),
+            "progress 0/4   0.0% [------------------------]"
+        );
+        assert_eq!(
+            benchmark_progress(2, 4),
+            "progress 2/4  50.0% [############------------]"
+        );
+        assert_eq!(
+            benchmark_progress(4, 4),
+            "progress 4/4 100.0% [########################]"
+        );
+    }
+
+    #[test]
+    fn phase_timing_verifier_accepts_network_worker_pool_phases() {
+        let phase_dir = env::temp_dir().join(format!(
+            "pq_dsnark_network_phase_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&phase_dir).expect("phase temp dir");
+        let timings = vec![
+            PhaseTimingRecord {
+                phase: "setup".to_owned(),
+                detail: "setup".to_owned(),
+                elapsed_ms: 0.1,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 0.1,
+            },
+            PhaseTimingRecord {
+                phase: "network_worker_pool_start".to_owned(),
+                detail: "spawn workers".to_owned(),
+                elapsed_ms: 10.0,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 10.0,
+            },
+            PhaseTimingRecord {
+                phase: "job".to_owned(),
+                detail: "runner=network protocol=r1cs n=2 nv=4 workers=1".to_owned(),
+                elapsed_ms: 12.0,
+                recorded_prove_ms: 6.0,
+                recorded_verify_ms: 6.0,
+                inferred_overhead_ms: 0.0,
+            },
+            PhaseTimingRecord {
+                phase: "job".to_owned(),
+                detail: "runner=network protocol=plonkish n=2 nv=4 workers=2".to_owned(),
+                elapsed_ms: 14.0,
+                recorded_prove_ms: 7.0,
+                recorded_verify_ms: 7.0,
+                inferred_overhead_ms: 0.0,
+            },
+            PhaseTimingRecord {
+                phase: "network_worker_pool_shutdown".to_owned(),
+                detail: "shutdown workers".to_owned(),
+                elapsed_ms: 8.0,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 8.0,
+            },
+            PhaseTimingRecord {
+                phase: "source_and_chart_artifacts".to_owned(),
+                detail: "charts".to_owned(),
+                elapsed_ms: 1.0,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 1.0,
+            },
+            PhaseTimingRecord {
+                phase: "final_result_artifacts".to_owned(),
+                detail: "final".to_owned(),
+                elapsed_ms: 1.0,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 1.0,
+            },
+            PhaseTimingRecord {
+                phase: "total".to_owned(),
+                detail: "total".to_owned(),
+                elapsed_ms: 46.0,
+                recorded_prove_ms: 13.0,
+                recorded_verify_ms: 13.0,
+                inferred_overhead_ms: 20.0,
+            },
+        ];
+        write_text_file(
+            &phase_dir.join("phase_timing.csv"),
+            &phase_timing_to_csv(&timings),
+        )
+        .expect("write network phase timing");
+
+        let rows = verify_phase_timing_csv_semantics(&phase_dir, 2)
+            .expect("network worker phases should be valid");
+        assert_eq!(rows, 8);
+        fs::remove_dir_all(&phase_dir).expect("cleanup phase temp dir");
+    }
+
+    #[test]
+    fn scripts_directory_has_only_interactive_entrypoints() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+        let scripts_dir = repo_root.join("scripts");
+        let mut names = fs::read_dir(&scripts_dir)
+            .expect("scripts directory")
+            .map(|entry| {
+                entry
+                    .expect("script entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                "interactive-linux.sh",
+                "interactive-macos.sh",
+                "interactive-powershell.ps1",
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_verify_results_command_flags() {
+        let command = parse_verify_results_command(&[
+            "--dir".to_owned(),
+            "results/bench-1".to_owned(),
+            "--format".to_owned(),
+            "csv".to_owned(),
+            "--paper-quality".to_owned(),
+        ])
+        .expect("verify-results command");
+        assert_eq!(command.dir, PathBuf::from("results/bench-1"));
+        assert_eq!(command.format, OutputFormat::Csv);
+        assert!(command.paper_quality);
+
+        let positional =
+            parse_verify_results_command(&["results/bench-2".to_owned()]).expect("positional dir");
+        assert_eq!(positional.dir, PathBuf::from("results/bench-2"));
+        assert_eq!(positional.format, OutputFormat::Json);
+        assert!(!positional.paper_quality);
     }
 
     #[test]
@@ -2398,14 +7702,104 @@ mod tests {
         ])
         .expect("range powers");
         assert_eq!(ranged.sizes, vec![4, 8, 16]);
+
+        let n_aliases = parse_benchmark_command(&[
+            "--n-values".to_owned(),
+            "3,2".to_owned(),
+            "--n-range".to_owned(),
+            "2..3".to_owned(),
+            "--workers".to_owned(),
+            "1".to_owned(),
+        ])
+        .expect("n aliases");
+        assert_eq!(n_aliases.sizes, vec![4, 8]);
     }
 
     #[test]
-    fn benchmark_charts_are_svg_with_real_series() {
+    fn benchmark_requires_single_worker_baseline() {
+        let error = parse_benchmark_command(&[
+            "--nv-range".to_owned(),
+            "2..4".to_owned(),
+            "--workers".to_owned(),
+            "2,4".to_owned(),
+        ])
+        .expect_err("missing worker=1 baseline should fail");
+        assert!(error.0.contains("must include 1"));
+    }
+
+    #[test]
+    fn benchmark_job_validation_rejects_bad_case_outcomes() {
+        let positive = MetricRecord {
+            protocol: "r1cs",
+            runner: "local",
+            case_name: "positive",
+            trial: 1,
+            workers: 1,
+            size: 4,
+            constraints: 4,
+            prove_ms: 10.0,
+            verify_ms: 2.0,
+            proof_bytes: 100,
+            communication_bytes: 50,
+            network_bytes: 0,
+            pcs_queries: 3,
+            host_logical_cores: None,
+            cores_per_worker: None,
+            core_affinity: None,
+            verified: true,
+            failure_reason: None,
+        };
+        let negative = MetricRecord {
+            protocol: "r1cs",
+            runner: "local",
+            case_name: "negative",
+            trial: 1,
+            workers: 1,
+            size: 4,
+            constraints: 4,
+            prove_ms: 11.0,
+            verify_ms: 2.5,
+            proof_bytes: 100,
+            communication_bytes: 50,
+            network_bytes: 0,
+            pcs_queries: 3,
+            host_logical_cores: None,
+            cores_per_worker: None,
+            core_affinity: None,
+            verified: false,
+            failure_reason: Some("Pcs".to_owned()),
+        };
+        assert!(
+            validate_benchmark_job_records(
+                Protocol::R1cs,
+                4,
+                1,
+                1,
+                std::slice::from_ref(&positive)
+            )
+            .is_ok()
+        );
+
+        let mut bad_positive = positive.clone();
+        bad_positive.verified = false;
+        bad_positive.failure_reason = Some("InvalidProof".to_owned());
+        let error = validate_benchmark_job_records(Protocol::R1cs, 4, 1, 1, &[bad_positive])
+            .expect_err("positive verification failure should stop benchmark");
+        assert!(error.0.contains("expected exactly one verified positive"));
+
+        let error = validate_benchmark_job_records(Protocol::R1cs, 4, 1, 1, &[positive, negative])
+            .expect_err("negative correctness records must not enter benchmark");
+        assert!(error.0.contains("no negative correctness records"));
+    }
+
+    #[test]
+    fn benchmark_charts_are_svg_and_pgfplots_with_real_series() {
         let records = vec![
             MetricRecord {
                 protocol: "r1cs",
+                runner: "local",
                 case_name: "positive",
+                trial: 1,
                 workers: 1,
                 size: 4,
                 constraints: 4,
@@ -2415,12 +7809,17 @@ mod tests {
                 communication_bytes: 50,
                 network_bytes: 0,
                 pcs_queries: 3,
+                host_logical_cores: None,
+                cores_per_worker: None,
+                core_affinity: None,
                 verified: true,
                 failure_reason: None,
             },
             MetricRecord {
                 protocol: "r1cs",
+                runner: "local",
                 case_name: "positive",
+                trial: 1,
                 workers: 2,
                 size: 4,
                 constraints: 4,
@@ -2430,6 +7829,49 @@ mod tests {
                 communication_bytes: 60,
                 network_bytes: 0,
                 pcs_queries: 3,
+                host_logical_cores: None,
+                cores_per_worker: None,
+                core_affinity: None,
+                verified: true,
+                failure_reason: None,
+            },
+            MetricRecord {
+                protocol: "r1cs",
+                runner: "local",
+                case_name: "positive",
+                trial: 2,
+                workers: 1,
+                size: 4,
+                constraints: 4,
+                prove_ms: 14.0,
+                verify_ms: 4.0,
+                proof_bytes: 100,
+                communication_bytes: 50,
+                network_bytes: 0,
+                pcs_queries: 3,
+                host_logical_cores: None,
+                cores_per_worker: None,
+                core_affinity: None,
+                verified: true,
+                failure_reason: None,
+            },
+            MetricRecord {
+                protocol: "r1cs",
+                runner: "network",
+                case_name: "positive",
+                trial: 1,
+                workers: 1,
+                size: 4,
+                constraints: 4,
+                prove_ms: 20.0,
+                verify_ms: 5.0,
+                proof_bytes: 100,
+                communication_bytes: 50,
+                network_bytes: 4096,
+                pcs_queries: 3,
+                host_logical_cores: Some(8),
+                cores_per_worker: Some(2),
+                core_affinity: Some(worker_affinity_mode()),
                 verified: true,
                 failure_reason: None,
             },
@@ -2437,9 +7879,711 @@ mod tests {
 
         let chart = worker_scaling_svg(&records);
         assert!(chart.starts_with("<svg"));
-        assert!(chart.contains("Ideal linear"));
+        assert!(chart.contains("Perfect upper bound"));
+        assert!(chart.contains("Serial+overhead diagnostic"));
+        assert!(chart.contains("class=\"diagnostic-line\""));
         assert!(chart.contains("R1CS"));
         assert!(chart.contains("class=\"series-line\""));
+
+        let tex_chart = line_chart_pgfplots(
+            &records,
+            "Prove time by circuit size",
+            "Prover time (ms)",
+            BenchmarkMetric::ProveMs,
+        );
+        assert!(tex_chart.contains("\\begin{tikzpicture}"));
+        assert!(tex_chart.contains("\\addplot+"));
+        assert!(tex_chart.contains("error bars/.cd"));
+        assert!(tex_chart.contains("+- (0,"));
+        assert!(tex_chart.contains("source.csv"));
+        assert!(tex_chart.contains("\\addlegendentry{R1CS, w=1}"));
+
+        let scaling_tex = worker_scaling_pgfplots(&records);
+        assert!(scaling_tex.contains("Perfect upper bound"));
+        assert!(scaling_tex.contains("Serial+overhead diagnostic"));
+        assert!(scaling_tex.contains("densely dotted"));
+        assert!(scaling_tex.contains("pqR1CS"));
+        assert!(scaling_tex.contains("(2, 2)"));
+        let scaling = worker_scaling_context(&records);
+        let local_scaling = scaling
+            .series
+            .iter()
+            .find(|series| series.runner == "local" && series.protocol == "r1cs")
+            .expect("local R1CS scaling series");
+        let local_serial_overhead = local_scaling
+            .serial_overhead
+            .expect("local R1CS should have a two-worker diagnostic");
+        assert!(local_serial_overhead.abs() < 0.0001);
+
+        let overhead = runner_overhead_points(&records);
+        assert_eq!(overhead.len(), 1);
+        assert!((overhead[0].overhead - (20.0 / 12.0)).abs() < 0.0001);
+        let overhead_svg = runner_overhead_svg(&records);
+        assert!(overhead_svg.contains("Network runner overhead"));
+        assert!(overhead_svg.contains("Parity"));
+        let overhead_tex = runner_overhead_pgfplots(&records);
+        assert!(overhead_tex.contains("Network/local prover time"));
+        assert!(overhead_tex.contains("\\addlegendentry{Parity}"));
+
+        let paper_tex = paper_figures_pgfplots(&records);
+        assert!(paper_tex.contains("\\begin{groupplot}"));
+        assert!(paper_tex.contains("\\pgfplotslegendfromname{pqPaperLegend}"));
+        assert!(paper_tex.contains("(a) Proving time"));
+        assert!(paper_tex.contains("(d) Worker scaling"));
+        assert!(paper_tex.contains("Serial+overhead diagnostic"));
+        assert!(paper_tex.contains("error bars/.cd"));
+
+        let source_csv = records_to_csv(&records);
+        assert!(source_csv.starts_with("protocol,runner,case,trial,workers"));
+        assert!(source_csv.contains("r1cs,local,positive,2,1,2,4"));
+
+        let standalone = paper_figures_standalone_tex();
+        assert!(standalone.contains("\\documentclass[tikz,border=3pt]{standalone}"));
+        assert!(standalone.contains("\\input{paper_figures.tex}"));
+
+        let overview_command = BenchmarkCommand {
+            sizes: vec![4],
+            workers: vec![1, 2],
+            pcs_queries: 3,
+            repeats: 1,
+            paper_preset: false,
+            runner: BenchmarkRunner::Both,
+            compile_figures: false,
+            figure_compiler: FigureCompiler::Auto,
+            out_dir: PathBuf::from("results"),
+            host_logical_cores: Some(8),
+            worker_cores: Some(2),
+            worker_core_plan: Some(WorkerCorePlan {
+                host_logical_cores: 8,
+                max_workers: 2,
+                cores_per_worker: 4,
+            }),
+        };
+        let overview = benchmark_overview_html(123, &overview_command, &records, false);
+        assert!(overview.contains("<!doctype html>"));
+        assert!(overview.contains("pq_dSNARK benchmark overview"));
+        assert!(overview.contains("source.csv"));
+        assert!(overview.contains("worker_scaling_max_size.svg"));
+        assert!(overview.contains("Core Allocation"));
+        assert!(overview.contains("serial+overhead"));
+        assert!(overview.contains("scaling visible"));
+        assert!(overview.contains("All positive performance proofs verified"));
+
+        let provenance = BenchmarkProvenance::capture();
+        let metadata = benchmark_metadata_json(
+            123,
+            &BenchmarkCommand {
+                sizes: vec![4],
+                workers: vec![1, 2],
+                pcs_queries: 3,
+                repeats: 1,
+                paper_preset: false,
+                runner: BenchmarkRunner::Local,
+                compile_figures: false,
+                figure_compiler: FigureCompiler::Auto,
+                out_dir: PathBuf::from("results"),
+                host_logical_cores: None,
+                worker_cores: None,
+                worker_core_plan: None,
+            },
+            &records,
+            false,
+            &provenance,
+        );
+        assert!(metadata.contains("\"run_id\": 123"));
+        assert!(metadata.contains("\"schema_version\": 7"));
+        assert!(metadata.contains("\"paper_preset\": false"));
+        assert!(metadata.contains("\"runner\": \"local\""));
+        assert!(metadata.contains("\"figure_compiler\": \"auto\""));
+        assert!(metadata.contains("\"compile_figures_requested\": false"));
+        assert!(metadata.contains("\"compile_figures_succeeded\": false"));
+        assert!(metadata.contains("\"build_profile\": \""));
+        assert!(metadata.contains("\"nv_powers\": [2]"));
+        assert!(metadata.contains("\"overview.html\""));
+        assert!(metadata.contains("\"phase_timing.csv\""));
+        assert!(metadata.contains("\"phase_timing.json\""));
+        assert!(metadata.contains("\"paper_figures.tex\""));
+        assert!(metadata.contains("\"summary_stats.csv\""));
+        assert!(metadata.contains("\"result_manifest.json\""));
+        assert!(metadata.contains("\"network_bytes_by_size.tex\""));
+        assert!(metadata.contains("\"runner_overhead_by_size.tex\""));
+        assert!(metadata.contains("\"core_allocation\": null"));
+        assert!(metadata.contains("\"provenance\""));
+        assert!(metadata.contains("\"git_commit\""));
+        assert!(metadata.contains("\"rustc_version\""));
+        assert!(metadata.contains("\"cargo_lock_sha256\""));
+        assert!(metadata.contains("\"rust_toolchain_sha256\""));
+        assert!(metadata.contains("\"third_party_spartan2_commit\""));
+        assert!(metadata.contains("\"repeats\": 1"));
+        assert!(metadata.contains("\"negative_rejected\": 0"));
+        assert_eq!(
+            parse_pinned_commit(
+                "# Third-Party Pins\n\n## Spartan2\n\n- Pinned commit: `0d4f1409e8f30536b8b25ed3f81bc446ed717e61`\n\n## HyperPlonk\n\n- Pinned commit: `2a3b55c97ad8a5d6627108a2e7def2aeccb7f3b9`\n",
+                "Spartan2"
+            ),
+            Some("0d4f1409e8f30536b8b25ed3f81bc446ed717e61".to_owned())
+        );
+        assert_eq!(
+            parse_pinned_commit(
+                "# Third-Party Pins\n\n## Spartan2\n\n- Pinned commit: `0d4f1409e8f30536b8b25ed3f81bc446ed717e61`\n\n## HyperPlonk\n\n- Pinned commit: `2a3b55c97ad8a5d6627108a2e7def2aeccb7f3b9`\n",
+                "HyperPlonk"
+            ),
+            Some("2a3b55c97ad8a5d6627108a2e7def2aeccb7f3b9".to_owned())
+        );
+        assert!(benchmark_artifacts(false).contains(&OVERVIEW_HTML));
+        assert!(benchmark_artifacts(false).contains(&"phase_timing.csv"));
+        assert!(benchmark_artifacts(false).contains(&"paper_figures_standalone.tex"));
+        assert!(benchmark_artifacts(false).contains(&RESULT_MANIFEST));
+        assert!(!benchmark_artifacts(false).contains(&COMPILED_PAPER_FIGURE));
+        assert!(benchmark_artifacts(true).contains(&COMPILED_PAPER_FIGURE));
+
+        let manifest_dir = env::temp_dir().join(format!(
+            "pq_dsnark_manifest_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&manifest_dir).expect("manifest temp dir");
+        for artifact in benchmark_artifacts(false) {
+            if artifact != RESULT_MANIFEST {
+                write_text_file(
+                    &manifest_dir.join(artifact),
+                    &format!("test artifact {artifact}\n"),
+                )
+                .expect("write artifact");
+            }
+        }
+        let manifest = benchmark_result_manifest_json(&manifest_dir, 123, false).expect("manifest");
+        assert!(manifest.contains("\"schema_version\": 1"));
+        assert!(manifest.contains("\"path\":\"metadata.json\""));
+        assert!(manifest.contains("\"sha256\""));
+        assert!(manifest.contains("\"self_artifact\": \"result_manifest.json\""));
+        assert!(!manifest.contains("\"path\":\"result_manifest.json\""));
+        write_text_file(&manifest_dir.join(RESULT_MANIFEST), &manifest).expect("write manifest");
+        let report = verify_benchmark_result_manifest(&manifest_dir).expect("verify manifest");
+        assert_eq!(report.run_id, 123);
+        assert_eq!(report.files_checked, benchmark_artifacts(false).len() - 1);
+        write_text_file(&manifest_dir.join("stale.svg"), "old figure\n")
+            .expect("write stale artifact");
+        let error = verify_benchmark_result_manifest(&manifest_dir)
+            .expect_err("unexpected artifact must fail verification");
+        assert!(error.0.contains("unexpected artifact"));
+        fs::remove_file(manifest_dir.join("stale.svg")).expect("remove stale artifact");
+        write_text_file(&manifest_dir.join("source.csv"), "tampered\n").expect("tamper artifact");
+        let error = verify_benchmark_result_manifest(&manifest_dir)
+            .expect_err("tampered artifact must fail verification");
+        assert!(error.0.contains("mismatch"));
+        fs::remove_dir_all(&manifest_dir).expect("cleanup manifest temp dir");
+
+        let semantic_dir = env::temp_dir().join(format!(
+            "pq_dsnark_semantic_result_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&semantic_dir).expect("semantic temp dir");
+        let semantic_command = BenchmarkCommand {
+            sizes: vec![4],
+            workers: vec![1],
+            pcs_queries: 3,
+            repeats: 1,
+            paper_preset: false,
+            runner: BenchmarkRunner::Local,
+            compile_figures: false,
+            figure_compiler: FigureCompiler::Auto,
+            out_dir: PathBuf::from("results"),
+            host_logical_cores: None,
+            worker_cores: None,
+            worker_core_plan: None,
+        };
+        let semantic_records = vec![
+            MetricRecord {
+                protocol: "r1cs",
+                runner: "local",
+                case_name: "positive",
+                trial: 1,
+                workers: 1,
+                size: 4,
+                constraints: 4,
+                prove_ms: 10.0,
+                verify_ms: 2.0,
+                proof_bytes: 100,
+                communication_bytes: 50,
+                network_bytes: 0,
+                pcs_queries: 3,
+                host_logical_cores: None,
+                cores_per_worker: None,
+                core_affinity: None,
+                verified: true,
+                failure_reason: None,
+            },
+            MetricRecord {
+                protocol: "plonkish",
+                runner: "local",
+                case_name: "positive",
+                trial: 1,
+                workers: 1,
+                size: 4,
+                constraints: 16,
+                prove_ms: 12.0,
+                verify_ms: 3.0,
+                proof_bytes: 140,
+                communication_bytes: 70,
+                network_bytes: 0,
+                pcs_queries: 3,
+                host_logical_cores: None,
+                cores_per_worker: None,
+                core_affinity: None,
+                verified: true,
+                failure_reason: None,
+            },
+        ];
+        let semantic_timings = vec![
+            PhaseTimingRecord {
+                phase: "setup".to_owned(),
+                detail: "test setup".to_owned(),
+                elapsed_ms: 0.1,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 0.1,
+            },
+            PhaseTimingRecord {
+                phase: "job".to_owned(),
+                detail: "runner=local protocol=r1cs n=2 nv=4 workers=1".to_owned(),
+                elapsed_ms: 12.0,
+                recorded_prove_ms: 10.0,
+                recorded_verify_ms: 2.0,
+                inferred_overhead_ms: 0.0,
+            },
+            PhaseTimingRecord {
+                phase: "job".to_owned(),
+                detail: "runner=local protocol=plonkish n=2 nv=4 workers=1".to_owned(),
+                elapsed_ms: 15.0,
+                recorded_prove_ms: 12.0,
+                recorded_verify_ms: 3.0,
+                inferred_overhead_ms: 0.0,
+            },
+            PhaseTimingRecord {
+                phase: "source_and_chart_artifacts".to_owned(),
+                detail: "charts".to_owned(),
+                elapsed_ms: 1.0,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 1.0,
+            },
+            PhaseTimingRecord {
+                phase: "final_result_artifacts".to_owned(),
+                detail: "final".to_owned(),
+                elapsed_ms: 1.0,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 1.0,
+            },
+            PhaseTimingRecord {
+                phase: "total".to_owned(),
+                detail: "total".to_owned(),
+                elapsed_ms: 29.0,
+                recorded_prove_ms: 22.0,
+                recorded_verify_ms: 5.0,
+                inferred_overhead_ms: 2.0,
+            },
+        ];
+        write_text_file(
+            &semantic_dir.join("metadata.json"),
+            &benchmark_metadata_json(
+                456,
+                &semantic_command,
+                &semantic_records,
+                false,
+                &provenance,
+            ),
+        )
+        .expect("write semantic metadata");
+        write_text_file(
+            &semantic_dir.join("source.csv"),
+            &records_to_csv(&semantic_records),
+        )
+        .expect("write semantic source csv");
+        write_text_file(
+            &semantic_dir.join("source.json"),
+            &records_to_json(&semantic_records),
+        )
+        .expect("write semantic source json");
+        write_text_file(
+            &semantic_dir.join("summary_stats.csv"),
+            &summary_stats_to_csv(&benchmark_stats(&semantic_records)),
+        )
+        .expect("write semantic summary stats");
+        write_text_file(
+            &semantic_dir.join("phase_timing.csv"),
+            &phase_timing_to_csv(&semantic_timings),
+        )
+        .expect("write semantic phase timing csv");
+        write_text_file(
+            &semantic_dir.join("phase_timing.json"),
+            &phase_timing_to_json(&semantic_timings),
+        )
+        .expect("write semantic phase timing json");
+        write_text_file(
+            &semantic_dir.join(OVERVIEW_HTML),
+            &benchmark_overview_html(456, &semantic_command, &semantic_records, false),
+        )
+        .expect("write semantic overview");
+        write_text_file(
+            &semantic_dir.join("summary.txt"),
+            &benchmark_summary(
+                &semantic_command,
+                &semantic_records,
+                &semantic_timings,
+                false,
+                &provenance,
+            ),
+        )
+        .expect("write semantic summary");
+        write_benchmark_charts(&semantic_dir, &semantic_records).expect("write semantic charts");
+        for artifact in benchmark_artifacts(false) {
+            if artifact != RESULT_MANIFEST && !semantic_dir.join(artifact).exists() {
+                write_text_file(
+                    &semantic_dir.join(artifact),
+                    &format!("semantic placeholder for {artifact}\n"),
+                )
+                .expect("write semantic placeholder");
+            }
+        }
+        let semantic_manifest =
+            benchmark_result_manifest_json(&semantic_dir, 456, false).expect("semantic manifest");
+        write_text_file(&semantic_dir.join(RESULT_MANIFEST), &semantic_manifest)
+            .expect("write semantic manifest");
+        let report = verify_benchmark_result_dir(&semantic_dir).expect("verify semantic result");
+        assert_eq!(report.source_rows_checked, 2);
+        assert_eq!(report.summary_rows_checked, 2);
+        assert_eq!(report.phase_rows_checked, 6);
+        let semantic_bad_source =
+            records_to_csv(&semantic_records[..1]).replace("r1cs,local", "r1cs,network");
+        write_text_file(&semantic_dir.join("source.csv"), &semantic_bad_source)
+            .expect("write semantic bad source csv");
+        let semantic_manifest =
+            benchmark_result_manifest_json(&semantic_dir, 456, false).expect("semantic manifest");
+        write_text_file(&semantic_dir.join(RESULT_MANIFEST), &semantic_manifest)
+            .expect("rewrite semantic manifest");
+        let error = verify_benchmark_result_dir(&semantic_dir)
+            .expect_err("manifest-consistent semantic mismatch must fail");
+        assert!(error.0.contains("source.csv"));
+        write_text_file(
+            &semantic_dir.join("source.csv"),
+            &records_to_csv(&semantic_records),
+        )
+        .expect("restore semantic source csv");
+        write_text_file(
+            &semantic_dir.join("prove_time_by_size.svg"),
+            "<svg>broken\n",
+        )
+        .expect("write semantic bad svg");
+        let semantic_manifest =
+            benchmark_result_manifest_json(&semantic_dir, 456, false).expect("semantic manifest");
+        write_text_file(&semantic_dir.join(RESULT_MANIFEST), &semantic_manifest)
+            .expect("rewrite semantic manifest after bad svg");
+        let error = verify_benchmark_result_dir(&semantic_dir)
+            .expect_err("manifest-consistent broken SVG must fail");
+        assert!(error.0.contains("prove_time_by_size.svg"));
+        fs::remove_dir_all(&semantic_dir).expect("cleanup semantic temp dir");
+
+        let paper_quality_dir = env::temp_dir().join(format!(
+            "pq_dsnark_paper_quality_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&paper_quality_dir).expect("paper quality temp dir");
+        let expected_positive = (PAPER_PRESET_NV_START..=PAPER_PRESET_NV_END).count()
+            * PAPER_PRESET_WORKERS.len()
+            * 2
+            * 2
+            * BENCHMARK_REPEATS;
+        let paper_metadata = format!(
+            concat!(
+                "{{\n",
+                "  \"schema_version\": 7,\n",
+                "  \"build_profile\": \"release\",\n",
+                "  \"nv_powers\": [2,3,4,5,6],\n",
+                "  \"workers\": [1,2,4],\n",
+                "  \"pcs_queries\": 3,\n",
+                "  \"repeats\": 1,\n",
+                "  \"paper_preset\": true,\n",
+                "  \"runner\": \"both\",\n",
+                "  \"compile_figures_requested\": true,\n",
+                "  \"compile_figures_succeeded\": true,\n",
+                "  \"record_count\": {},\n",
+                "  \"positive_verified\": {},\n",
+                "  \"negative_rejected\": {}\n",
+                "}}\n"
+            ),
+            expected_positive, expected_positive, 0
+        );
+        write_text_file(&paper_quality_dir.join("metadata.json"), &paper_metadata)
+            .expect("write paper metadata");
+        write_text_file(&paper_quality_dir.join(COMPILED_PAPER_FIGURE), "%PDF-1.4\n")
+            .expect("write compiled figure marker");
+        let mut source_csv = format!("{SOURCE_CSV_HEADER}\n");
+        for runner in ["local", "network"] {
+            for protocol in ["r1cs", "plonkish"] {
+                for nv_power in PAPER_PRESET_NV_START..=PAPER_PRESET_NV_END {
+                    for workers in PAPER_PRESET_WORKERS {
+                        let size = 1_usize << nv_power;
+                        let constraints = if protocol == "r1cs" { size } else { size * 4 };
+                        let network_bytes = if runner == "network" { 1234 } else { 0 };
+                        let affinity = if runner == "network" {
+                            "20,5,linux-taskset"
+                        } else {
+                            ",,"
+                        };
+                        source_csv.push_str(&format!(
+                            "{protocol},{runner},positive,1,{workers},{nv_power},{size},{constraints},{PAPER_PRESET_PCS_QUERIES},10.000,5.000,1000,900,{network_bytes},{affinity},true,\n"
+                        ));
+                    }
+                }
+            }
+        }
+        write_text_file(&paper_quality_dir.join("source.csv"), &source_csv)
+            .expect("write paper source csv");
+        let mut phase_timing = format!("{PHASE_TIMING_CSV_HEADER}\n");
+        for index in 0..expected_positive {
+            phase_timing.push_str(&format!(
+                "job,paper-job-{index},15.000,10.000,5.000,0.000\n"
+            ));
+        }
+        phase_timing.push_str("source_and_chart_artifacts,charts,1.000,0.000,0.000,1.000\n");
+        phase_timing.push_str("final_result_artifacts,final,1.000,0.000,0.000,1.000\n");
+        phase_timing.push_str("total,total,902.000,600.000,300.000,2.000\n");
+        write_text_file(&paper_quality_dir.join("phase_timing.csv"), &phase_timing)
+            .expect("write paper phase timing csv");
+        write_text_file(
+            &paper_quality_dir.join(OVERVIEW_HTML),
+            "<!doctype html><p>All positive performance proofs verified</p><a>source.csv</a><a>worker_scaling_max_size.svg</a><section>Core Allocation</section>",
+        )
+        .expect("write paper overview");
+        write_benchmark_charts(&paper_quality_dir, &records).expect("write paper charts");
+        verify_benchmark_paper_quality(&paper_quality_dir).expect("paper quality metadata");
+        let debug_metadata = paper_metadata.replace(
+            "\"build_profile\": \"release\"",
+            "\"build_profile\": \"debug\"",
+        );
+        write_text_file(&paper_quality_dir.join("metadata.json"), &debug_metadata)
+            .expect("write debug metadata");
+        let error = verify_benchmark_paper_quality(&paper_quality_dir)
+            .expect_err("debug metadata must fail paper quality");
+        assert!(error.0.contains("build_profile"));
+        write_text_file(&paper_quality_dir.join("metadata.json"), &paper_metadata)
+            .expect("restore paper metadata");
+        let bad_source = source_csv.replace(",positive,1,1,2,", ",negative,1,1,2,");
+        write_text_file(&paper_quality_dir.join("source.csv"), &bad_source)
+            .expect("write bad source csv");
+        let error = verify_benchmark_paper_quality(&paper_quality_dir)
+            .expect_err("negative source row must fail paper quality");
+        assert!(error.0.contains("verified positive performance run"));
+        fs::remove_dir_all(&paper_quality_dir).expect("cleanup paper quality temp dir");
+
+        let stats_csv = summary_stats_to_csv(&benchmark_stats(&records));
+        assert!(stats_csv.starts_with("protocol,runner,case"));
+        assert!(stats_csv.contains("prove_ms_mean"));
+        assert!(stats_csv.contains("12.000000"));
+    }
+
+    #[test]
+    fn r1cs_fallback_metrics_include_all_pcs_openings() {
+        let (instance, witness) = sample_r1cs(4).expect("sample r1cs");
+        let proof = prove_r1cs_for_instance(&instance, &witness, 2, 2).expect("proof");
+        let metrics = verify_r1cs_for_instance(&instance, &proof, 2).expect("verify");
+        let fallback = r1cs_fallback_metrics(&proof);
+
+        assert_eq!(fallback.0, r1cs_proof_size_bytes(&proof));
+        assert_eq!(fallback.1, metrics.communication_bytes);
+        assert_eq!(fallback.1, r1cs_opening_communication_bytes(&proof));
+        let main_openings = proof.outer_openings.az.communication_bytes()
+            + proof.outer_openings.bz.communication_bytes()
+            + proof.outer_openings.cz.communication_bytes()
+            + proof.inner.witness_opening.communication_bytes()
+            + proof.residual_opening.communication_bytes();
+        assert!(fallback.1 > main_openings);
+
+        let tampered = tamper_r1cs_proof(&proof).expect("tampered proof");
+        assert!(verify_r1cs_for_instance(&instance, &tampered, 2).is_err());
+        assert_eq!(r1cs_fallback_metrics(&proof), fallback);
+    }
+
+    #[test]
+    fn plonkish_rejected_fallback_metrics_include_sampled_index_openings() {
+        let instance = sample_plonkish_instance(4).expect("sample plonkish");
+        let proof = prove_for_instance(&instance, 2, 2).expect("proof");
+        let metrics = verify_for_instance(&instance, &proof, 2).expect("verify");
+
+        assert_eq!(
+            plonkish_proof_communication_bytes(&proof),
+            metrics.communication_bytes
+        );
+        assert!(
+            plonkish_proof_communication_bytes(&proof)
+                > proof.constraint_opening.communication_bytes()
+        );
+
+        let tampered = tampered_plonkish_proof_variants(&proof)
+            .expect("tamper proof")
+            .remove(0)
+            .1;
+        assert!(verify_for_instance(&instance, &tampered, 2).is_err());
+        assert_eq!(
+            plonkish_proof_communication_bytes(&proof),
+            metrics.communication_bytes
+        );
+    }
+
+    #[test]
+    fn plonkish_negative_variants_cover_multiple_failure_surfaces() {
+        let instance = sample_plonkish_instance(4).expect("sample plonkish");
+        let proof = prove_for_instance(&instance, 1, 1).expect("proof");
+        let variants = tampered_plonkish_proof_variants(&proof).expect("variants");
+        let labels = variants.iter().map(|(label, _)| *label).collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "accumulator-recurrence",
+                "gate-query",
+                "permutation-query",
+                "gate-subclaim",
+                "constraint-pcs-opening"
+            ]
+        );
+        for (label, tampered) in variants {
+            assert!(
+                verify_for_instance(&instance, &tampered, 1).is_err(),
+                "{label} variant unexpectedly verified"
+            );
+        }
+
+        let failures =
+            verify_plonkish_negative_variants(&instance, &proof, 1).expect("negative variants");
+        assert!(failures.contains("accumulator-recurrence"));
+        assert!(failures.contains("constraint-pcs-opening"));
+    }
+
+    #[test]
+    fn r1cs_network_hook_produces_compact_pcs_openings() {
+        let (addr0, handle0) = spawn_loopback_worker(0).expect("worker 0");
+        let (addr1, handle1) = spawn_loopback_worker(1).expect("worker 1");
+        let addrs = vec![addr0, addr1];
+        ping(&addrs[0]).expect("ping 0");
+        ping(&addrs[1]).expect("ping 1");
+        register(&addrs[0], 0).expect("register 0");
+        register(&addrs[1], 1).expect("register 1");
+
+        let (instance, witness) = sample_r1cs(4).expect("sample r1cs");
+        let backend = RefCell::new(NetworkPcsClient::new(
+            addrs.clone(),
+            "r1cs-compact-test".to_owned(),
+        ));
+        let mut transcript = HashTranscript::new(b"pq-experiments-r1cs");
+        let proof = prove_r1cs_with_pcs_and_spark_batch_hooks(
+            &instance,
+            &witness,
+            2,
+            DistributedPcsParams::new(2),
+            &mut transcript,
+            R1csBatchProverHooks {
+                commit_distributed: |evaluations: &[FieldElement], workers: usize| {
+                    backend
+                        .borrow_mut()
+                        .commit(evaluations, workers)
+                        .map_err(|_| R1csPiopError::Pcs)
+                },
+                open_distributed:
+                    |evaluations: &[FieldElement],
+                     commitment: &DistributedCommitment,
+                     point: &[FieldElement],
+                     params: DistributedPcsParams,
+                     transcript: &mut HashTranscript| {
+                        backend
+                            .borrow_mut()
+                            .open_compact(evaluations, commitment, point, params, transcript)
+                            .map(R1csPcsOpening::Compact)
+                            .map_err(|_| R1csPiopError::Pcs)
+                    },
+                spark_worker_provider: |requests: &[SparkWorkerClaimRequest<'_>]| {
+                    backend
+                        .borrow_mut()
+                        .r1cs_spark_claims(&instance, requests)
+                        .map_err(|_| R1csPiopError::InvalidProof)
+                },
+            },
+        )
+        .expect("network compact R1CS proof");
+
+        assert_r1cs_compact_openings(&proof);
+        assert_eq!(proof.spark.workers.len(), 2);
+        assert!(
+            proof
+                .spark
+                .matrix_evaluations
+                .iter()
+                .all(|matrix| matrix.worker_evaluations.len() == 2)
+        );
+        assert!(backend.borrow().bytes() > 0);
+        verify_r1cs_for_instance(&instance, &proof, 2).expect("verify compact network proof");
+
+        TcpWorkerRuntime::shutdown(&addrs).expect("shutdown");
+        handle0.join().expect("join 0").expect("worker 0 ok");
+        handle1.join().expect("join 1").expect("worker 1 ok");
+    }
+
+    #[test]
+    fn plonkish_network_hook_produces_compact_pcs_opening() {
+        let (addr0, handle0) = spawn_loopback_worker(0).expect("worker 0");
+        let (addr1, handle1) = spawn_loopback_worker(1).expect("worker 1");
+        let addrs = vec![addr0, addr1];
+        ping(&addrs[0]).expect("ping 0");
+        ping(&addrs[1]).expect("ping 1");
+        register(&addrs[0], 0).expect("register 0");
+        register(&addrs[1], 1).expect("register 1");
+
+        let instance = sample_plonkish_instance(4).expect("sample plonkish");
+        let backend = RefCell::new(NetworkPcsClient::new(
+            addrs.clone(),
+            "plonkish-compact-test".to_owned(),
+        ));
+        let mut transcript = HashTranscript::new(b"pq-experiments-plonkish");
+        let proof = prove_plonkish_with_pcs_hooks(
+            &instance,
+            2,
+            DistributedPcsParams::new(2),
+            &mut transcript,
+            |evaluations, workers| {
+                backend
+                    .borrow_mut()
+                    .commit(evaluations, workers)
+                    .map_err(|_| PlonkishPiopError::InvalidProof)
+            },
+            |evaluations, commitment, point, params, transcript| {
+                backend
+                    .borrow_mut()
+                    .open_compact(evaluations, commitment, point, params, transcript)
+                    .map(PlonkishPcsOpening::Compact)
+                    .map_err(|_| PlonkishPiopError::InvalidProof)
+            },
+        )
+        .expect("network compact Plonkish proof");
+
+        assert!(matches!(
+            proof.constraint_opening,
+            PlonkishPcsOpening::Compact(_)
+        ));
+        assert!(backend.borrow().bytes() > 0);
+        verify_for_instance(&instance, &proof, 2).expect("verify compact network proof");
+
+        TcpWorkerRuntime::shutdown(&addrs).expect("shutdown");
+        handle0.join().expect("join 0").expect("worker 0 ok");
+        handle1.join().expect("join 1").expect("worker 1 ok");
     }
 
     #[test]
@@ -2459,6 +8603,7 @@ mod tests {
             format: OutputFormat::Json,
             case: CaseSelection::Both,
             pcs_queries: 2,
+            worker_core_plan: None,
         };
         let r1cs = run_r1cs_network(&r1cs_config, &addrs).expect("r1cs records");
         assert_network_records(&r1cs);
@@ -2470,6 +8615,7 @@ mod tests {
             format: OutputFormat::Json,
             case: CaseSelection::Both,
             pcs_queries: 2,
+            worker_core_plan: None,
         };
         let plonkish = run_plonkish_network(&plonkish_config, &addrs).expect("plonkish records");
         assert_network_records(&plonkish);
@@ -2487,5 +8633,25 @@ mod tests {
         assert!(!records[1].verified);
         assert!(records[1].failure_reason.is_some());
         assert!(records[1].network_bytes > 0);
+    }
+
+    fn assert_r1cs_compact_openings(proof: &R1csPiopProof) {
+        assert!(matches!(
+            proof.outer_openings.az,
+            R1csPcsOpening::Compact(_)
+        ));
+        assert!(matches!(
+            proof.outer_openings.bz,
+            R1csPcsOpening::Compact(_)
+        ));
+        assert!(matches!(
+            proof.outer_openings.cz,
+            R1csPcsOpening::Compact(_)
+        ));
+        assert!(matches!(
+            proof.inner.witness_opening,
+            R1csPcsOpening::Compact(_)
+        ));
+        assert!(matches!(proof.residual_opening, R1csPcsOpening::Compact(_)));
     }
 }

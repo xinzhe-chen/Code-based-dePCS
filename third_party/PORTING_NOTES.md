@@ -74,6 +74,10 @@ symbol-level port is completed.
     algebra while retaining the local committed running-product accumulator.
   - HyperPlonk KZG PCS code is reference-only and is not used as the final
     post-quantum PCS.
+  - Upstream benchmark plotting scratch files and the `hyperplonk/srs.params`
+    KZG SRS binary are intentionally excluded from Git tracking. The local
+    repository keeps the source code needed for audit and porting without
+    publishing non-PQ commitment parameters or generated benchmark artifacts.
 
 ## Next Porting Milestone
 

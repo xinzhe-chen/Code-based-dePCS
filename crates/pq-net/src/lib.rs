@@ -1,12 +1,17 @@
+use std::collections::{HashMap, hash_map::Entry};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use pq_core::FieldElement;
+use pq_core::{FieldElement, Partition, R1csInstance, SparseEntry, SparseMatrix};
 use pq_pcs::{
-    Commitment, MerklePcs, OpeningProof, PolynomialCommitment, QueryOpening, WorkerCommitment,
-    WorkerOpening, encode_systematic,
+    Commitment, DistributedBrakedown, DistributedPcs, OpeningProof, QueryOpening, WorkerCommitment,
+    WorkerOpening,
+};
+use pq_piop_r1cs::{
+    SparkChallenges, SparkWorkerEvaluation, SparkWorkerFingerprint, SparkWorkerShardClaim,
+    compute_spark_worker_shard_claim,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,8 +49,21 @@ pub enum Message {
         session: String,
         worker_id: usize,
         start: usize,
-        values: Vec<FieldElement>,
         query_indices: Vec<usize>,
+    },
+    R1csSparkClaim {
+        session: String,
+        worker_id: usize,
+        start: usize,
+        end: usize,
+        rows: usize,
+        cols: usize,
+        a_entries: Vec<SparseEntry>,
+        b_entries: Vec<SparseEntry>,
+        c_entries: Vec<SparseEntry>,
+        challenges: SparkChallenges,
+        row_point: Vec<FieldElement>,
+        col_point: Vec<FieldElement>,
     },
     Shutdown,
 }
@@ -57,6 +75,7 @@ pub enum Response {
     RoundResult { payload: String },
     PcsCommitResult { commitment: WorkerCommitment },
     PcsOpenResult { opening: WorkerOpening },
+    R1csSparkClaimResult { claim: SparkWorkerShardClaim },
     Bye,
     Error { message: String },
 }
@@ -75,32 +94,60 @@ impl WorkerRuntime for TcpWorkerRuntime {
     }
 
     fn dispatch_round(addrs: &[String], session: &str, payload: &str) -> NetResult<Vec<String>> {
-        let mut out = Vec::with_capacity(addrs.len());
-        for addr in addrs {
-            let response = send(
-                addr,
-                &Message::Round {
-                    session: session.to_string(),
-                    payload: payload.to_string(),
-                },
-            )?;
-            match response {
-                Response::RoundResult { payload } => out.push(payload),
-                Response::Error { message } => return Err(NetError::Io(message)),
-                _ => return Err(NetError::InvalidResponse),
+        thread::scope(|scope| {
+            let handles = addrs
+                .iter()
+                .map(|addr| {
+                    let addr = addr.clone();
+                    let session = session.to_owned();
+                    let payload = payload.to_owned();
+                    scope.spawn(
+                        move || match send(&addr, &Message::Round { session, payload })? {
+                            Response::RoundResult { payload } => Ok(payload),
+                            Response::Error { message } => Err(NetError::Io(message)),
+                            _ => Err(NetError::InvalidResponse),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let mut out = Vec::with_capacity(handles.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(result) => out.push(result?),
+                    Err(_) => {
+                        return Err(NetError::Io("worker dispatch thread panicked".to_owned()));
+                    }
+                }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     fn shutdown(addrs: &[String]) -> NetResult<()> {
-        for addr in addrs {
-            let response = send(addr, &Message::Shutdown)?;
-            if response != Response::Bye {
-                return Err(NetError::InvalidResponse);
+        thread::scope(|scope| {
+            let handles = addrs
+                .iter()
+                .map(|addr| {
+                    let addr = addr.clone();
+                    scope.spawn(move || match send(&addr, &Message::Shutdown)? {
+                        Response::Bye => Ok(()),
+                        Response::Error { message } => Err(NetError::Io(message)),
+                        _ => Err(NetError::InvalidResponse),
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for handle in handles {
+                match handle.join() {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(NetError::Io("worker shutdown thread panicked".to_owned()));
+                    }
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -111,6 +158,7 @@ pub fn run_worker(addr: &str, worker_id: usize) -> NetResult<()> {
 
 fn run_worker_listener(listener: TcpListener, worker_id: usize) -> NetResult<()> {
     let mut registered = false;
+    let mut pcs_sessions = HashMap::<String, WorkerShard>::new();
     for stream in listener.incoming() {
         let mut stream = stream?;
         let message = match read_message(&mut stream) {
@@ -149,7 +197,7 @@ fn run_worker_listener(listener: TcpListener, worker_id: usize) -> NetResult<()>
                 }
             }
             Message::PcsCommit {
-                session: _,
+                session,
                 worker_id: claimed,
                 start,
                 values,
@@ -163,19 +211,32 @@ fn run_worker_listener(listener: TcpListener, worker_id: usize) -> NetResult<()>
                         message: "worker id mismatch".to_string(),
                     }
                 } else {
-                    match worker_pcs_commit(worker_id, start, &values) {
-                        Ok(commitment) => Response::PcsCommitResult { commitment },
-                        Err(error) => Response::Error {
-                            message: format!("{error:?}"),
+                    match pcs_sessions.entry(session) {
+                        Entry::Occupied(_) => Response::Error {
+                            message: "PCS session already exists".to_string(),
                         },
+                        Entry::Vacant(entry) => {
+                            match worker_pcs_commit(worker_id, start, &values) {
+                                Ok(commitment) => {
+                                    entry.insert(WorkerShard {
+                                        start,
+                                        values,
+                                        commitment: commitment.clone(),
+                                    });
+                                    Response::PcsCommitResult { commitment }
+                                }
+                                Err(error) => Response::Error {
+                                    message: format!("{error:?}"),
+                                },
+                            }
+                        }
                     }
                 }
             }
             Message::PcsOpen {
-                session: _,
+                session,
                 worker_id: claimed,
                 start,
-                values,
                 query_indices,
             } => {
                 if !registered {
@@ -187,8 +248,63 @@ fn run_worker_listener(listener: TcpListener, worker_id: usize) -> NetResult<()>
                         message: "worker id mismatch".to_string(),
                     }
                 } else {
-                    match worker_pcs_open(worker_id, start, &values, &query_indices) {
-                        Ok(opening) => Response::PcsOpenResult { opening },
+                    match pcs_sessions.get(&session) {
+                        Some(shard) if shard.start == start => {
+                            match worker_pcs_open(worker_id, shard, &query_indices) {
+                                Ok(opening) => Response::PcsOpenResult { opening },
+                                Err(error) => Response::Error {
+                                    message: format!("{error:?}"),
+                                },
+                            }
+                        }
+                        Some(_) => Response::Error {
+                            message: "PCS shard start mismatch".to_string(),
+                        },
+                        None => Response::Error {
+                            message: "PCS session not found".to_string(),
+                        },
+                    }
+                }
+            }
+            Message::R1csSparkClaim {
+                session: _,
+                worker_id: claimed,
+                start,
+                end,
+                rows,
+                cols,
+                a_entries,
+                b_entries,
+                c_entries,
+                challenges,
+                row_point,
+                col_point,
+            } => {
+                if !registered {
+                    Response::Error {
+                        message: "worker is not registered".to_string(),
+                    }
+                } else if claimed != worker_id {
+                    Response::Error {
+                        message: "worker id mismatch".to_string(),
+                    }
+                } else {
+                    match worker_r1cs_spark_claim(
+                        worker_id,
+                        SparkClaimInput {
+                            start,
+                            end,
+                            rows,
+                            cols,
+                            a_entries,
+                            b_entries,
+                            c_entries,
+                            challenges,
+                            row_point,
+                            col_point,
+                        },
+                    ) {
+                        Ok(claim) => Response::R1csSparkClaimResult { claim },
                         Err(error) => Response::Error {
                             message: format!("{error:?}"),
                         },
@@ -256,7 +372,6 @@ pub fn pcs_worker_open(
     session: &str,
     worker_id: usize,
     start: usize,
-    values: &[FieldElement],
     query_indices: &[usize],
 ) -> NetResult<WorkerOpening> {
     match send(
@@ -265,11 +380,52 @@ pub fn pcs_worker_open(
             session: session.to_owned(),
             worker_id,
             start,
-            values: values.to_vec(),
             query_indices: query_indices.to_vec(),
         },
     )? {
         Response::PcsOpenResult { opening } => Ok(opening),
+        Response::Error { message } => Err(NetError::Io(message)),
+        _ => Err(NetError::InvalidResponse),
+    }
+}
+
+pub struct R1csSparkClaimRequest<'a> {
+    pub session: &'a str,
+    pub worker_id: usize,
+    pub start: usize,
+    pub end: usize,
+    pub rows: usize,
+    pub cols: usize,
+    pub a_entries: &'a [SparseEntry],
+    pub b_entries: &'a [SparseEntry],
+    pub c_entries: &'a [SparseEntry],
+    pub challenges: SparkChallenges,
+    pub row_point: &'a [FieldElement],
+    pub col_point: &'a [FieldElement],
+}
+
+pub fn r1cs_spark_worker_claim(
+    addr: &str,
+    request: R1csSparkClaimRequest<'_>,
+) -> NetResult<SparkWorkerShardClaim> {
+    match send(
+        addr,
+        &Message::R1csSparkClaim {
+            session: request.session.to_owned(),
+            worker_id: request.worker_id,
+            start: request.start,
+            end: request.end,
+            rows: request.rows,
+            cols: request.cols,
+            a_entries: request.a_entries.to_vec(),
+            b_entries: request.b_entries.to_vec(),
+            c_entries: request.c_entries.to_vec(),
+            challenges: request.challenges,
+            row_point: request.row_point.to_vec(),
+            col_point: request.col_point.to_vec(),
+        },
+    )? {
+        Response::R1csSparkClaimResult { claim } => Ok(claim),
         Response::Error { message } => Err(NetError::Io(message)),
         _ => Err(NetError::InvalidResponse),
     }
@@ -283,58 +439,97 @@ pub fn send(addr: &str, message: &Message) -> NetResult<Response> {
     read_response(&mut stream)
 }
 
+pub fn message_wire_bytes(message: &Message) -> usize {
+    frame_wire_bytes(encode_message(message).as_bytes())
+}
+
+pub fn response_wire_bytes(response: &Response) -> usize {
+    frame_wire_bytes(encode_response(response).as_bytes())
+}
+
+fn frame_wire_bytes(payload: &[u8]) -> usize {
+    4 + payload.len()
+}
+
 fn worker_pcs_commit(
     worker_id: usize,
     start: usize,
     values: &[FieldElement],
 ) -> NetResult<WorkerCommitment> {
-    let codeword = encode_systematic(values).map_err(|error| NetError::Io(format!("{error:?}")))?;
-    let encoded_commitment =
-        MerklePcs::commit(&codeword).map_err(|error| NetError::Io(format!("{error:?}")))?;
-    Ok(WorkerCommitment {
-        worker_id,
-        range: (start, start + values.len()),
-        encoded_commitment,
-    })
+    DistributedBrakedown::worker_commit(worker_id, start, values)
+        .map_err(|error| NetError::Io(format!("{error:?}")))
+}
+
+#[derive(Clone, Debug)]
+struct WorkerShard {
+    start: usize,
+    values: Vec<FieldElement>,
+    commitment: WorkerCommitment,
+}
+
+struct SparkClaimInput {
+    start: usize,
+    end: usize,
+    rows: usize,
+    cols: usize,
+    a_entries: Vec<SparseEntry>,
+    b_entries: Vec<SparseEntry>,
+    c_entries: Vec<SparseEntry>,
+    challenges: SparkChallenges,
+    row_point: Vec<FieldElement>,
+    col_point: Vec<FieldElement>,
 }
 
 fn worker_pcs_open(
     worker_id: usize,
-    start: usize,
-    values: &[FieldElement],
+    shard: &WorkerShard,
     query_indices: &[usize],
 ) -> NetResult<WorkerOpening> {
-    let codeword = encode_systematic(values).map_err(|error| NetError::Io(format!("{error:?}")))?;
-    let col_len = values.len();
-    let stride_offset = if col_len > 1 { col_len / 2 } else { 0 };
-    let mut queries = Vec::with_capacity(query_indices.len());
-    for query_index in query_indices {
-        if *query_index >= col_len {
-            return Err(NetError::InvalidMessage);
-        }
-        let next = (query_index + 1) % col_len;
-        let stride = (query_index + stride_offset) % col_len;
-        queries.push(QueryOpening {
-            query_index: *query_index,
-            systematic: MerklePcs::open(&codeword, *query_index)
-                .map_err(|error| NetError::Io(format!("{error:?}")))?,
-            systematic_next: MerklePcs::open(&codeword, next)
-                .map_err(|error| NetError::Io(format!("{error:?}")))?,
-            systematic_stride: MerklePcs::open(&codeword, stride)
-                .map_err(|error| NetError::Io(format!("{error:?}")))?,
-            adjacent_parity: MerklePcs::open(&codeword, col_len + *query_index)
-                .map_err(|error| NetError::Io(format!("{error:?}")))?,
-            stride_parity: MerklePcs::open(&codeword, 2 * col_len + *query_index)
-                .map_err(|error| NetError::Io(format!("{error:?}")))?,
-            blend_parity: MerklePcs::open(&codeword, 3 * col_len + *query_index)
-                .map_err(|error| NetError::Io(format!("{error:?}")))?,
-        });
+    let opening =
+        DistributedBrakedown::worker_open(worker_id, shard.start, &shard.values, query_indices)
+            .map_err(|error| NetError::Io(format!("{error:?}")))?;
+    if opening.worker_id != shard.commitment.worker_id || opening.range != shard.commitment.range {
+        return Err(NetError::InvalidResponse);
     }
-    Ok(WorkerOpening {
-        worker_id,
-        range: (start, start + values.len()),
-        queries,
-    })
+    Ok(opening)
+}
+
+fn worker_r1cs_spark_claim(
+    worker_id: usize,
+    input: SparkClaimInput,
+) -> NetResult<SparkWorkerShardClaim> {
+    if input.start > input.end || input.end > input.rows {
+        return Err(NetError::InvalidMessage);
+    }
+    validate_partition_entries(input.start, input.end, &input.a_entries)?;
+    validate_partition_entries(input.start, input.end, &input.b_entries)?;
+    validate_partition_entries(input.start, input.end, &input.c_entries)?;
+    let a = SparseMatrix::from_entries(input.rows, input.cols, input.a_entries)
+        .map_err(|_| NetError::InvalidMessage)?;
+    let b = SparseMatrix::from_entries(input.rows, input.cols, input.b_entries)
+        .map_err(|_| NetError::InvalidMessage)?;
+    let c = SparseMatrix::from_entries(input.rows, input.cols, input.c_entries)
+        .map_err(|_| NetError::InvalidMessage)?;
+    let instance = R1csInstance::new(a, b, c).map_err(|_| NetError::InvalidMessage)?;
+    compute_spark_worker_shard_claim(
+        &instance,
+        Partition::new(worker_id, input.start, input.end),
+        input.challenges,
+        &input.row_point,
+        &input.col_point,
+    )
+    .map_err(|error| NetError::Io(format!("{error:?}")))
+}
+
+fn validate_partition_entries(start: usize, end: usize, entries: &[SparseEntry]) -> NetResult<()> {
+    if entries
+        .iter()
+        .all(|entry| start <= entry.row && entry.row < end)
+    {
+        Ok(())
+    } else {
+        Err(NetError::InvalidMessage)
+    }
 }
 
 fn write_message(stream: &mut TcpStream, message: &Message) -> NetResult<()> {
@@ -392,15 +587,41 @@ fn encode_message(message: &Message) -> String {
             session,
             worker_id,
             start,
-            values,
             query_indices,
         } => format!(
-            "PCS_OPEN|{}|{}|{}|{}|{}",
+            "PCS_OPEN|{}|{}|{}|{}",
             escape(session),
             worker_id,
             start,
-            encode_fields(values),
             encode_usizes(query_indices)
+        ),
+        Message::R1csSparkClaim {
+            session,
+            worker_id,
+            start,
+            end,
+            rows,
+            cols,
+            a_entries,
+            b_entries,
+            c_entries,
+            challenges,
+            row_point,
+            col_point,
+        } => format!(
+            "R1CS_SPARK_CLAIM|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            escape(session),
+            worker_id,
+            start,
+            end,
+            rows,
+            cols,
+            encode_sparse_entries(a_entries),
+            encode_sparse_entries(b_entries),
+            encode_sparse_entries(c_entries),
+            encode_spark_challenges(*challenges),
+            encode_fields(row_point),
+            encode_fields(col_point)
         ),
         Message::Shutdown => "SHUTDOWN".to_string(),
     }
@@ -425,15 +646,42 @@ fn decode_message(input: &str) -> NetResult<Message> {
                 values: decode_fields(values)?,
             })
         }
-        [kind, session, worker_id, start, values, query_indices] if kind == "PCS_OPEN" => {
+        [kind, session, worker_id, start, query_indices] if kind == "PCS_OPEN" => {
             Ok(Message::PcsOpen {
                 session: unescape(session),
                 worker_id: parse_usize(worker_id)?,
                 start: parse_usize(start)?,
-                values: decode_fields(values)?,
                 query_indices: decode_usizes(query_indices)?,
             })
         }
+        [
+            kind,
+            session,
+            worker_id,
+            start,
+            end,
+            rows,
+            cols,
+            a_entries,
+            b_entries,
+            c_entries,
+            challenges,
+            row_point,
+            col_point,
+        ] if kind == "R1CS_SPARK_CLAIM" => Ok(Message::R1csSparkClaim {
+            session: unescape(session),
+            worker_id: parse_usize(worker_id)?,
+            start: parse_usize(start)?,
+            end: parse_usize(end)?,
+            rows: parse_usize(rows)?,
+            cols: parse_usize(cols)?,
+            a_entries: decode_sparse_entries(a_entries)?,
+            b_entries: decode_sparse_entries(b_entries)?,
+            c_entries: decode_sparse_entries(c_entries)?,
+            challenges: decode_spark_challenges(challenges)?,
+            row_point: decode_fields(row_point)?,
+            col_point: decode_fields(col_point)?,
+        }),
         [kind] if kind == "SHUTDOWN" => Ok(Message::Shutdown),
         _ => Err(NetError::InvalidMessage),
     }
@@ -449,6 +697,9 @@ fn encode_response(response: &Response) -> String {
         }
         Response::PcsOpenResult { opening } => {
             format!("PCS_OPEN_RESULT|{}", encode_worker_opening(opening))
+        }
+        Response::R1csSparkClaimResult { claim } => {
+            format!("R1CS_SPARK_CLAIM_RESULT|{}", encode_spark_claim(claim))
         }
         Response::Bye => "BYE".to_string(),
         Response::Error { message } => format!("ERROR|{}", escape(message)),
@@ -470,6 +721,9 @@ fn decode_response(input: &str) -> NetResult<Response> {
         }),
         [kind, opening] if kind == "PCS_OPEN_RESULT" => Ok(Response::PcsOpenResult {
             opening: decode_worker_opening(opening)?,
+        }),
+        [kind, claim] if kind == "R1CS_SPARK_CLAIM_RESULT" => Ok(Response::R1csSparkClaimResult {
+            claim: decode_spark_claim(claim)?,
         }),
         [kind] if kind == "BYE" => Ok(Response::Bye),
         [kind, message] if kind == "ERROR" => Ok(Response::Error {
@@ -566,6 +820,61 @@ fn decode_usizes(input: &str) -> NetResult<Vec<usize>> {
     input.split(',').map(parse_usize).collect()
 }
 
+fn encode_sparse_entries(entries: &[SparseEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| format!("{}:{}:{}", entry.row, entry.col, entry.value.value()))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn decode_sparse_entries(input: &str) -> NetResult<Vec<SparseEntry>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    input
+        .split(';')
+        .map(|item| {
+            let parts = item.split(':').collect::<Vec<_>>();
+            match parts.as_slice() {
+                [row, col, value] => Ok(SparseEntry {
+                    row: parse_usize(row)?,
+                    col: parse_usize(col)?,
+                    value: value
+                        .parse::<u64>()
+                        .map(FieldElement::from)
+                        .map_err(|_| NetError::InvalidMessage)?,
+                }),
+                _ => Err(NetError::InvalidMessage),
+            }
+        })
+        .collect()
+}
+
+fn encode_spark_challenges(challenges: SparkChallenges) -> String {
+    encode_fields(&[
+        challenges.tuple,
+        challenges.matrix,
+        challenges.row,
+        challenges.col,
+        challenges.value,
+    ])
+}
+
+fn decode_spark_challenges(input: &str) -> NetResult<SparkChallenges> {
+    let values = decode_fields(input)?;
+    match values.as_slice() {
+        [tuple, matrix, row, col, value] => Ok(SparkChallenges {
+            tuple: *tuple,
+            matrix: *matrix,
+            row: *row,
+            col: *col,
+            value: *value,
+        }),
+        _ => Err(NetError::InvalidMessage),
+    }
+}
+
 fn parse_usize(input: &str) -> NetResult<usize> {
     input.parse().map_err(|_| NetError::InvalidMessage)
 }
@@ -621,6 +930,96 @@ fn decode_worker_opening(input: &str) -> NetResult<WorkerOpening> {
         }),
         _ => Err(NetError::InvalidResponse),
     }
+}
+
+fn encode_spark_claim(claim: &SparkWorkerShardClaim) -> String {
+    format!(
+        "{}#{}",
+        encode_spark_fingerprint(&claim.fingerprint),
+        claim
+            .matrix_evaluations
+            .iter()
+            .map(encode_spark_evaluation)
+            .collect::<Vec<_>>()
+            .join(";")
+    )
+}
+
+fn decode_spark_claim(input: &str) -> NetResult<SparkWorkerShardClaim> {
+    let parts = input.splitn(2, '#').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [fingerprint, evaluations] => Ok(SparkWorkerShardClaim {
+            fingerprint: decode_spark_fingerprint(fingerprint)?,
+            matrix_evaluations: decode_spark_evaluations(evaluations)?,
+        }),
+        _ => Err(NetError::InvalidResponse),
+    }
+}
+
+fn encode_spark_fingerprint(fingerprint: &SparkWorkerFingerprint) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        fingerprint.worker_id,
+        fingerprint.range.0,
+        fingerprint.range.1,
+        fingerprint.entry_count,
+        fingerprint.linear_fingerprint.value(),
+        fingerprint.product_fingerprint.value()
+    )
+}
+
+fn decode_spark_fingerprint(input: &str) -> NetResult<SparkWorkerFingerprint> {
+    let parts = input.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [worker_id, start, end, entry_count, linear, product] => Ok(SparkWorkerFingerprint {
+            worker_id: parse_usize(worker_id)?,
+            range: (parse_usize(start)?, parse_usize(end)?),
+            entry_count: parse_usize(entry_count)?,
+            linear_fingerprint: parse_field_response(linear)?,
+            product_fingerprint: parse_field_response(product)?,
+        }),
+        _ => Err(NetError::InvalidResponse),
+    }
+}
+
+fn encode_spark_evaluation(evaluation: &SparkWorkerEvaluation) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        evaluation.matrix_id,
+        evaluation.worker_id,
+        evaluation.range.0,
+        evaluation.range.1,
+        evaluation.entry_count,
+        evaluation.evaluation.value()
+    )
+}
+
+fn decode_spark_evaluations(input: &str) -> NetResult<Vec<SparkWorkerEvaluation>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    input.split(';').map(decode_spark_evaluation).collect()
+}
+
+fn decode_spark_evaluation(input: &str) -> NetResult<SparkWorkerEvaluation> {
+    let parts = input.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [matrix_id, worker_id, start, end, entry_count, evaluation] => Ok(SparkWorkerEvaluation {
+            matrix_id: parse_usize(matrix_id)?,
+            worker_id: parse_usize(worker_id)?,
+            range: (parse_usize(start)?, parse_usize(end)?),
+            entry_count: parse_usize(entry_count)?,
+            evaluation: parse_field_response(evaluation)?,
+        }),
+        _ => Err(NetError::InvalidResponse),
+    }
+}
+
+fn parse_field_response(input: &str) -> NetResult<FieldElement> {
+    input
+        .parse::<u64>()
+        .map(FieldElement::from)
+        .map_err(|_| NetError::InvalidResponse)
 }
 
 fn encode_query_opening(query: &QueryOpening) -> String {
@@ -761,6 +1160,8 @@ fn hex_value(value: u8) -> NetResult<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pq_core::sample_r1cs;
+    use pq_pcs::{MerklePcs, PolynomialCommitment};
 
     #[test]
     fn tcp_worker_register_round_shutdown() {
@@ -774,6 +1175,32 @@ mod tests {
         assert!(replies[0].contains("worker=7"));
         TcpWorkerRuntime::shutdown(std::slice::from_ref(&addr)).expect("shutdown");
         handle.join().expect("join").expect("worker ok");
+    }
+
+    #[test]
+    fn tcp_worker_parallel_round_preserves_address_order() {
+        let mut addrs = Vec::new();
+        let mut handles = Vec::new();
+        for worker_id in 0..3 {
+            let (addr, handle) = spawn_loopback_worker(worker_id).expect("worker");
+            ping(&addr).expect("ping");
+            register(&addr, worker_id).expect("register");
+            addrs.push(addr);
+            handles.push(handle);
+        }
+
+        let replies =
+            TcpWorkerRuntime::dispatch_round(&addrs, "ordered", "payload").expect("parallel round");
+        assert_eq!(replies.len(), addrs.len());
+        for (worker_id, reply) in replies.iter().enumerate() {
+            assert!(reply.contains(&format!("worker={worker_id}")));
+            assert!(reply.contains("session=ordered"));
+        }
+
+        TcpWorkerRuntime::shutdown(&addrs).expect("shutdown");
+        for handle in handles {
+            handle.join().expect("join").expect("worker ok");
+        }
     }
 
     #[test]
@@ -813,10 +1240,37 @@ mod tests {
         };
         let encoded = encode_response(&response);
         assert_eq!(decode_response(&encoded), Ok(response));
+
+        let open = Message::PcsOpen {
+            session: "pcs|session".to_string(),
+            worker_id: 2,
+            start: 16,
+            query_indices: vec![0, 3, 5],
+        };
+        let encoded = encode_message(&open);
+        assert_eq!(decode_message(&encoded), Ok(open));
     }
 
     #[test]
-    fn worker_executes_pcs_commit_and_open_tasks() {
+    fn wire_byte_helpers_match_framed_codec_lengths() {
+        let message = Message::PcsOpen {
+            session: "pcs|session".to_string(),
+            worker_id: 2,
+            start: 16,
+            query_indices: vec![0, 3, 5],
+        };
+        let encoded = encode_message(&message);
+        assert_eq!(message_wire_bytes(&message), 4 + encoded.len());
+
+        let response = Response::Error {
+            message: "bad|worker".to_string(),
+        };
+        let encoded = encode_response(&response);
+        assert_eq!(response_wire_bytes(&response), 4 + encoded.len());
+    }
+
+    #[test]
+    fn worker_stores_committed_pcs_shard_and_opens_by_session() {
         let (addr, handle) = spawn_loopback_worker(0).expect("worker");
         ping(&addr).expect("ping");
         register(&addr, 0).expect("register");
@@ -825,7 +1279,7 @@ mod tests {
         assert_eq!(commitment.worker_id, 0);
         assert_eq!(commitment.range, (0, values.len()));
 
-        let opening = pcs_worker_open(&addr, "pcs-test", 0, 0, &values, &[0, 2]).expect("open");
+        let opening = pcs_worker_open(&addr, "pcs-test", 0, 0, &[0, 2]).expect("open");
         assert_eq!(opening.worker_id, 0);
         assert_eq!(opening.queries.len(), 2);
         for query in &opening.queries {
@@ -841,8 +1295,111 @@ mod tests {
                 .expect("stride parity");
             MerklePcs::verify(&commitment.encoded_commitment, &query.blend_parity).expect("blend");
         }
+        let replacement = vec![9_u64.into(), 9_u64.into(), 9_u64.into(), 9_u64.into()];
+        assert!(pcs_worker_commit(&addr, "pcs-test", 0, 0, &replacement).is_err());
+        let original_opening = pcs_worker_open(&addr, "pcs-test", 0, 0, &[0]).expect("open");
+        assert_eq!(original_opening.queries[0].systematic.value, values[0]);
+        assert!(pcs_worker_open(&addr, "missing-session", 0, 0, &[0]).is_err());
+        assert!(pcs_worker_open(&addr, "pcs-test", 0, 1, &[0]).is_err());
 
         TcpWorkerRuntime::shutdown(std::slice::from_ref(&addr)).expect("shutdown");
         handle.join().expect("join").expect("worker ok");
+    }
+
+    #[test]
+    fn worker_computes_r1cs_spark_claim_for_partition() {
+        let (instance, _) = sample_r1cs();
+        let (addr, handle) = spawn_loopback_worker(0).expect("worker");
+        ping(&addr).expect("ping");
+        register(&addr, 0).expect("register");
+        let partition = Partition::new(0, 0, 1);
+        let challenges = SparkChallenges {
+            tuple: 11_u64.into(),
+            matrix: 13_u64.into(),
+            row: 17_u64.into(),
+            col: 19_u64.into(),
+            value: 23_u64.into(),
+        };
+        let row_point = vec![3_u64.into()];
+        let col_point = vec![5_u64.into(), 7_u64.into()];
+        let a_entries = partition_entries_for_test(instance.a(), partition);
+        let b_entries = partition_entries_for_test(instance.b(), partition);
+        let c_entries = partition_entries_for_test(instance.c(), partition);
+        let claim = r1cs_spark_worker_claim(
+            &addr,
+            R1csSparkClaimRequest {
+                session: "spark-test",
+                worker_id: partition.id,
+                start: partition.start,
+                end: partition.end,
+                rows: instance.num_constraints(),
+                cols: instance.num_variables(),
+                a_entries: &a_entries,
+                b_entries: &b_entries,
+                c_entries: &c_entries,
+                challenges,
+                row_point: &row_point,
+                col_point: &col_point,
+            },
+        )
+        .expect("spark claim");
+        let expected = compute_spark_worker_shard_claim(
+            &instance, partition, challenges, &row_point, &col_point,
+        )
+        .expect("local claim");
+        assert_eq!(claim, expected);
+
+        let message = Message::R1csSparkClaim {
+            session: "spark|session".to_owned(),
+            worker_id: partition.id,
+            start: partition.start,
+            end: partition.end,
+            rows: instance.num_constraints(),
+            cols: instance.num_variables(),
+            a_entries,
+            b_entries,
+            c_entries,
+            challenges,
+            row_point,
+            col_point,
+        };
+        let encoded = encode_message(&message);
+        assert_eq!(decode_message(&encoded), Ok(message));
+        let response = Response::R1csSparkClaimResult { claim };
+        let encoded = encode_response(&response);
+        assert_eq!(decode_response(&encoded), Ok(response));
+
+        assert!(
+            r1cs_spark_worker_claim(
+                &addr,
+                R1csSparkClaimRequest {
+                    session: "spark-bad",
+                    worker_id: 1,
+                    start: 0,
+                    end: 1,
+                    rows: instance.num_constraints(),
+                    cols: instance.num_variables(),
+                    a_entries: &[],
+                    b_entries: &[],
+                    c_entries: &[],
+                    challenges,
+                    row_point: &[],
+                    col_point: &[],
+                },
+            )
+            .is_err()
+        );
+
+        TcpWorkerRuntime::shutdown(std::slice::from_ref(&addr)).expect("shutdown");
+        handle.join().expect("join").expect("worker ok");
+    }
+
+    fn partition_entries_for_test(matrix: &SparseMatrix, partition: Partition) -> Vec<SparseEntry> {
+        matrix
+            .entries()
+            .iter()
+            .copied()
+            .filter(|entry| partition.contains(entry.row))
+            .collect()
     }
 }

@@ -1,0 +1,30 @@
+# Rust build products
+/target/
+
+# Benchmark outputs are generated artifacts. Keep the directory documentation,
+# but do not version local scratch runs. Curated publishable runs belong under
+# results/release_results/ and are intentionally not ignored.
+/results/bench-*/
+!/results/README.md
+!/results/release_results/
+!/results/release_results/**
+
+# Local logs and temporary report screenshots
+*.log
+*.tmp
+*.bak
+/results/bench-*/*.png
+
+# Vendored HyperPlonk reference source excludes. Keep source files, but do not
+# publish upstream benchmark plotting scratch files or KZG SRS binaries as part
+# of this post-quantum PCS implementation repository.
+/third_party/hyperplonk/bench_results/
+/third_party/hyperplonk/hyperplonk/srs.params
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/

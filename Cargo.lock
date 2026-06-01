@@ -24,6 +24,7 @@ version = "0.1.0"
 dependencies = [
  "pq-core",
  "pq-pcs",
+ "pq-piop-r1cs",
 ]
 
 [[package]]
@@ -35,11 +36,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pq-piop"
+version = "0.1.0"
+dependencies = [
+ "pq-pcs",
+ "pq-transcript",
+]
+
+[[package]]
 name = "pq-piop-plonkish"
 version = "0.1.0"
 dependencies = [
  "pq-core",
  "pq-pcs",
+ "pq-piop",
  "pq-sumcheck",
  "pq-transcript",
 ]
@@ -50,6 +60,7 @@ version = "0.1.0"
 dependencies = [
  "pq-core",
  "pq-pcs",
+ "pq-piop",
  "pq-sumcheck",
  "pq-transcript",
 ]
