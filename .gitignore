@@ -2,8 +2,8 @@
 /target/
 
 # Benchmark outputs are generated artifacts. Keep the directory documentation,
-# but do not version local scratch runs. Curated publishable runs belong under
-# results/release_results/ and are intentionally not ignored.
+# but do not version local scratch runs. Curated publishable runs can be copied
+# manually into results/release_results/, which is intentionally not ignored.
 /results/bench-*/
 !/results/README.md
 !/results/release_results/

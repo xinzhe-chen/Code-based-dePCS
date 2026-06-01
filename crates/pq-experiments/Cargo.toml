@@ -11,6 +11,8 @@ pq-pcs = { path = "../pq-pcs" }
 pq-piop-plonkish = { path = "../pq-piop-plonkish" }
 pq-piop-r1cs = { path = "../pq-piop-r1cs" }
 pq-transcript = { path = "../pq-transcript" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [[bin]]
 name = "pq-experiments"

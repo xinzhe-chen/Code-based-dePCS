@@ -45,7 +45,7 @@ The `scripts/` directory intentionally contains only three user-facing script
 entrypoints, and all three are menu-driven:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\interactive-powershell.ps1
+.\scripts\interactive-powershell.cmd
 ```
 
 ```bash
@@ -53,10 +53,14 @@ bash scripts/interactive-linux.sh
 bash scripts/interactive-macos.sh
 ```
 
-The PowerShell script is safe to launch from a normal terminal or through
-Explorer's "Run with PowerShell": by default it waits for Enter before closing,
-including after an error. Use `-NoPause` only for CI-style scripted smoke
-checks.
+The Windows entry is a clickable `.cmd` launcher with its PowerShell menu
+payload embedded inside the same file. It extracts that payload to
+`target/windows/interactive-powershell.generated.ps1` and runs it with
+`-ExecutionPolicy Bypass`, so fresh Windows machines with restricted `.ps1`
+policy do not close before the menu loads. By default it waits for Enter before
+closing, including after an error. Use `-NoPause` only for CI-style scripted
+smoke checks. Runtime startup failures are also written to
+`results/logs/interactive-powershell-last.log`.
 
 For a fresh-clone validation checklist and the latest lightweight benchmark
 sanity-check interpretation, see `Doc/reproducibility_runbook.md`.
@@ -66,17 +70,19 @@ For a requirement-by-requirement status audit, see
 The menu is the script API. It does not run a predetermined experiment when
 opened. The available actions are:
 
-- preflight dependency detection;
-- one-step installation/checking of missing Rust, Git, build-tool, and core
-  platform dependencies;
-- proof experiment wizard, which launches the Rust `pq-experiments interactive`
-  prompt;
-- performance benchmark wizard;
-- benchmark result verification.
+- environment setup/check, which runs preflight, can install/check missing
+  Rust, Git, build-tool, and core platform dependencies, and can build the
+  debug `pq-experiments` target on a fresh clone;
+- proof experiment wizard, which runs a selected positive proof path and writes
+  real proof bundles under `proofs/` in a timestamped bench folder;
+- verify experiments wizard, which scans `results/bench-*`, shows which folders
+  contain stored proofs, marks unreadable proof files as invalid, and writes
+  extra verification reports under `verifications/`;
+- performance benchmark wizard, the final menu action.
 
 On macOS, the preflight explicitly checks Xcode Command Line Tools. If they are
-missing, the install action invokes Apple's `xcode-select --install` prompt and
-then asks you to rerun the menu after the installer completes.
+missing, the environment setup action invokes Apple's `xcode-select --install`
+prompt and then asks you to rerun the menu after the installer completes.
 
 The benchmark wizard is for performance runs only. Each atomic benchmark row is
 one real end-to-end prove+verify over one selected circuit and uses
@@ -95,11 +101,12 @@ masks. The scripts print the derived core plan before the benchmark starts, and
 the result metadata records `host_logical_cores`, `cores_per_worker`, and
 `core_affinity`.
 
-Open `results/bench-<run-id>/overview.html` after a benchmark for the visual
-experiment dashboard, then use the menu's verification action before copying or
-publishing a result directory. Local scratch runs under `results/bench-*` are
-ignored by Git; copy selected, validated runs into
-`results/release_results/` when you want them included in the GitHub repo.
+Open `results/bench-YYYYMMDD-HHMMSS-performance/overview.html` after a
+benchmark for the visual experiment dashboard. Proof experiments use
+`bench-YYYYMMDD-HHMMSS-proof`; performance benchmarks use
+`bench-YYYYMMDD-HHMMSS-performance`. Local scratch runs under `results/bench-*`
+are ignored by Git. If you want to publish selected evidence, manually copy the
+chosen verified run into `results/release_results/`.
 For paper-facing results, use the verifier's paper-quality gate; it requires a
 release build, `runner=both`, the full paper preset grid, compiled figures,
 verified positive cases, and performance-only benchmark rows.
@@ -109,8 +116,13 @@ the interactive scripts:
 
 ```bash
 cargo run -p pq-experiments -- interactive
-cargo run -p pq-experiments --release -- benchmark --runner both --n-range 2..5 --workers 1,2,4 --pcs-queries 1 --out results
-cargo run -p pq-experiments -- verify-results results/bench-<run-id> --format json
+cargo run -p pq-experiments --release -- proof-experiment --protocol both --runner local --n 2 --workers 1 --pcs-queries 1
+cargo run -p pq-experiments -- list-proofs --results results --format text
+cargo run -p pq-experiments -- verify-proof results/bench-YYYYMMDD-HHMMSS-proof --all --format json
+cargo run -p pq-experiments -- quick-smoke --out target/quick-smoke
+cargo run -p pq-experiments --release -- benchmark --runner both --n-range 2..5 --worker-power-range 0..2 --pcs-queries 1
+cargo run -p pq-experiments -- verify-results results/bench-YYYYMMDD-HHMMSS-performance --format json
+cargo run -p pq-experiments -- verify-proof results/bench-YYYYMMDD-HHMMSS-performance --all --format json
 ```
 
 The experiment CLI supports `--case positive`, `--case negative`, and
@@ -144,12 +156,14 @@ gate virtual-evaluation subclaims, Plonkish permutation accumulator random
 recurrence subclaims and cubic recurrence sumchecks, R1CS inner
 product-sumcheck openings, and PIOP
 consistency openings.
-The benchmark command creates `results/bench-<timestamp>/` containing
+The benchmark command creates `results/bench-YYYYMMDD-HHMMSS-performance/`
+containing
 `metadata.json`, `result_manifest.json` with SHA-256 checksums for every other
 artifact, a static `overview.html` experiment dashboard, phase-level
 `phase_timing.csv` / `phase_timing.json`, raw performance-row `source.csv`,
 raw performance-row `source.json`, `summary_stats.csv`, `summary.txt`,
-SVG charts, individual PGFPlots/TikZ `.tex` figures, plus a
+stored proof bundles under `proofs/`, SVG charts, individual PGFPlots/TikZ
+`.tex` figures, plus a
 paper-oriented 2x2 `paper_figures.tex` and `paper_figures_standalone.tex`
 wrapper for prove time, verify time, proof size, and worker scaling versus the
 `workers=1` non-distributed baseline. Network bytes and network/local runner
@@ -160,27 +174,33 @@ PGFPlots files, grouped paper figure, manifest, and metadata. It summarizes the
 configuration, correctness gate, core allocation, scaling interpretation
 against the `workers=1` baseline, and per-configuration summary statistics for
 quick visual inspection before opening the raw data.
+For a one-command fresh-clone smoke, `quick-smoke` runs the smallest local
+performance benchmark, verifies the result manifest, reverifies all stored
+proofs, and checks that the extra verification reports do not change benchmark
+artifact counts.
 `metadata.json` also records provenance for reproducibility: host OS/arch,
 debug/release profile, full command line, git commit/branch/dirty state,
 `rustc` and `cargo` versions, `RUSTFLAGS`, `Cargo.lock` and
 `rust-toolchain.toml` SHA-256 hashes, and pinned third-party source commits
 when those repositories are present.
-The Windows benchmark wrapper supports `-Help` and exits after printing usage;
-it does not start a default benchmark run when help is requested.
 Benchmark sizes can be supplied directly with
 `--sizes 4,8,16`, as exponent lists with `--nv-powers 2,3,4`
 or `--n-values 2,3,4`, or as inclusive exponent ranges with
-`--nv-range 2..6` or `--n-range 2..6`, where `nv=2^n`. The Windows wrapper
-accepts the matching `-NvPowers` / `-NValues` and `-NvRange` / `-NRange`
-forms. `--paper-preset` / `-PaperPreset` selects the paper-facing default
-grid `n=2..6`, `workers=1,2,4`, and `pcs_queries=3`; explicit
+`--nv-range 2..6` or `--n-range 2..6`, where the grid is
+`nv=2^2,2^3,...,2^6`.
+`--worker-power-range 0..2` expands to `workers=1,2,4`; `workers=1` is
+also added automatically when a distributed-only worker exponent range such as
+`1..3` is requested, because scaling summaries need the non-distributed
+baseline. `--paper-preset`
+selects the paper-facing default grid `n=2..6`, `workers=1,2,4`, and
+`pcs_queries=3`; explicit
 size, worker, and query flags override those preset defaults. Source
 rows include both `runner` and `nv_power`/`size`; `--runner network` /
-`-Runner network` sends the benchmark through loopback TCP workers for PCS, and
+`--runner network` sends the benchmark through loopback TCP workers for PCS, and
 for R1CS also Spark shard claims, recording non-zero `network_bytes` for
 network-backed proof rows. `--runner both`
-/ `-Runner both` records local and network-backed proof rows in the same result
-directory so the generated figures can directly compare both real paths. The figure outputs use
+records local and network-backed proof rows in the same result directory so the
+generated figures can directly compare both real paths. The figure outputs use
 publication-oriented vector styling with measured data points, fixed protocol
 colors, worker line/marker encodings, clean axes, legend boxes, and an
 explicit perfect-linear upper bound only on the worker-scaling plot. The PGFPlots
@@ -197,13 +217,12 @@ by local-runner prover time for matching protocol/worker/size settings. The
 SVG files are quick previews; the `.tex` outputs are the paper-facing artifacts
 and are annotated with their measured-data sources.
 Selecting figure compilation in the benchmark wizard, or passing
-`--compile-figures --figure-compiler auto` to the Rust benchmark command,
-invokes `pdflatex` or `tectonic` from the result directory and writes
-`paper_figures_standalone.pdf`. The `auto` compiler mode prefers `tectonic`
-when present because it is better suited to non-interactive runs. If the
-requested compiler is not installed the benchmark fails explicitly after
-leaving the raw data and `.tex` figure sources in place, and `metadata.json`
-records whether figure compilation was requested and whether it succeeded.
+`--compile-figures` to the Rust benchmark command, invokes `pdflatex` or
+`tectonic` from the result directory and writes `paper_figures_standalone.pdf`.
+The automatic compiler mode prefers `tectonic` when present because it is
+better suited to non-interactive runs. The interactive environment check reports
+whether a LaTeX figure compiler is installed and the setup path installs
+`tectonic` when figure compilation support is missing.
 Each benchmark job validates exactly one positive end-to-end performance path:
 prove one circuit and verify that proof. Negative/tampered proof checks remain
 in the unit tests, integration tests, and ordinary experiment commands with
@@ -211,7 +230,7 @@ in the unit tests, integration tests, and ordinary experiment commands with
 benchmark rows.
 Generated result directories can be checked later from the interactive
 verification menu or with
-`cargo run -p pq-experiments -- verify-results results/bench-<run-id> --format json`;
+`cargo run -p pq-experiments -- verify-results results/bench-YYYYMMDD-HHMMSS-performance --format json`;
 the verifier recomputes SHA-256 hashes from `result_manifest.json` and fails on
 missing, modified, or extra top-level artifacts. It also cross-checks
 `metadata.json`, `source.csv`, `source.json`, `summary_stats.csv`,
@@ -227,9 +246,17 @@ every positive benchmark case. It also validates that `source.csv` covers each
 paper-grid local/network/protocol/worker/size cell exactly once, that
 `phase_timing.csv` contains every benchmark job plus source/final/total phases,
 and that the HTML/SVG/PGFPlots/PDF artifacts contain expected figure markers.
-The benchmark runner also
-creates each `bench-<run-id>` directory atomically and performs this manifest
-self-check before reporting completion.
+The benchmark runner also creates each timestamped bench directory atomically
+and performs this manifest self-check before reporting completion. Stored proof
+bundles can be reverified later with
+`cargo run -p pq-experiments -- verify-proof results/bench-YYYYMMDD-HHMMSS-performance --all --format json`.
+This writes a JSON and HTML report under `verifications/` and deliberately does
+not rewrite `source.csv`, `metadata.json`, `result_manifest.json`, figures, or
+the benchmark overview. If any selected stored proof fails, the report is still
+written and the command exits nonzero. The verifier checks the proof payload,
+bundle metadata, and the matching `proofs/index.json` entry, including file
+size and SHA-256; malformed proof JSON is also recorded as a failed proof
+outcome instead of suppressing the report.
 Benchmark validation requires `workers=1` to be
 present, so the scaling plot cannot silently invent a baseline. `summary.txt` and
 `metadata.json` record whether the benchmark binary was built in `debug` or
@@ -238,7 +265,7 @@ runs. The `.tex` files are intended for direct LaTeX inclusion
 with `\usepackage{pgfplots}`,
 `\usepgfplotslibrary{groupplots}` for `paper_figures.tex`, and
 `\pgfplotsset{compat=1.18}`; the source data stays alongside each figure. The
-The interactive scripts print plain progress steps for cargo checks/builds,
+interactive scripts print plain progress steps for cargo checks/builds,
 selected size mode, current benchmark job, output directory, and completion
 status; progress logs are kept separate from generated CSV/JSON source data.
 

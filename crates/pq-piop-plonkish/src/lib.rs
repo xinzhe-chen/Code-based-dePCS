@@ -19,6 +19,7 @@ use pq_sumcheck::{
     zerocheck_final_evaluation,
 };
 use pq_transcript::Transcript;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlonkishPiopError {
@@ -30,7 +31,7 @@ pub enum PlonkishPiopError {
 
 pub type PlonkishPiopResult<T> = Result<T, PlonkishPiopError>;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishWitnessRow {
     pub a: FieldElement,
     pub b: FieldElement,
@@ -43,7 +44,7 @@ impl PlonkishWitnessRow {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishWitness {
     rows: Vec<PlonkishWitnessRow>,
 }
@@ -104,14 +105,14 @@ impl Piop for PlonkishPiop {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlonkishColumn {
     A,
     B,
     C,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PlonkishCell {
     pub row: usize,
     pub column: PlonkishColumn,
@@ -123,7 +124,7 @@ impl PlonkishCell {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishPermutation {
     mapping: Vec<usize>,
 }
@@ -177,7 +178,7 @@ impl PlonkishPermutation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishInstance {
     circuit: PlonkishCircuit,
     permutation: PlonkishPermutation,
@@ -279,7 +280,7 @@ fn validate_plonkish_witness(
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishPiopProof {
     pub oracle_commitments: PlonkishOracleCommitments,
     pub gate_subclaim: PlonkishGateSubclaimProof,
@@ -293,7 +294,7 @@ pub struct PlonkishPiopProof {
     pub workers: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlonkishPcsOpening {
     Full(DistributedOpening),
     Compact(CompactDistributedOpening),
@@ -364,7 +365,7 @@ impl PlonkishPcsOpening {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishOracleCommitments {
     pub a: Commitment,
     pub b: Commitment,
@@ -380,7 +381,7 @@ pub struct PlonkishOracleCommitments {
     pub permutation_residual: Commitment,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishGateSubclaimProof {
     pub point: Vec<FieldElement>,
     pub virtual_gate_value: FieldElement,
@@ -395,12 +396,12 @@ pub struct PlonkishGateSubclaimProof {
     pub gate_residual: PlonkishSampledGateColumnSubclaim,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishSampledGateColumnSubclaim {
     pub folding: SampledMleFoldingProof,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishGateCubicProof {
     pub sumcheck: CubicZerocheckProof,
     pub product_left: PlonkishSampledGateColumnSubclaim,
@@ -408,7 +409,7 @@ pub struct PlonkishGateCubicProof {
     pub linear_output: PlonkishSampledGateColumnSubclaim,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishGateQuery {
     pub row: usize,
     pub a: OpeningProof,
@@ -425,7 +426,7 @@ pub struct PlonkishGateQuery {
     pub constraint_residual: DistributedIndexOpening,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishPermutationQuery {
     pub source: usize,
     pub target: usize,
@@ -435,7 +436,7 @@ pub struct PlonkishPermutationQuery {
     pub constraint_residual: DistributedIndexOpening,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishPermutationAccumulatorProof {
     pub beta: FieldElement,
     pub gamma: FieldElement,
@@ -449,7 +450,7 @@ pub struct PlonkishPermutationAccumulatorProof {
     pub recurrence_queries: Vec<PlonkishPermutationAccumulatorQuery>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishPermutationAccumulatorSubclaimProof {
     pub point: Vec<FieldElement>,
     pub public_commitments: PlonkishPermutationAccumulatorPublicCommitments,
@@ -471,7 +472,7 @@ pub struct PlonkishPermutationAccumulatorSubclaimProof {
     pub denominator_shift_queries: Vec<PlonkishAccumulatorShiftQuery>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishAccumulatorRecurrenceProof {
     pub sumcheck: CubicZerocheckProof,
     pub current: PlonkishSampledGateColumnSubclaim,
@@ -482,14 +483,14 @@ pub struct PlonkishAccumulatorRecurrenceProof {
     pub residual: PlonkishSampledGateColumnSubclaim,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishAccumulatorShiftQuery {
     pub index: usize,
     pub current_at_next: OpeningProof,
     pub shifted_at_index: OpeningProof,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishAccumulatorResidualQuery {
     pub index: usize,
     pub value: OpeningProof,
@@ -514,7 +515,7 @@ struct PlonkishPermutationAccumulatorVectors {
     denominator_next: Vec<FieldElement>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishPermutationAccumulatorPublicCommitments {
     pub active: Commitment,
     pub value: Commitment,
@@ -522,7 +523,7 @@ pub struct PlonkishPermutationAccumulatorPublicCommitments {
     pub target_id: Commitment,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishPermutationAccumulatorQuery {
     pub index: usize,
     pub value: OpeningProof,
@@ -535,7 +536,7 @@ pub struct PlonkishPermutationAccumulatorQuery {
     pub denominator_next: OpeningProof,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishMetrics {
     pub proof_bytes: usize,
     pub communication_bytes: usize,

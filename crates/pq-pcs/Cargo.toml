@@ -7,10 +7,10 @@ license.workspace = true
 [dependencies]
 pq-core = { path = "../pq-core" }
 pq-transcript = { path = "../pq-transcript" }
+serde = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
 
 [lints]
 workspace = true
-

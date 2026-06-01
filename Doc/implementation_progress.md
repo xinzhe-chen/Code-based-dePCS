@@ -1,5 +1,19 @@
 # pq_dSNARK Implementation Progress
 
+## Current Entry Point Notice
+
+This file is a chronological engineering log. Older entries mention scripts
+and command shapes that were later removed or replaced. For current usage,
+follow `README.md`, `Doc/reproducibility_runbook.md`, and `results/README.md`.
+The current user-facing script entries are only:
+
+- `scripts/interactive-linux.sh`
+- `scripts/interactive-macos.sh`
+- `scripts/interactive-powershell.cmd`
+
+Automation should use the Rust CLI directly, especially `proof-experiment`,
+`list-proofs`, `verify-proof`, `benchmark`, and `verify-results`.
+
 ## 2026-05-31
 
 - Created the implementation plan from `Doc/pq_dSNARK.pdf`.
@@ -92,7 +106,7 @@
     committed columns and distributed residual PCS;
   - Plonkish negative experiments now tamper proof openings rather than changing
     private witness values inside the local sample instance.
-- Plonkish permutation argument no longer has a zero-valued placeholder:
+- Plonkish permutation argument no longer has a zero-valued shortcut:
   - prover derives Fiat-Shamir `beta/gamma` after oracle commitments, builds
     numerator and denominator running-product traces for
     `value + beta * position + gamma`, and commits both traces with Merkle PCS;
@@ -2848,7 +2862,7 @@
     `run_benchmarks`, and `verify_results` variants) and kept exactly three
     script entrypoints under `scripts/`:
     `interactive-linux.sh`, `interactive-macos.sh`, and
-    `interactive-powershell.ps1`;
+    `interactive-powershell.cmd`;
   - all three entries now open a menu instead of running predetermined
     experiments on launch. The menu covers dependency preflight/installation,
     proof experiment wizard, performance benchmark wizard, and result
@@ -2864,15 +2878,15 @@
     direct `cargo run -p pq-experiments -- ...` commands for non-interactive
     benchmark/verification automation, keeping scripts interactive-only;
   - verification:
-    PowerShell parser check for `scripts/interactive-powershell.ps1` passed;
-    piped PowerShell menu exit and preflight checks passed;
+    PowerShell parser checks and piped `scripts/interactive-powershell.cmd`
+    menu exit and preflight checks passed;
     Git for Windows Bash syntax checks for `scripts/interactive-linux.sh` and
     `scripts/interactive-macos.sh` passed; piped Linux/macOS menu exit checks
     passed.
 
 - Interactive entrypoint revalidation:
   - `scripts/` currently contains only `interactive-linux.sh`,
-    `interactive-macos.sh`, and `interactive-powershell.ps1`;
+    `interactive-macos.sh`, and `interactive-powershell.cmd`;
   - PowerShell double-click behavior was rechecked by running the menu without
     `-NoPause`: selecting exit prints `Press Enter to exit...`, so a normal
     Windows launch does not immediately close on success or error;
@@ -2953,12 +2967,12 @@
   - validation on this Windows PC with Git Bash: `bash -n` passed for
     `interactive-linux.sh` and `interactive-macos.sh`; piped Linux menu exit
     passed; piped macOS preflight displayed `Xcode command line tools missing`
-    as expected in the non-macOS compatibility shell; PowerShell parser check
-    for `interactive-powershell.ps1` passed.
+    as expected in the non-macOS compatibility shell; PowerShell parser checks
+    passed.
 - Interactive script and benchmark progress hardening:
   - kept the root `scripts/` directory limited to exactly
     `interactive-linux.sh`, `interactive-macos.sh`, and
-    `interactive-powershell.ps1`;
+    `interactive-powershell.cmd`;
   - added a `pq-experiments` regression test that fails if any other root
     script entrypoint is added, so legacy predetermined wrapper scripts cannot
     reappear silently;
@@ -2995,6 +3009,27 @@
     protocol boundaries remain documented as research-prototype scope rather
     than production-complete Spartan/Spark, HyperPlonk, or Brakedown/BaseFold
     implementations.
+- Release network benchmark/verifier smoke:
+  - ran
+    `cargo run -p pq-experiments --release -- benchmark --runner network --n-range 2..2 --workers 1,2 --pcs-queries 1 --out results`;
+    an initial run completed all four prove/verify jobs but failed result
+    self-verification because the semantic phase verifier did not accept
+    `network_worker_pool_start` and `network_worker_pool_shutdown` phases;
+  - fixed `verify_phase_timing_csv_semantics` to accept those real network
+    worker-pool phases with positive elapsed time and added
+    `phase_timing_verifier_accepts_network_worker_pool_phases`;
+  - updated CI benchmark-smoke expectations from `phase_rows_checked=8` to
+    `phase_rows_checked=11`, matching setup, two worker-pool startups, four
+    jobs, shutdown, source/chart generation, final artifacts, and total;
+  - re-ran the release network benchmark successfully as
+    `results\bench-1780303043921679000`. `verify-results` returned
+    `ok=true`, `source_rows_checked=4`, `phase_rows_checked=11`, and
+    `summary_rows_checked=4`;
+  - recorded the measured rows in `Doc/reproducibility_runbook.md`: R1CS
+    workers `1 -> 2` prove time was `183.425 ms -> 173.550 ms` (`1.057x`),
+    while Plonkish was `162.965 ms -> 166.584 ms` (`0.978x`). The runbook
+    explicitly treats this as release/TCP/core-affinity sanity evidence, not a
+    paper-quality scaling claim.
 - Results publishing surface cleanup:
   - removed already-tracked local scratch `results/bench-*` directories from
     the Git index with `git rm -r --cached results/bench-*`, leaving the files
@@ -3004,6 +3039,318 @@
   - verified `.gitignore` ignores scratch benchmark outputs via
     `/results/bench-*/`, while `results/release_results/` remains the explicit
     curated publication location.
+- Windows clickable entry hardening:
+  - replaced the user-facing Windows entry under `scripts/` with
+    `interactive-powershell.cmd`;
+  - the `.cmd` launcher invokes PowerShell with `-ExecutionPolicy Bypass`, so a
+    fresh Windows machine with restricted `.ps1` execution policy does not
+    close before the project menu loads;
+  - the embedded PowerShell payload now uses `Read-Host` for menu prompts and
+    keeps the console open by default after completion or errors. Runtime
+    startup failures are logged to
+    `results/logs/interactive-powershell-last.log`;
+  - validation: PowerShell parser checks passed; both
+    `@('0') | .\scripts\interactive-powershell.cmd -NoPause` and
+    `cmd /c "echo 0| scripts\interactive-powershell.cmd -NoPause"` rendered
+    the menu and exited without entering a proof or benchmark wizard; the
+    preflight menu path returned to the main menu successfully.
+- Repository polish for the consolidated entry surface:
+  - added an explicit `.gitattributes` rule for `*.cmd text eol=crlf`, while
+    keeping `*.sh text eol=lf` and `*.ps1 text eol=crlf`, so Linux/macOS shell
+    entries and the Windows launcher check out with the expected line endings
+    on fresh machines;
+  - removed stale README wording that referred to the deleted Windows
+    benchmark wrapper and its old PowerShell-style flags. The README now
+    describes the direct Rust CLI flags for automation and the interactive menu
+    for user-facing runs.
+  - audited the repository text for obvious unfinished-work and synthetic-proof
+    wording under the implementation, docs, results, and script surfaces. The
+    only hit was a negative verifier test fixture string, which was renamed to
+    `invalid semantic fixture` to avoid suggesting any proof or benchmark path
+    uses stand-in data.
+- Verified result publication flow:
+  - added `pq-experiments publish-results`, which verifies a scratch
+    `results/bench-*` directory, copies it into a release-results directory,
+    refuses to overwrite an existing destination, and verifies the copied
+    result before reporting success;
+  - integrated publication into the interactive scripts through a single
+    Results wizard. The top-level menu is now reduced to four actions:
+    environment setup/check, proof experiment, performance benchmark, and
+    verify/publish results;
+  - simplified the environment path similarly: preflight and optional
+    dependency installation now live under one environment setup/check action;
+  - hardened the Bash latest-result lookup to use shell globbing rather than
+    `find | tail`, avoiding accidental resolution to Windows `find` during Git
+    Bash compatibility checks;
+  - validation: `cargo test -p pq-experiments` passed with 20 tests, including
+    publish command parsing and verified-copy coverage. `cargo clippy -p
+    pq-experiments --all-targets -- -D warnings`, PowerShell parser check,
+    Bash syntax checks, direct `publish-results`, and both PowerShell/Bash menu
+    publish smokes against `results\bench-1780303043921679000` passed.
+- CI publish verification:
+  - updated the Windows and Linux benchmark smoke jobs to run
+    `publish-results` after `verify-results`, targeting
+    `results/release_results`;
+  - CI now asserts that the copied release result reports
+    `dest_files_checked=22` and `source_rows_checked=4`, so the automated smoke
+    covers both the scratch benchmark result and the release publication path;
+  - interactive script smoke checks now assert the simplified four-action menu
+    shape (`Environment setup/check`, `Verify/publish results`) and still fail
+    if opening the menu starts a proof, benchmark, results wizard, or cargo
+    build.
+- Action-scoped dependency checks:
+  - narrowed Bash `ensure_toolchain` so proof and results verification/publish
+    require only the base Rust/Git/build prerequisites. Linux `taskset` is now
+    required only when the selected benchmark runner is `network` or `both`;
+  - limited automatic `rustup component add rustfmt clippy` to the environment
+    setup/install path instead of running it before every proof, benchmark, or
+    results action. Ordinary actions still run `rustup show` for toolchain
+    diagnostics, then build the required debug/release target.
+
+- Stored proof bundle and verification workflow:
+  - added serde-backed proof bundle serialization for the R1CS and Plonkish
+    proof structures, including the nested PCS, sumcheck, Spark, and Plonkish
+    accumulator proof objects;
+  - added `pq-experiments proof-experiment`, which creates
+    `bench-YYYYMMDD-HHMMSS-proof` directories and writes real proof bundles
+    under `proofs/*.proof.json` plus `proofs/index.json`;
+  - changed performance benchmark directory names to
+    `bench-YYYYMMDD-HHMMSS-performance` and made every performance row write a
+    stored proof bundle. Benchmark manifests include the proof bundles and
+    proof index;
+  - added `pq-experiments list-proofs`, which scans bench folders and reports
+    which have stored proofs and which do not;
+  - added `pq-experiments verify-proof`, which loads stored proof bundles,
+    regenerates the public sample statement for the recorded protocol/size,
+    verifies the stored proof without reproving, and writes JSON/HTML reports
+    under `verifications/`;
+  - `verify-results` deliberately ignores the `verifications/` subdirectory,
+    so extra proof verification reports do not change benchmark source data,
+    metadata, manifest, overview, or figures.
+- Interactive script workflow update:
+  - Linux, macOS, and PowerShell menus now expose
+    `Environment setup/check`, `Proof experiment`, `Verify experiments`, and
+    `Performance benchmark`, with Performance Benchmark as the final menu
+    action;
+  - Proof Experiment prompts directly for protocol, runner, `n`, workers, PCS
+    queries, and output directory instead of opening the lower-level Rust
+    interactive prompt;
+  - Verify Experiments builds the debug binary, calls `list-proofs`, shows the
+    detected bench/proof inventory, lets the user select a bench and proof/all,
+    then calls `verify-proof`.
+- Result hygiene:
+  - removed historical local scratch directories under `results/bench-*` and
+    `results/logs`;
+  - kept `results/README.md` and `results/release_results/`, and documented
+    that copying into `release_results` is manual.
+- Validation after stored-proof changes:
+  - `cargo test --workspace`: passed;
+  - `cargo test -p pq-experiments`: passed after the final proof-payload
+    boxing/clippy fix;
+  - `cargo clippy --workspace --all-targets -- -D warnings`: passed;
+  - PowerShell parser check, Git Bash syntax checks, PowerShell verify-menu
+    smoke, and Bash verify-menu smoke passed;
+  - `target\proof-smoke\bench-20260601-095926-proof`: `proof-experiment`
+    produced one R1CS proof bundle and `verify-proof --all` verified it;
+  - `target\bench-smoke\bench-20260601-100024-performance`: local benchmark
+    produced two performance proof bundles; `verify-results` returned
+    `files_checked=25`, `source_rows_checked=2`, `phase_rows_checked=6`,
+    `summary_rows_checked=2`; `verify-proof --all` verified both proofs, and a
+    follow-up `verify-results` still passed;
+  - `target\network-smoke\bench-20260601-120350-performance`: release network
+    benchmark produced four performance proof bundles; `verify-results`
+    returned `files_checked=27`, `source_rows_checked=4`,
+    `phase_rows_checked=11`, `summary_rows_checked=4`; `list-proofs` found
+    four proofs, `verify-proof --all` verified all four, and a follow-up
+    `verify-results` still passed.
+  - `target\pollution-smoke\bench-20260601-121400-performance`: local
+    performance smoke rechecked the non-pollution invariant directly. Before
+    extra proof verification, `verify-results` returned `files_checked=25` and
+    `bytes_checked=392207`; `verify-proof --all` wrote JSON/HTML reports under
+    `verifications\` and verified both stored proofs; a second
+    `verify-results` returned the same `files_checked=25` and
+    `bytes_checked=392207`, confirming that ad hoc verify reports do not enter
+    the performance benchmark artifact set.
+  - hardened `verify-proof` failure semantics: it now writes the verification
+    report first, then exits nonzero if any selected stored proof fails.
+    Regression coverage creates a valid stored R1CS proof bundle, verifies it,
+    tampers the proof payload, checks that the stored-proof report records the
+    failed verification, and checks that the CLI returns an error instead of
+    silently succeeding. Validation:
+    `cargo test -p pq-experiments verify_proof_command_fails_when_stored_proof_is_tampered`,
+    `cargo test -p pq-experiments`, and
+    `cargo clippy -p pq-experiments --all-targets -- -D warnings`.
+  - removed the older `pq-experiments publish-results` command and its
+    recursive copy implementation. This keeps release-result handling aligned
+    with the current project rule: generated `results/bench-*` runs remain
+    scratch artifacts, while copying selected runs into `results/release_results`
+    is a manual curator action. The verifier commands remain
+    `verify-results` and `verify-proof`.
+  - hardened fresh-machine interactive behavior. Proof Experiment, Verify
+    Experiments, and Performance Benchmark now call a script-level
+    `ensure_toolchain_for_action` / `Ensure-ToolchainForAction` helper: if Git,
+    Rust, Cargo, MSVC/Xcode tools, or Linux network-affinity tools are missing,
+    the script offers to install missing dependencies immediately instead of
+    only telling the user to return to the setup menu. The Windows message now
+    correctly points to menu option 1 for environment setup/check. Regression
+    coverage checks that both interactive scripts expose this install offer from
+    the action paths and that the stale "menu option 2" text cannot return.
+    Validation: PowerShell parser check, Git Bash syntax checks for the Linux
+    and macOS scripts, PowerShell menu-exit smoke, Git Bash menu-exit smoke,
+    `cargo test -p pq-experiments`, and
+    `cargo clippy -p pq-experiments --all-targets -- -D warnings`.
+  - re-ran full workspace validation after the latest script/CLI hardening:
+    `cargo test --workspace` passed across all crates and doctests, and
+    `cargo clippy --workspace --all-targets -- -D warnings` passed. The
+    completion audit now records the stronger stored-proof tamper evidence and
+    action-scoped dependency-install checks.
+  - added a current-entrypoint notice at the top of this chronological log so
+    older historical entries mentioning removed script wrappers are not mistaken
+    for supported usage. Added a regression test that scans current user docs
+    (`README.md`, `Doc/reproducibility_runbook.md`, `results/README.md`, and
+    `results/release_results/README.md`) and rejects references to removed
+    wrappers such as `run_benchmarks.*`, `run_experiments.*`,
+    `verify_results.*`, `publish-results`, or the old
+    `Verify/publish results` menu label. Validation:
+    `cargo test -p pq-experiments` passed with 24 tests and
+    `cargo clippy -p pq-experiments --all-targets -- -D warnings` passed.
+  - added regression coverage for the result-artifact ignore policy. The test
+    now checks that `.gitignore` keeps `/target/`, scratch `results/bench-*`,
+    and local logs out of version control while preserving
+    `results/release_results/**` as the manual publication area. Direct
+    `git check-ignore` probes confirmed that `results/logs/*.log`,
+    `results/bench-*/...`, and `target/...` are ignored, while
+    `results/release_results/bench-.../...` is not ignored.
+  - strengthened stored proof verification. `verify-proof` now checks not only
+    the proof payload but also bundle metadata, expected proof id shape,
+    recomputed proof/communication byte counts, and the corresponding
+    `proofs/index.json` entry including file size and SHA-256. Metadata or
+    index mismatch is reported as a failed proof outcome, so JSON/HTML reports
+    are still written before the command exits nonzero. Added a regression test
+    that tampers only `proof_bytes` in the stored bundle while leaving the proof
+    payload valid; `verify-proof` now rejects it with metadata and index-hash
+    failure reasons.
+  - made corrupt stored proof JSON reportable as a failed proof outcome. The
+    verifier now records parse/schema failures in the JSON/HTML verification
+    report and then exits nonzero, rather than failing before report generation.
+    Regression coverage overwrites a valid `*.proof.json` file with invalid
+    JSON and checks that both report files are written and the CLI fails.
+    Validation: `cargo test -p pq-experiments` passed with 27 tests and
+    `cargo clippy -p pq-experiments --all-targets -- -D warnings` passed.
+  - made `list-proofs` robust to malformed proof bundles. It now counts proof
+    files even when one cannot be parsed, marks the offending file as
+    `[invalid]`, exposes `invalid_proof_count` in JSON/CSV output, and keeps the
+    bench selectable for later `verify-proof` inspection. Regression coverage
+    creates a bench with a corrupt `*.proof.json` and checks that discovery does
+    not fail. Validation: `cargo test -p pq-experiments` passed with 28 tests
+    and `cargo clippy -p pq-experiments --all-targets -- -D warnings` passed.
+  - re-ran a fresh local smoke after the proof metadata/index hardening:
+    `target\latest-smoke\bench-20260601-125449-performance` completed two
+    positive end-to-end performance rows (`r1cs` and `plonkish`) at `n=2`,
+    `workers=1`, `pcs_queries=1`. `verify-results` returned
+    `files_checked=25`, `bytes_checked=392201`, `source_rows_checked=2`,
+    `phase_rows_checked=6`, and `summary_rows_checked=2`. `list-proofs`
+    reported two proof files and `invalid_proof_count=0`. `verify-proof --all`
+    verified both stored proofs, and a follow-up `verify-results` returned the
+    same `files_checked=25` and `bytes_checked=392201`, confirming that normal
+    proof reverification and report generation remain non-polluting.
+  - closed the remaining proof-manifest regression gaps found during final
+    audit. Added direct tests that prove benchmark manifests include
+    `proofs/index.json` and each stored `*.proof.json` with byte counts and
+    SHA-256 hashes, and that running `verify-proof` later writes only
+    `verifications\` reports while a second `verify-results` observes the same
+    checked file count, byte count, and semantic row counts. Also added
+    `macos-latest` to CI for real macOS format/clippy/test coverage and Bash
+    interactive menu smoke, and documented the macOS interactive entry in
+    `results\release_results\README.md`. Validation:
+    `cargo test -p pq-experiments` passed with 30 tests,
+    `cargo clippy -p pq-experiments --all-targets -- -D warnings` passed,
+    `cargo fmt --check` passed, the PowerShell parser check passed, the
+    PowerShell `.cmd` menu-exit smoke passed, and Git Bash menu-exit smokes for
+    both Linux and macOS entries passed.
+  - strengthened the fresh-clone setup path. The Linux/macOS and PowerShell
+    `Environment setup/check` wizards now detect whether the debug
+    `pq-experiments` target is already built and offer to compile it directly
+    from the setup action, instead of requiring the user to enter a proof,
+    verify, or benchmark wizard first. The action wizards still build the
+    exact debug/release target they need. Regression coverage now asserts that
+    the interactive scripts expose both dependency installation and debug target
+    build capability. Validation: `cargo test -p pq-experiments` passed with
+    30 tests, `cargo clippy -p pq-experiments --all-targets -- -D warnings`
+    passed, `cargo fmt --check` passed, the PowerShell parser check passed, and
+    PowerShell/Linux/macOS menu-exit smokes passed. Full workspace validation
+    also passed after the proof-manifest and macOS CI changes:
+    `cargo test --workspace` and
+    `cargo clippy --workspace --all-targets -- -D warnings`.
+  - added a one-command non-interactive fresh-clone smoke:
+    `cargo run -p pq-experiments -- quick-smoke --out target\quick-smoke`.
+    It runs the smallest local performance benchmark (`n=2`, `workers=1`,
+    `pcs_queries=1`), verifies the benchmark result manifest, reverifies all
+    stored proofs, and confirms that the generated `verifications\` reports do
+    not change benchmark file, byte, or semantic row counts. Validation:
+    `target\quick-smoke\bench-20260601-132153-performance` completed both R1CS
+    and Plonkish rows, reported `files_checked=25`, `bytes_checked=392125`,
+    `source_rows_checked=2`, `phase_rows_checked=6`,
+    `summary_rows_checked=2`, `proofs_checked=2`, and `proofs_verified=2`.
+    `cargo test -p pq-experiments` passed with 31 tests,
+    `cargo clippy -p pq-experiments --all-targets -- -D warnings` passed, and
+    `cargo fmt --check` passed.
+  - wired the new `quick-smoke` path into CI on the real `macos-latest`
+    runner. Windows and Linux CI already run network benchmark smokes; the
+    macOS job now executes the one-command local quick smoke and checks the
+    JSON summary for `ok=true`, `source_rows_checked=2`, `proofs_verified=2`,
+    and an HTML verification report path. Added a regression test that scans
+    the workflow for this command so the fresh-clone smoke stays guarded.
+    Validation: `cargo test -p pq-experiments` passed with 32 tests,
+    `cargo clippy -p pq-experiments --all-targets -- -D warnings` passed,
+    `cargo fmt --check` passed, and `git diff --check` passed.
+  - fixed CLI help semantics for clone-and-run usability. Subcommands such as
+    `quick-smoke --help` now print usage to stdout and exit successfully, while
+    real argument errors still print to stderr and exit nonzero. Validation:
+    the rebuilt `target\debug\pq-experiments.exe quick-smoke --help` returned
+    exit code 0, wrote usage containing `quick-smoke` to stdout, and left
+    stderr empty; `cargo test -p pq-experiments` passed with 33 tests;
+    `cargo clippy -p pq-experiments --all-targets -- -D warnings`,
+    `cargo fmt --check`, and `git diff --check` passed.
+
+## 2026-06-01 Final Readiness Cleanup
+
+- Rechecked the final repository surface for wording that could imply
+  synthetic proof paths or unfinished implementation shortcuts. The remaining
+  hits were test-fixture names and historical progress-log wording, not
+  executable protocol paths. Renamed the proof-manifest fixture to
+  `minimal-indexed.proof.json`, renamed PCS regression transcript domains to
+  `range-length-sampled-*`, and clarified the historical log entry.
+- Validation:
+  - `cargo test -p pq-experiments result_manifest_includes_proof_artifacts_with_hashes`
+  - `cargo test -p pq-pcs distributed_verify_rejects_bad_range_lengths`
+  - `cargo test -p pq-experiments current_user_docs_do_not_reference_removed_script_entries`
+  - `cargo test -p pq-experiments gitignore_preserves_scratch_vs_release_result_split`
+  - `cargo fmt --check`
+  - `git diff --check`
+  - `git diff --cached --check`
+  - `cargo test --workspace`
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - repository text scan for obvious unfinished-work and synthetic-proof
+    wording under `crates`, `Doc`, `README.md`, `scripts`, `tools`, `results`,
+    and `.github`, excluding vendored third-party code, returned no matches.
+- Completion stance: the implementation is ready to be treated as complete for
+  the requested research-grade correctness prototype. It should not be
+  described as a production SNARK or a complete optimized
+  Brakedown/HyperPlonk/Spartan implementation beyond the documented prototype
+  boundaries below.
+- Removed the repository `tools/` directory after Windows direct-use feedback.
+  The only Windows user entry remains `scripts/interactive-powershell.cmd`;
+  it now embeds the PowerShell menu payload in the same file, extracts it at
+  runtime to ignored `target/windows/interactive-powershell.generated.ps1`, and
+  runs it with `-ExecutionPolicy Bypass`. This keeps root script entries at
+  exactly three while avoiding a visible `tools/` entry that can be run
+  directly by mistake.
+- Validation:
+  - `cmd /c "echo 0| scripts\interactive-powershell.cmd -NoPause"`
+  - `cargo test -p pq-experiments scripts_directory_has_only_interactive_entrypoints`
+  - `cargo test -p pq-experiments windows_cmd_embeds_powershell_payload_without_tools_directory`
+  - `cargo test -p pq-experiments interactive_scripts_offer_dependency_install_from_actions`
 
 ## Current Limitations
 

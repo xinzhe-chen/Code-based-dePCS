@@ -2,6 +2,7 @@ use std::thread;
 
 use pq_core::{FieldElement, PartitionPlan, eq_basis, evaluate_mle, log2_power_of_two};
 use pq_transcript::{Transcript, sha256};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PcsError {
@@ -16,7 +17,7 @@ pub enum PcsError {
 
 pub type PcsResult<T> = Result<T, PcsError>;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedPcsParams {
     pub query_count: usize,
 }
@@ -42,13 +43,13 @@ impl Default for DistributedPcsParams {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commitment {
     pub root: [u8; 32],
     pub len: usize,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PcsSetup {
     pub max_len: usize,
 }
@@ -69,14 +70,14 @@ impl PcsSetup {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpeningProof {
     pub index: usize,
     pub value: FieldElement,
     pub path: Vec<([u8; 32], bool)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchOpeningProof {
     pub proofs: Vec<OpeningProof>,
 }
@@ -214,21 +215,21 @@ pub fn verify_systematic_encoding(
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerCommitment {
     pub worker_id: usize,
     pub range: (usize, usize),
     pub encoded_commitment: Commitment,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedCommitment {
     pub workers: Vec<WorkerCommitment>,
     pub original_len: usize,
     pub root: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerOpening {
     pub worker_id: usize,
     pub range: (usize, usize),
@@ -242,7 +243,7 @@ pub struct WorkerOpeningRequest<'a> {
     pub query_indices: &'a [usize],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryOpening {
     pub query_index: usize,
     pub systematic: OpeningProof,
@@ -253,7 +254,7 @@ pub struct QueryOpening {
     pub blend_parity: OpeningProof,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedOpening {
     pub point: Vec<FieldElement>,
     pub claimed_value: FieldElement,
@@ -269,7 +270,7 @@ pub struct DistributedOpening {
     pub transcript_state: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactDistributedOpening {
     pub point: Vec<FieldElement>,
     pub claimed_value: FieldElement,
@@ -286,7 +287,7 @@ pub struct CompactDistributedOpening {
     pub transcript_state: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactQueryOpening {
     pub query_index: usize,
     pub column: OpeningProof,
@@ -300,21 +301,21 @@ pub struct CompactQueryOpening {
     pub blend_parity: OpeningProof,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MleFoldingProof {
     pub input_commitment: Commitment,
     pub layers: Vec<FoldLayerProof>,
     pub final_value: FieldElement,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FoldLayerProof {
     pub challenge: FieldElement,
     pub values: Vec<FieldElement>,
     pub commitment: Commitment,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SampledMleFoldingProof {
     pub input_commitment: Commitment,
     pub input_len: usize,
@@ -325,7 +326,7 @@ pub struct SampledMleFoldingProof {
     pub transcript_state: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SampledFoldRoundProof {
     pub challenge: FieldElement,
     pub input_len: usize,
@@ -333,7 +334,7 @@ pub struct SampledFoldRoundProof {
     pub checks: Vec<SampledFoldCheck>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SampledFoldCheck {
     pub folded_index: usize,
     pub left: OpeningProof,
@@ -341,7 +342,7 @@ pub struct SampledFoldCheck {
     pub folded: OpeningProof,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedIndexOpening {
     pub global_index: usize,
     pub worker_id: usize,
@@ -868,6 +869,19 @@ fn merkle_layers(values: &[FieldElement]) -> PcsResult<Vec<Vec<[u8; 32]>>> {
         layers.push(level.clone());
     }
     Ok(layers)
+}
+
+fn merkle_root_from_layers(layers: &[Vec<[u8; 32]>]) -> PcsResult<[u8; 32]> {
+    layers
+        .last()
+        .and_then(|level| {
+            if level.len() == 1 {
+                Some(level[0])
+            } else {
+                None
+            }
+        })
+        .ok_or(PcsError::InvalidLength)
 }
 
 fn merkle_open_from_layers(
@@ -1941,8 +1955,16 @@ where
         evaluate_mle(evaluations, point).map_err(|_| PcsError::InvalidEvaluation)?;
     let combined_column = build_combined_column(evaluations, commitment, &point[col_vars..])?;
     let combined_codeword = encode_systematic(&combined_column)?;
-    let combined_commitment = MerklePcs::commit(&combined_column)?;
-    let codeword_commitment = MerklePcs::commit(&combined_codeword)?;
+    let combined_layers = merkle_layers(&combined_column)?;
+    let codeword_layers = merkle_layers(&combined_codeword)?;
+    let combined_commitment = Commitment {
+        root: merkle_root_from_layers(&combined_layers)?,
+        len: combined_column.len(),
+    };
+    let codeword_commitment = Commitment {
+        root: merkle_root_from_layers(&codeword_layers)?,
+        len: combined_codeword.len(),
+    };
 
     absorb_compact_opening_header(
         transcript,
@@ -1980,7 +2002,15 @@ where
     let composition_queries = composition_query_indices
         .iter()
         .copied()
-        .map(|query_index| compact_query_opening(&combined_column, &combined_codeword, query_index))
+        .map(|query_index| {
+            compact_query_opening_from_layers(
+                &combined_column,
+                &combined_layers,
+                &combined_codeword,
+                &codeword_layers,
+                query_index,
+            )
+        })
         .collect::<PcsResult<Vec<_>>>()?;
     absorb_compact_composition_query_openings(transcript, &composition_queries);
     let query_indices =
@@ -1988,7 +2018,15 @@ where
     let combined_queries = query_indices
         .iter()
         .copied()
-        .map(|query_index| compact_query_opening(&combined_column, &combined_codeword, query_index))
+        .map(|query_index| {
+            compact_query_opening_from_layers(
+                &combined_column,
+                &combined_layers,
+                &combined_codeword,
+                &codeword_layers,
+                query_index,
+            )
+        })
         .collect::<PcsResult<Vec<_>>>()?;
     let requests = worker_opening_requests(evaluations, commitment, &query_indices);
     let openings = provider(&requests)?;
@@ -2030,13 +2068,19 @@ fn build_combined_column(
     Ok(combined_column)
 }
 
-fn compact_query_opening(
+fn compact_query_opening_from_layers(
     combined_column: &[FieldElement],
+    combined_layers: &[Vec<[u8; 32]>],
     combined_codeword: &[FieldElement],
+    codeword_layers: &[Vec<[u8; 32]>],
     query_index: usize,
 ) -> PcsResult<CompactQueryOpening> {
     let col_len = combined_column.len();
-    if query_index >= col_len || combined_codeword.len() != col_len * 4 {
+    if query_index >= col_len
+        || combined_codeword.len() != col_len * 4
+        || combined_layers.is_empty()
+        || codeword_layers.is_empty()
+    {
         return Err(PcsError::InvalidLength);
     }
     let next = (query_index + 1) % col_len;
@@ -2044,15 +2088,31 @@ fn compact_query_opening(
     let stride = (query_index + stride_offset) % col_len;
     Ok(CompactQueryOpening {
         query_index,
-        column: MerklePcs::open(combined_column, query_index)?,
-        column_next: MerklePcs::open(combined_column, next)?,
-        column_stride: MerklePcs::open(combined_column, stride)?,
-        codeword_systematic: MerklePcs::open(combined_codeword, query_index)?,
-        codeword_next: MerklePcs::open(combined_codeword, next)?,
-        codeword_stride: MerklePcs::open(combined_codeword, stride)?,
-        adjacent_parity: MerklePcs::open(combined_codeword, col_len + query_index)?,
-        stride_parity: MerklePcs::open(combined_codeword, 2 * col_len + query_index)?,
-        blend_parity: MerklePcs::open(combined_codeword, 3 * col_len + query_index)?,
+        column: merkle_open_from_layers(combined_column, combined_layers, query_index)?,
+        column_next: merkle_open_from_layers(combined_column, combined_layers, next)?,
+        column_stride: merkle_open_from_layers(combined_column, combined_layers, stride)?,
+        codeword_systematic: merkle_open_from_layers(
+            combined_codeword,
+            codeword_layers,
+            query_index,
+        )?,
+        codeword_next: merkle_open_from_layers(combined_codeword, codeword_layers, next)?,
+        codeword_stride: merkle_open_from_layers(combined_codeword, codeword_layers, stride)?,
+        adjacent_parity: merkle_open_from_layers(
+            combined_codeword,
+            codeword_layers,
+            col_len + query_index,
+        )?,
+        stride_parity: merkle_open_from_layers(
+            combined_codeword,
+            codeword_layers,
+            2 * col_len + query_index,
+        )?,
+        blend_parity: merkle_open_from_layers(
+            combined_codeword,
+            codeword_layers,
+            3 * col_len + query_index,
+        )?,
     })
 }
 
@@ -3562,14 +3622,14 @@ mod tests {
             &combined_column,
             &col_point,
             1,
-            &mut HashTranscript::new(b"dummy-sampled-column"),
+            &mut HashTranscript::new(b"range-length-sampled-column"),
         )
         .expect("sampled folding");
         let sampled_composition_proof = prove_sampled_mle_folding(
             &combined_codeword,
             &composition_point,
             1,
-            &mut HashTranscript::new(b"dummy-sampled-codeword"),
+            &mut HashTranscript::new(b"range-length-sampled-codeword"),
         )
         .expect("sampled composition");
         let opening = DistributedOpening {

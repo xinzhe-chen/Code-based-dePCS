@@ -1,5 +1,6 @@
 use pq_core::{CoreError, FieldElement, MultilinearPolynomial, eq_eval, eq_evaluations};
 use pq_transcript::{HashTranscript, Transcript};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SumcheckError {
@@ -18,7 +19,7 @@ impl From<CoreError> for SumcheckError {
 
 pub type SumcheckResult<T> = Result<T, SumcheckError>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundPolynomial {
     pub eval_at_0: FieldElement,
     pub eval_at_1: FieldElement,
@@ -30,7 +31,7 @@ impl RoundPolynomial {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SumcheckProof {
     pub claimed_sum: FieldElement,
     pub rounds: Vec<RoundPolynomial>,
@@ -38,7 +39,7 @@ pub struct SumcheckProof {
     pub final_evaluation: FieldElement,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuadraticRoundPolynomial {
     pub eval_at_0: FieldElement,
     pub eval_at_1: FieldElement,
@@ -56,7 +57,7 @@ impl QuadraticRoundPolynomial {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CubicRoundPolynomial {
     pub eval_at_0: FieldElement,
     pub eval_at_1: FieldElement,
@@ -78,7 +79,7 @@ impl CubicRoundPolynomial {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CubicZerocheckProof {
     pub eq_point: Vec<FieldElement>,
     pub claimed_sum: FieldElement,
@@ -167,7 +168,7 @@ pub fn verify_sumcheck<T: Transcript>(
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedSumcheckProof {
     pub workers: usize,
     pub local_sums: Vec<FieldElement>,
@@ -241,7 +242,7 @@ pub fn verify_distributed_sumcheck<T: Transcript>(
     verify_sumcheck(&aggregate_poly, &proof.aggregate, transcript)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZerocheckProof {
     pub eq_point: Vec<FieldElement>,
     pub claimed_sum: FieldElement,
@@ -250,7 +251,7 @@ pub struct ZerocheckProof {
     pub final_evaluation: FieldElement,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductSumcheckProof {
     pub claimed_sum: FieldElement,
     pub rounds: Vec<QuadraticRoundPolynomial>,
@@ -604,15 +605,16 @@ pub fn rational_sum(
     if numerator.len() != denominator.len() {
         return Err(SumcheckError::LengthMismatch);
     }
-    let mut sum = FieldElement::ZERO;
-    for (p, q) in numerator.iter().zip(denominator) {
-        let inv = q.inverse().ok_or(SumcheckError::ZeroDenominator)?;
-        sum += *p * inv;
-    }
-    Ok(sum)
+    let inverses =
+        FieldElement::batch_inverse(denominator).ok_or(SumcheckError::ZeroDenominator)?;
+    Ok(numerator
+        .iter()
+        .zip(inverses)
+        .map(|(p, inv)| *p * inv)
+        .sum())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RationalSumcheckProof {
     pub claimed_sum: FieldElement,
     pub len: usize,
@@ -697,11 +699,13 @@ fn rational_evaluations(
     if numerator.len() != denominator.len() {
         return Err(SumcheckError::LengthMismatch);
     }
-    let mut evaluations = Vec::with_capacity(numerator.len().max(1).next_power_of_two());
-    for (p, q) in numerator.iter().zip(denominator) {
-        let inv = q.inverse().ok_or(SumcheckError::ZeroDenominator)?;
-        evaluations.push(*p * inv);
-    }
+    let inverses =
+        FieldElement::batch_inverse(denominator).ok_or(SumcheckError::ZeroDenominator)?;
+    let mut evaluations = numerator
+        .iter()
+        .zip(inverses)
+        .map(|(p, inv)| *p * inv)
+        .collect::<Vec<_>>();
     evaluations.resize(
         evaluations.len().max(1).next_power_of_two(),
         FieldElement::ZERO,
@@ -709,7 +713,7 @@ fn rational_evaluations(
     Ok(evaluations)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultisetEqualityProof {
     pub gamma: FieldElement,
     pub f1_len: usize,
@@ -777,7 +781,7 @@ pub fn verify_multiset_equality<T: Transcript>(
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductMultisetEqualityProof {
     pub gamma: FieldElement,
     pub f1_len: usize,
@@ -898,13 +902,10 @@ fn log_derivative_sum(
     values: &[FieldElement],
     gamma: FieldElement,
 ) -> SumcheckResult<FieldElement> {
-    let mut sum = FieldElement::ZERO;
-    for value in values {
-        let denom = gamma + *value;
-        let inv = denom.inverse().ok_or(SumcheckError::ZeroDenominator)?;
-        sum += inv;
-    }
-    Ok(sum)
+    let denominators = log_derivative_denominators(values, gamma);
+    let inverses =
+        FieldElement::batch_inverse(&denominators).ok_or(SumcheckError::ZeroDenominator)?;
+    Ok(inverses.into_iter().sum())
 }
 
 fn log_derivative_denominators(values: &[FieldElement], gamma: FieldElement) -> Vec<FieldElement> {

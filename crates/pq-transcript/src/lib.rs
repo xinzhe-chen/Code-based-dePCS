@@ -1,8 +1,9 @@
 //! Fiat-Shamir transcript utilities for the pq_dSNARK prototype.
 //!
 //! The transcript is intentionally dependency-free for the correctness
-//! prototype. Inputs are recorded with explicit type and length prefixes, then
-//! challenges are derived by hashing the accumulated state with SHA-256.
+//! prototype. Inputs are recorded with explicit type and length prefixes into a
+//! rolling digest, then challenges are derived by hashing that digest with
+//! SHA-256.
 
 use core::fmt;
 use pq_core::{FieldElement, GOLDILOCKS_MODULUS};
@@ -47,7 +48,8 @@ pub trait Transcript {
 /// Deterministic SHA-256 based transcript.
 #[derive(Clone, Eq, PartialEq)]
 pub struct HashTranscript {
-    state: Vec<u8>,
+    state_digest: [u8; 32],
+    state_len: usize,
     challenge_counter: u64,
 }
 
@@ -55,7 +57,8 @@ impl HashTranscript {
     /// Creates a transcript and immediately absorbs a top-level protocol label.
     pub fn new(protocol_label: &[u8]) -> Self {
         let mut transcript = Self {
-            state: Vec::new(),
+            state_digest: initial_transcript_digest(),
+            state_len: 0,
             challenge_counter: 0,
         };
         transcript.record(b"init", b"protocol", protocol_label);
@@ -85,15 +88,27 @@ impl HashTranscript {
         append_len_prefixed(&mut input, TRANSCRIPT_VERSION);
         append_len_prefixed(&mut input, b"state");
         input.extend_from_slice(&self.challenge_counter.to_le_bytes());
-        append_len_prefixed(&mut input, &self.state);
+        input.extend_from_slice(&usize_to_u64(self.state_len).to_le_bytes());
+        input.extend_from_slice(&self.state_digest);
         sha256(&input)
     }
 
     fn record(&mut self, tag: &[u8], label: &[u8], value: &[u8]) {
-        append_len_prefixed(&mut self.state, TRANSCRIPT_VERSION);
-        append_len_prefixed(&mut self.state, tag);
-        append_len_prefixed(&mut self.state, label);
-        append_len_prefixed(&mut self.state, value);
+        let mut input = Vec::new();
+        append_len_prefixed(&mut input, TRANSCRIPT_VERSION);
+        append_len_prefixed(&mut input, b"record");
+        input.extend_from_slice(&self.state_digest);
+        append_len_prefixed(&mut input, tag);
+        append_len_prefixed(&mut input, label);
+        append_len_prefixed(&mut input, value);
+        self.state_digest = sha256(&input);
+        self.state_len = self
+            .state_len
+            .wrapping_add(TRANSCRIPT_VERSION.len())
+            .wrapping_add(tag.len())
+            .wrapping_add(label.len())
+            .wrapping_add(value.len())
+            .wrapping_add(24);
     }
 
     fn record_usizes(&mut self, tag: &[u8], label: &[u8], values: &[usize]) {
@@ -119,7 +134,8 @@ impl HashTranscript {
             append_len_prefixed(&mut input, extra);
             input.extend_from_slice(&challenge_id.to_le_bytes());
             input.extend_from_slice(&block_counter.to_le_bytes());
-            append_len_prefixed(&mut input, &self.state);
+            input.extend_from_slice(&usize_to_u64(self.state_len).to_le_bytes());
+            input.extend_from_slice(&self.state_digest);
 
             let digest = sha256(&input);
             let remaining = len - out.len();
@@ -140,7 +156,7 @@ impl Default for HashTranscript {
 impl fmt::Debug for HashTranscript {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HashTranscript")
-            .field("state_len", &self.state.len())
+            .field("state_len", &self.state_len)
             .field("challenge_counter", &self.challenge_counter)
             .finish()
     }
@@ -225,6 +241,13 @@ impl TranscriptField for FieldElement {
 fn append_len_prefixed(dst: &mut Vec<u8>, value: &[u8]) {
     dst.extend_from_slice(&usize_to_u64(value.len()).to_le_bytes());
     dst.extend_from_slice(value);
+}
+
+fn initial_transcript_digest() -> [u8; 32] {
+    let mut input = Vec::new();
+    append_len_prefixed(&mut input, TRANSCRIPT_VERSION);
+    append_len_prefixed(&mut input, b"empty-state");
+    sha256(&input)
 }
 
 fn usize_to_u64(value: usize) -> u64 {

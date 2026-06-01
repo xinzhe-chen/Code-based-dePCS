@@ -1,6 +1,7 @@
 use crate::{CoreError, FieldElement, Result};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Gate {
     Add {
         left: usize,
@@ -18,7 +19,7 @@ pub enum Gate {
     },
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishRow {
     pub a: FieldElement,
     pub b: FieldElement,
@@ -30,12 +31,12 @@ pub struct PlonkishRow {
     pub q_c: FieldElement,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomizedGate {
     monomials: Vec<GateMonomial>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateMonomial {
     pub coeff: i64,
     pub selector: Option<usize>,
@@ -208,7 +209,7 @@ fn signed_coeff(coeff: i64) -> FieldElement {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishCircuit {
     rows: Vec<PlonkishRow>,
     num_wires: usize,

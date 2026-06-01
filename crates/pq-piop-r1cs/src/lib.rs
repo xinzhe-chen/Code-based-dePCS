@@ -19,6 +19,8 @@ use pq_sumcheck::{
     verify_product_sumcheck_rounds, verify_zerocheck_rounds, zerocheck_final_evaluation,
 };
 use pq_transcript::{HashTranscript, Transcript};
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum R1csPiopError {
@@ -60,7 +62,7 @@ impl Piop for R1csPiop {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributedSparkProof {
     pub tuple_challenge: FieldElement,
     pub matrix_challenge: FieldElement,
@@ -75,7 +77,7 @@ pub struct DistributedSparkProof {
     pub matrix_evaluations: Vec<SparkMatrixEvaluationProof>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkWorkerFingerprint {
     pub worker_id: usize,
     pub range: (usize, usize),
@@ -84,7 +86,7 @@ pub struct SparkWorkerFingerprint {
     pub product_fingerprint: FieldElement,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkWorkerEvaluation {
     pub matrix_id: usize,
     pub worker_id: usize,
@@ -93,7 +95,7 @@ pub struct SparkWorkerEvaluation {
     pub evaluation: FieldElement,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkMatrixEvaluationProof {
     pub matrix_id: usize,
     pub evaluation: FieldElement,
@@ -103,7 +105,7 @@ pub struct SparkMatrixEvaluationProof {
     pub value_memory: SparkMemoryCheckProof,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkMemoryCheckProof {
     pub hash_challenge: FieldElement,
     pub domain_len: usize,
@@ -115,7 +117,7 @@ pub struct SparkMemoryCheckProof {
     pub multiset: ProductMultisetEqualityProof,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkMemoryTraceCommitments {
     pub init: Commitment,
     pub writes: Commitment,
@@ -123,14 +125,14 @@ pub struct SparkMemoryTraceCommitments {
     pub reads: Commitment,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkMemoryDomainQuery {
     pub index: usize,
     pub init: OpeningProof,
     pub audit: OpeningProof,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkMemoryAccessQuery {
     pub index: usize,
     pub address: usize,
@@ -141,7 +143,7 @@ pub struct SparkMemoryAccessQuery {
     pub write: OpeningProof,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkMemoryWorkerDigest {
     pub worker_id: usize,
     pub entry_range: (usize, usize),
@@ -153,7 +155,7 @@ pub struct SparkMemoryWorkerDigest {
     pub audit_product: FieldElement,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkChallenges {
     pub tuple: FieldElement,
     pub matrix: FieldElement,
@@ -162,7 +164,7 @@ pub struct SparkChallenges {
     pub value: FieldElement,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkWorkerShardClaim {
     pub fingerprint: SparkWorkerFingerprint,
     pub matrix_evaluations: Vec<SparkWorkerEvaluation>,
@@ -176,7 +178,7 @@ pub struct SparkWorkerClaimRequest<'a> {
     pub col_point: &'a [FieldElement],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csPiopProof {
     pub oracle_commitments: R1csOracleCommitments,
     pub outer_commitments: R1csOuterCommitments,
@@ -192,7 +194,7 @@ pub struct R1csPiopProof {
     pub workers: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csOracleCommitments {
     pub witness: Commitment,
     pub az: Commitment,
@@ -200,21 +202,21 @@ pub struct R1csOracleCommitments {
     pub cz: Commitment,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csOuterCommitments {
     pub az: DistributedCommitment,
     pub bz: DistributedCommitment,
     pub cz: DistributedCommitment,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csOuterOpenings {
     pub az: R1csPcsOpening,
     pub bz: R1csPcsOpening,
     pub cz: R1csPcsOpening,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csInnerProof {
     pub matrix_challenges: [FieldElement; 3],
     pub witness_commitment: DistributedCommitment,
@@ -222,7 +224,7 @@ pub struct R1csInnerProof {
     pub witness_opening: R1csPcsOpening,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum R1csPcsOpening {
     Full(DistributedOpening),
     Compact(CompactDistributedOpening),
@@ -293,7 +295,7 @@ impl R1csPcsOpening {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csRowConsistencyQuery {
     pub row: usize,
     pub witness_openings: Vec<OpeningProof>,
@@ -303,14 +305,14 @@ pub struct R1csRowConsistencyQuery {
     pub residual_opening: DistributedIndexOpening,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csWitnessConsistencyQuery {
     pub index: usize,
     pub oracle_opening: OpeningProof,
     pub distributed_opening: DistributedIndexOpening,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csMetrics {
     pub proof_bytes: usize,
     pub communication_bytes: usize,
@@ -615,20 +617,30 @@ where
     ) -> R1csPiopResult<R1csPcsOpening>,
     S: FnMut(&[SparkWorkerClaimRequest<'_>]) -> R1csPiopResult<Vec<SparkWorkerShardClaim>>,
 {
+    let trace = trace_r1cs_enabled();
+    let phase = Instant::now();
     if !instance
         .is_satisfied(witness)
         .map_err(|_| R1csPiopError::Unsatisfied)?
     {
         return Err(R1csPiopError::Unsatisfied);
     }
+    trace_r1cs_phase(trace, "prove/is_satisfied", phase.elapsed());
+    let phase = Instant::now();
     let vectors = constraint_vectors(instance, witness)?;
+    trace_r1cs_phase(trace, "prove/constraint_vectors", phase.elapsed());
+    let phase = Instant::now();
     transcript.absorb_domain(b"r1cs-piop-v1");
     absorb_instance_shape(instance, workers, transcript);
     let oracle_commitments = commit_oracles(&vectors)?;
     absorb_oracle_commitments(&oracle_commitments, transcript);
+    trace_r1cs_phase(trace, "prove/oracle_commitments", phase.elapsed());
+    let phase = Instant::now();
     let outer_commitments =
         commit_outer_linearizations(&vectors, workers, &mut hooks.commit_distributed)?;
     absorb_outer_commitments(&outer_commitments, transcript);
+    trace_r1cs_phase(trace, "prove/outer_commitments", phase.elapsed());
+    let phase = Instant::now();
     let az_poly =
         MultilinearPolynomial::new(vectors.az.clone()).map_err(|_| R1csPiopError::InvalidShape)?;
     let bz_poly =
@@ -637,6 +649,8 @@ where
         MultilinearPolynomial::new(vectors.cz.clone()).map_err(|_| R1csPiopError::InvalidShape)?;
     let outer_sumcheck = prove_cubic_zerocheck(&az_poly, &bz_poly, &cz_poly, transcript)
         .map_err(|_| R1csPiopError::Sumcheck)?;
+    trace_r1cs_phase(trace, "prove/outer_sumcheck", phase.elapsed());
+    let phase = Instant::now();
     let outer_openings = open_outer_linearizations(
         &vectors,
         &outer_commitments,
@@ -645,6 +659,8 @@ where
         transcript,
         &mut hooks.open_distributed,
     )?;
+    trace_r1cs_phase(trace, "prove/outer_openings", phase.elapsed());
+    let phase = Instant::now();
     let inner = prove_inner_linearization(
         instance,
         &vectors,
@@ -657,6 +673,8 @@ where
         &mut hooks.commit_distributed,
         &mut hooks.open_distributed,
     )?;
+    trace_r1cs_phase(trace, "prove/inner_linearization", phase.elapsed());
+    let phase = Instant::now();
     let witness_consistency_indices = challenge_witness_consistency_indices(
         &oracle_commitments.witness,
         &inner.witness_commitment,
@@ -670,8 +688,12 @@ where
         &witness_consistency_indices,
     )?;
     absorb_witness_consistency_queries(transcript, &witness_consistency_queries);
+    trace_r1cs_phase(trace, "prove/witness_consistency", phase.elapsed());
+    let phase = Instant::now();
     let residual_commitment = (hooks.commit_distributed)(&vectors.residual, workers)?;
     DistributedBrakedown::absorb_distributed_commitment(&residual_commitment, transcript);
+    trace_r1cs_phase(trace, "prove/residual_commitment", phase.elapsed());
+    let phase = Instant::now();
     let residual_poly = MultilinearPolynomial::new(vectors.residual.clone())
         .map_err(|_| R1csPiopError::InvalidShape)?;
     let sumcheck =
@@ -684,6 +706,8 @@ where
         pcs_params,
         transcript,
     )?;
+    trace_r1cs_phase(trace, "prove/residual_sumcheck_open", phase.elapsed());
+    let phase = Instant::now();
     let row_indices = challenge_row_indices(instance, pcs_params, transcript)?;
     let row_queries = row_indices
         .iter()
@@ -699,6 +723,8 @@ where
         })
         .collect::<R1csPiopResult<Vec<_>>>()?;
     absorb_row_consistency_queries(transcript, &row_queries);
+    trace_r1cs_phase(trace, "prove/row_queries", phase.elapsed());
+    let phase = Instant::now();
     let spark = prove_distributed_spark_with_batch_worker_provider(
         instance,
         workers,
@@ -709,7 +735,10 @@ where
         transcript,
         &mut hooks.spark_worker_provider,
     )?;
+    trace_r1cs_phase(trace, "prove/spark", phase.elapsed());
+    let phase = Instant::now();
     verify_inner_spark_link(&inner, &spark)?;
+    trace_r1cs_phase(trace, "prove/inner_spark_link", phase.elapsed());
     Ok(R1csPiopProof {
         oracle_commitments,
         outer_commitments,
@@ -891,6 +920,19 @@ fn constraint_vectors(
         cz,
         residual,
     })
+}
+
+fn trace_r1cs_enabled() -> bool {
+    std::env::var_os("PQ_DSNARK_TRACE_R1CS").is_some()
+}
+
+fn trace_r1cs_phase(enabled: bool, label: &str, elapsed: Duration) {
+    if enabled {
+        eprintln!(
+            "[r1cs trace] {label}: {:.3} ms",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
 }
 
 fn commit_oracles(vectors: &ConstraintVectors) -> R1csPiopResult<R1csOracleCommitments> {
@@ -2133,6 +2175,8 @@ fn prove_spark_matrix_evaluation_with_worker_evaluations<T: Transcript>(
     transcript: &mut T,
     worker_evaluations: Vec<SparkWorkerEvaluation>,
 ) -> R1csPiopResult<SparkMatrixEvaluationProof> {
+    let trace = trace_r1cs_enabled();
+    let phase = Instant::now();
     absorb_spark_matrix_evaluation_statement(transcript, matrix_id, matrix, row_point, col_point);
     validate_spark_worker_evaluations(matrix_id, plan, &worker_evaluations)?;
     absorb_spark_worker_evaluations(transcript, &worker_evaluations);
@@ -2140,6 +2184,12 @@ fn prove_spark_matrix_evaluation_with_worker_evaluations<T: Transcript>(
         .iter()
         .map(|worker| worker.evaluation)
         .sum();
+    trace_r1cs_phase(
+        trace,
+        &format!("spark/matrix_{matrix_id}/statement"),
+        phase.elapsed(),
+    );
+    let phase = Instant::now();
     let row_memory = prove_spark_memory_check(
         b"row",
         matrix_id,
@@ -2151,6 +2201,12 @@ fn prove_spark_matrix_evaluation_with_worker_evaluations<T: Transcript>(
         pcs_params,
         transcript,
     )?;
+    trace_r1cs_phase(
+        trace,
+        &format!("spark/matrix_{matrix_id}/row_memory"),
+        phase.elapsed(),
+    );
+    let phase = Instant::now();
     let col_memory = prove_spark_memory_check(
         b"col",
         matrix_id,
@@ -2162,8 +2218,19 @@ fn prove_spark_matrix_evaluation_with_worker_evaluations<T: Transcript>(
         pcs_params,
         transcript,
     )?;
+    trace_r1cs_phase(
+        trace,
+        &format!("spark/matrix_{matrix_id}/col_memory"),
+        phase.elapsed(),
+    );
+    let phase = Instant::now();
     let value_memory =
         prove_spark_value_memory_check(matrix_id, matrix.entries(), plan, pcs_params, transcript)?;
+    trace_r1cs_phase(
+        trace,
+        &format!("spark/matrix_{matrix_id}/value_memory"),
+        phase.elapsed(),
+    );
     Ok(SparkMatrixEvaluationProof {
         matrix_id,
         evaluation,
@@ -2346,6 +2413,8 @@ where
     T: Transcript,
     F: Fn(&SparseEntry) -> usize + Copy,
 {
+    let trace_enabled = trace_r1cs_enabled();
+    let phase = Instant::now();
     absorb_spark_memory_header(
         transcript,
         label,
@@ -2356,9 +2425,15 @@ where
     );
     let hash_challenge = transcript.challenge_field::<FieldElement>(b"spark-memory-hash");
     let memory_values = spark_eq_memory_values(domain_len, point)?;
+    trace_r1cs_phase(trace_enabled, "spark/memory/eq_values", phase.elapsed());
+    let phase = Instant::now();
     let access_indices = entries.iter().map(access_index).collect::<Vec<_>>();
     let trace = spark_memory_trace(domain_len, &memory_values, &access_indices, hash_challenge)?;
+    trace_r1cs_phase(trace_enabled, "spark/memory/trace", phase.elapsed());
+    let phase = Instant::now();
     let trace_commitments = commit_spark_memory_trace(&trace)?;
+    trace_r1cs_phase(trace_enabled, "spark/memory/commitments", phase.elapsed());
+    let phase = Instant::now();
     let (domain_indices, access_sample_indices) = challenge_spark_memory_trace_queries(
         transcript,
         label,
@@ -2371,8 +2446,16 @@ where
     let (domain_queries, access_queries) =
         open_spark_memory_trace_queries(&trace, &domain_indices, &access_sample_indices)?;
     absorb_spark_memory_trace_queries(transcript, &domain_queries, &access_queries);
+    trace_r1cs_phase(trace_enabled, "spark/memory/queries", phase.elapsed());
+    let phase = Instant::now();
     let worker_digests = compute_spark_memory_worker_digests(plan, entries, &trace)?;
     absorb_spark_memory_worker_digests(transcript, &worker_digests);
+    trace_r1cs_phase(
+        trace_enabled,
+        "spark/memory/worker_digests",
+        phase.elapsed(),
+    );
+    let phase = Instant::now();
     let multiset = prove_product_multiset_equality(
         &trace.init,
         &trace.writes,
@@ -2381,6 +2464,7 @@ where
         transcript,
     )
     .map_err(|_| R1csPiopError::Sumcheck)?;
+    trace_r1cs_phase(trace_enabled, "spark/memory/multiset", phase.elapsed());
     Ok(SparkMemoryCheckProof {
         hash_challenge,
         domain_len,

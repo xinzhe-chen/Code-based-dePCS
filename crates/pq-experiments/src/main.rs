@@ -33,6 +33,7 @@ use pq_piop_r1cs::{
     prove_r1cs_with_pcs_params, verify_r1cs_with_pcs_params,
 };
 use pq_transcript::{HashTranscript, Transcript, sha256};
+use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Protocol {
@@ -124,6 +125,160 @@ struct BenchmarkCommand {
 }
 
 #[derive(Clone, Debug)]
+struct ProofExperimentCommand {
+    protocol: ProofProtocolSelection,
+    runner: BenchmarkRunner,
+    size: usize,
+    workers: usize,
+    pcs_queries: usize,
+    out_dir: PathBuf,
+    format: OutputFormat,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ProofProtocolSelection {
+    R1cs,
+    Plonkish,
+    Both,
+}
+
+impl ProofProtocolSelection {
+    fn variants(self) -> Vec<Protocol> {
+        match self {
+            Self::R1cs => vec![Protocol::R1cs],
+            Self::Plonkish => vec![Protocol::Plonkish],
+            Self::Both => vec![Protocol::R1cs, Protocol::Plonkish],
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::R1cs => "r1cs",
+            Self::Plonkish => "plonkish",
+            Self::Both => "both",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ListProofsCommand {
+    results_dir: PathBuf,
+    format: ProofListFormat,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ProofListFormat {
+    Text,
+    Json,
+    Csv,
+}
+
+#[derive(Clone, Debug)]
+struct VerifyProofCommand {
+    dir: PathBuf,
+    proof: ProofSelection,
+    format: OutputFormat,
+}
+
+#[derive(Clone, Debug)]
+enum ProofSelection {
+    All,
+    One(String),
+}
+
+#[derive(Clone, Debug)]
+struct ProofListEntry {
+    dir: PathBuf,
+    bench_name: String,
+    proof_count: usize,
+    invalid_proof_count: usize,
+    proof_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ProofIndexEntry {
+    proof_id: String,
+    path: String,
+    protocol: String,
+    runner: String,
+    case_name: String,
+    trial: usize,
+    nv_power: usize,
+    size: usize,
+    workers: usize,
+    pcs_queries: usize,
+    proof_bytes: usize,
+    communication_bytes: usize,
+    network_bytes: usize,
+    file_bytes: usize,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ProofIndexFile {
+    schema_version: usize,
+    generated_by: String,
+    proof_count: usize,
+    proofs: Vec<ProofIndexEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ProofBundle {
+    schema_version: usize,
+    proof_id: String,
+    run_kind: String,
+    generated_utc: String,
+    protocol: String,
+    runner: String,
+    case_name: String,
+    trial: usize,
+    nv_power: usize,
+    size: usize,
+    workers: usize,
+    pcs_queries: usize,
+    proof_bytes: usize,
+    communication_bytes: usize,
+    network_bytes: usize,
+    host_logical_cores: Option<usize>,
+    cores_per_worker: Option<usize>,
+    core_affinity: Option<String>,
+    proof: StoredProof,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "protocol", content = "proof")]
+enum StoredProof {
+    #[serde(rename = "r1cs")]
+    R1cs(Box<R1csPiopProof>),
+    #[serde(rename = "plonkish")]
+    Plonkish(Box<PlonkishPiopProof>),
+}
+
+#[derive(Clone, Debug)]
+struct ProofVerificationOutcome {
+    proof_id: String,
+    path: PathBuf,
+    protocol: String,
+    runner: String,
+    size: usize,
+    workers: usize,
+    pcs_queries: usize,
+    verified: bool,
+    verify_ms: f64,
+    proof_bytes: usize,
+    communication_bytes: usize,
+    failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ProofVerifyReport {
+    bench_dir: PathBuf,
+    report_json: PathBuf,
+    report_html: PathBuf,
+    outcomes: Vec<ProofVerificationOutcome>,
+}
+
+#[derive(Clone, Debug)]
 struct WorkerCorePlan {
     host_logical_cores: usize,
     max_workers: usize,
@@ -152,6 +307,11 @@ struct VerifyResultsCommand {
     dir: PathBuf,
     format: OutputFormat,
     paper_quality: bool,
+}
+
+#[derive(Clone, Debug)]
+struct QuickSmokeCommand {
+    out_dir: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -353,9 +513,21 @@ impl Display for CliError {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("{error}");
-        process::exit(2);
+        if is_usage_help(&error) {
+            println!("{error}");
+        } else {
+            eprintln!("{error}");
+        }
+        process::exit(cli_exit_code(&error));
     }
+}
+
+fn cli_exit_code(error: &CliError) -> i32 {
+    if is_usage_help(error) { 0 } else { 2 }
+}
+
+fn is_usage_help(error: &CliError) -> bool {
+    error.0.starts_with("usage:\n")
 }
 
 fn run() -> Result<(), CliError> {
@@ -374,6 +546,18 @@ fn run() -> Result<(), CliError> {
     }
     if args.first().map(String::as_str) == Some("benchmark") {
         return run_benchmark_command(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("quick-smoke") {
+        return run_quick_smoke_command(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("proof-experiment") {
+        return run_proof_experiment_command(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("list-proofs") {
+        return run_list_proofs_command(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("verify-proof") {
+        return run_verify_proof_command(&args[1..]);
     }
     if args.first().map(String::as_str) == Some("verify-results") {
         return run_verify_results_command(&args[1..]);
@@ -619,9 +803,20 @@ fn parse_benchmark_command(args: &[String]) -> Result<BenchmarkCommand, CliError
             flag @ ("--nv-range" | "--n-range") => {
                 command.sizes = parse_nv_range_to_sizes(next_value(args, &mut index, flag)?, flag)?;
             }
+            "--size-range" => {
+                command.sizes =
+                    parse_size_range_to_sizes(next_value(args, &mut index, "--size-range")?)?;
+            }
             "--workers" => {
                 command.workers =
                     parse_csv_usizes(next_value(args, &mut index, "--workers")?, "--workers")?;
+            }
+            "--worker-power-range" => {
+                command.workers = parse_worker_power_range_to_workers(next_value(
+                    args,
+                    &mut index,
+                    "--worker-power-range",
+                )?)?;
             }
             "--pcs-queries" => {
                 command.pcs_queries = parse_positive_usize(
@@ -731,6 +926,162 @@ fn parse_benchmark_runner(value: &str) -> Result<BenchmarkRunner, CliError> {
     }
 }
 
+fn parse_proof_protocol_selection(value: &str) -> Result<ProofProtocolSelection, CliError> {
+    match value {
+        "r1cs" => Ok(ProofProtocolSelection::R1cs),
+        "plonkish" => Ok(ProofProtocolSelection::Plonkish),
+        "both" => Ok(ProofProtocolSelection::Both),
+        other => Err(CliError(format!(
+            "unsupported proof protocol '{other}', expected r1cs, plonkish, or both"
+        ))),
+    }
+}
+
+fn parse_proof_experiment_command(args: &[String]) -> Result<ProofExperimentCommand, CliError> {
+    let mut command = ProofExperimentCommand {
+        protocol: ProofProtocolSelection::Both,
+        runner: BenchmarkRunner::Local,
+        size: 4,
+        workers: 1,
+        pcs_queries: 1,
+        out_dir: PathBuf::from("results"),
+        format: OutputFormat::Json,
+    };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--protocol" => {
+                command.protocol =
+                    parse_proof_protocol_selection(next_value(args, &mut index, "--protocol")?)?;
+            }
+            "--runner" => {
+                command.runner = parse_benchmark_runner(next_value(args, &mut index, "--runner")?)?;
+                if command.runner == BenchmarkRunner::Both {
+                    return Err(CliError(
+                        "proof-experiment --runner must be local or network".to_owned(),
+                    ));
+                }
+            }
+            "--size" => {
+                command.size =
+                    parse_positive_usize(next_value(args, &mut index, "--size")?, "--size")?;
+            }
+            flag @ ("--nv-power" | "--n") => {
+                let power = parse_positive_usize(next_value(args, &mut index, flag)?, flag)?;
+                command.size = 1_usize
+                    .checked_shl(power as u32)
+                    .ok_or_else(|| CliError(format!("{flag} is too large: {power}")))?;
+            }
+            "--workers" => {
+                command.workers =
+                    parse_positive_usize(next_value(args, &mut index, "--workers")?, "--workers")?;
+            }
+            "--pcs-queries" => {
+                command.pcs_queries = parse_positive_usize(
+                    next_value(args, &mut index, "--pcs-queries")?,
+                    "--pcs-queries",
+                )?;
+            }
+            "--out" => {
+                command.out_dir = PathBuf::from(next_value(args, &mut index, "--out")?);
+            }
+            "--format" => {
+                command.format = parse_format(next_value(args, &mut index, "--format")?)?;
+            }
+            "--help" | "-h" => return Err(CliError(usage())),
+            other => {
+                return Err(CliError(format!(
+                    "unknown proof-experiment argument '{other}'"
+                )));
+            }
+        }
+        index += 1;
+    }
+    if command.size == 0 || !command.size.is_power_of_two() {
+        return Err(CliError(
+            "proof-experiment size must be a positive power of two".to_owned(),
+        ));
+    }
+    if command.workers == 0 || !command.workers.is_power_of_two() || command.workers > command.size
+    {
+        return Err(CliError(
+            "proof-experiment workers must be a positive power of two not exceeding size"
+                .to_owned(),
+        ));
+    }
+    Ok(command)
+}
+
+fn parse_proof_list_format(value: &str) -> Result<ProofListFormat, CliError> {
+    match value {
+        "text" => Ok(ProofListFormat::Text),
+        "json" => Ok(ProofListFormat::Json),
+        "csv" => Ok(ProofListFormat::Csv),
+        other => Err(CliError(format!(
+            "unsupported list-proofs --format '{other}', expected text, json, or csv"
+        ))),
+    }
+}
+
+fn parse_list_proofs_command(args: &[String]) -> Result<ListProofsCommand, CliError> {
+    let mut command = ListProofsCommand {
+        results_dir: PathBuf::from("results"),
+        format: ProofListFormat::Text,
+    };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--results" | "--dir" => {
+                command.results_dir = PathBuf::from(next_value(args, &mut index, "--results")?);
+            }
+            "--format" => {
+                command.format =
+                    parse_proof_list_format(next_value(args, &mut index, "--format")?)?;
+            }
+            "--help" | "-h" => return Err(CliError(usage())),
+            other => return Err(CliError(format!("unknown list-proofs argument '{other}'"))),
+        }
+        index += 1;
+    }
+    Ok(command)
+}
+
+fn parse_verify_proof_command(args: &[String]) -> Result<VerifyProofCommand, CliError> {
+    let mut dir = None;
+    let mut proof = None;
+    let mut format = OutputFormat::Json;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dir" => {
+                dir = Some(PathBuf::from(next_value(args, &mut index, "--dir")?));
+            }
+            "--proof" => {
+                proof = Some(ProofSelection::One(
+                    next_value(args, &mut index, "--proof")?.to_owned(),
+                ));
+            }
+            "--all" => {
+                proof = Some(ProofSelection::All);
+            }
+            "--format" => {
+                format = parse_format(next_value(args, &mut index, "--format")?)?;
+            }
+            "--help" | "-h" => return Err(CliError(usage())),
+            value if !value.starts_with('-') && dir.is_none() => {
+                dir = Some(PathBuf::from(value));
+            }
+            other => return Err(CliError(format!("unknown verify-proof argument '{other}'"))),
+        }
+        index += 1;
+    }
+    Ok(VerifyProofCommand {
+        dir: dir.ok_or_else(|| CliError("verify-proof requires --dir <bench-dir>".to_owned()))?,
+        proof: proof.unwrap_or(ProofSelection::All),
+        format,
+    })
+}
+
 fn validate_benchmark_command(command: &BenchmarkCommand) -> Result<(), CliError> {
     if command.sizes.is_empty() || command.workers.is_empty() {
         return Err(CliError(
@@ -738,26 +1089,27 @@ fn validate_benchmark_command(command: &BenchmarkCommand) -> Result<(), CliError
         ));
     }
     for size in &command.sizes {
-        if *size == 0 || !size.is_power_of_two() {
-            return Err(CliError(
-                "benchmark sizes must be positive powers of two".to_owned(),
-            ));
+        if *size == 0 {
+            return Err(CliError("benchmark sizes must be positive".to_owned()));
         }
     }
+    let min_row_domain = command
+        .sizes
+        .iter()
+        .copied()
+        .min()
+        .expect("sizes are checked non-empty")
+        .max(1)
+        .next_power_of_two();
     for workers in &command.workers {
         if *workers == 0 || !workers.is_power_of_two() {
             return Err(CliError(
                 "benchmark workers must be positive powers of two".to_owned(),
             ));
         }
-        let min_size = *command
-            .sizes
-            .iter()
-            .min()
-            .expect("sizes are checked non-empty");
-        if *workers > min_size {
+        if *workers > min_row_domain {
             return Err(CliError(
-                "benchmark workers must not exceed the smallest R1CS size".to_owned(),
+                "benchmark workers must not exceed the smallest padded R1CS row domain".to_owned(),
             ));
         }
     }
@@ -810,6 +1162,24 @@ fn parse_verify_results_command(args: &[String]) -> Result<VerifyResultsCommand,
     })
 }
 
+fn parse_quick_smoke_command(args: &[String]) -> Result<QuickSmokeCommand, CliError> {
+    let mut command = QuickSmokeCommand {
+        out_dir: PathBuf::from("target/quick-smoke"),
+    };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--out" => {
+                command.out_dir = PathBuf::from(next_value(args, &mut index, "--out")?);
+            }
+            "--help" | "-h" => return Err(CliError(usage())),
+            other => return Err(CliError(format!("unknown quick-smoke argument '{other}'"))),
+        }
+        index += 1;
+    }
+    Ok(command)
+}
+
 fn run_interactive_command() -> Result<(), CliError> {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -834,13 +1204,19 @@ fn run_interactive_command() -> Result<(), CliError> {
 }
 
 fn run_benchmark_command(args: &[String]) -> Result<(), CliError> {
+    run_benchmark_command_inner(args)?;
+    Ok(())
+}
+
+fn run_benchmark_command_inner(args: &[String]) -> Result<PathBuf, CliError> {
     let total_start = Instant::now();
     let setup_start = Instant::now();
     let mut command = parse_benchmark_command(args)?;
     configure_benchmark_core_plan(&mut command)?;
-    let (run_id, run_dir) = create_benchmark_run_dir(&command.out_dir)?;
+    let (run_id, _run_label, run_dir) = create_result_run_dir(&command.out_dir, "performance")?;
 
     let mut records = Vec::new();
+    let mut proof_index_entries = Vec::new();
     let mut phase_timings = Vec::new();
     let mut network_pools = BenchmarkNetworkPools::new();
     push_phase_timing(
@@ -854,7 +1230,6 @@ fn run_benchmark_command(args: &[String]) -> Result<(), CliError> {
     let runner_variants = command.runner.variants();
     let total_jobs = benchmark_total_jobs(&command, runner_variants.len());
     let mut job_index = 0_usize;
-    eprintln!("[benchmark] output directory: {}", run_dir.display());
     for runner in &runner_variants {
         for protocol in [Protocol::R1cs, Protocol::Plonkish] {
             for size in &command.sizes {
@@ -898,30 +1273,20 @@ fn run_benchmark_command(args: &[String]) -> Result<(), CliError> {
                             None
                         };
                         let job_start = Instant::now();
-                        let run_result = match runner {
-                            BenchmarkRunner::Local => match protocol {
-                                Protocol::R1cs => run_r1cs(&config),
-                                Protocol::Plonkish => run_plonkish(&config),
-                            },
-                            BenchmarkRunner::Network => match protocol {
-                                Protocol::R1cs => run_r1cs_network(
-                                    &config,
-                                    network_addrs.as_ref().expect("network addrs prepared"),
-                                ),
-                                Protocol::Plonkish => run_plonkish_network(
-                                    &config,
-                                    network_addrs.as_ref().expect("network addrs prepared"),
-                                ),
-                            },
-                            BenchmarkRunner::Both => unreachable!("expanded before benchmark loop"),
-                        };
-                        let mut run_records = match run_result {
-                            Ok(records) => records,
+                        let run_result = run_single_positive_job(
+                            *runner,
+                            protocol,
+                            &config,
+                            network_addrs.as_deref(),
+                        );
+                        let job_output = match run_result {
+                            Ok(output) => output,
                             Err(error) => {
                                 let _ = network_pools.shutdown_all(&mut phase_timings);
                                 return Err(error);
                             }
                         };
+                        let mut run_records = vec![job_output.record];
                         let recorded_prove_ms =
                             run_records.iter().map(|record| record.prove_ms).sum();
                         let recorded_verify_ms =
@@ -958,6 +1323,14 @@ fn run_benchmark_command(args: &[String]) -> Result<(), CliError> {
                             trial,
                             &run_records,
                         )?;
+                        let proof_entry = write_proof_bundle(
+                            &run_dir,
+                            "performance-benchmark",
+                            &run_records[0],
+                            job_output.proof,
+                            unix_timestamp_label(run_id)?,
+                        )?;
+                        proof_index_entries.push(proof_entry);
                         eprintln!(
                             "[benchmark job {job_index}/{total_jobs}] {} done positive_verified={positives}",
                             benchmark_progress(job_index, total_jobs)
@@ -972,6 +1345,7 @@ fn run_benchmark_command(args: &[String]) -> Result<(), CliError> {
     network_pools.shutdown_all(&mut phase_timings)?;
     eprintln!("[benchmark] writing source data, SVG charts, and PGFPlots figures");
     let artifact_start = Instant::now();
+    write_proof_index(&run_dir, &proof_index_entries)?;
     write_text_file(&run_dir.join("source.csv"), &records_to_csv(&records))?;
     write_text_file(&run_dir.join("source.json"), &records_to_json(&records))?;
     write_text_file(
@@ -1110,7 +1484,73 @@ fn run_benchmark_command(args: &[String]) -> Result<(), CliError> {
         report.files_checked, report.bytes_checked
     );
     eprintln!("[benchmark] complete");
-    println!("{}", run_dir.display());
+    Ok(run_dir)
+}
+
+fn run_quick_smoke_command(args: &[String]) -> Result<(), CliError> {
+    let command = parse_quick_smoke_command(args)?;
+    let benchmark_args = vec![
+        "--runner".to_owned(),
+        "local".to_owned(),
+        "--n-range".to_owned(),
+        "2..2".to_owned(),
+        "--workers".to_owned(),
+        "1".to_owned(),
+        "--pcs-queries".to_owned(),
+        "1".to_owned(),
+        "--out".to_owned(),
+        command.out_dir.display().to_string(),
+    ];
+    eprintln!("[quick-smoke] running local n=2 workers=1 benchmark");
+    let run_dir = run_benchmark_command_inner(&benchmark_args)?;
+    let before_report = verify_benchmark_result_dir(&run_dir)?;
+    let proof_report = verify_stored_proofs(&VerifyProofCommand {
+        dir: run_dir.clone(),
+        proof: ProofSelection::All,
+        format: OutputFormat::Json,
+    })?;
+    let failed = proof_report
+        .outcomes
+        .iter()
+        .filter(|outcome| !outcome.verified)
+        .count();
+    if failed > 0 {
+        return Err(CliError(format!(
+            "quick-smoke stored proof verification failed: {failed}/{} selected proof(s) failed; reports written to {} and {}",
+            proof_report.outcomes.len(),
+            proof_report.report_json.display(),
+            proof_report.report_html.display()
+        )));
+    }
+    let after_report = verify_benchmark_result_dir(&run_dir)?;
+    if before_report.files_checked != after_report.files_checked
+        || before_report.bytes_checked != after_report.bytes_checked
+        || before_report.source_rows_checked != after_report.source_rows_checked
+        || before_report.phase_rows_checked != after_report.phase_rows_checked
+        || before_report.summary_rows_checked != after_report.summary_rows_checked
+    {
+        return Err(CliError(
+            "quick-smoke proof reverification changed benchmark manifest or semantic counts"
+                .to_owned(),
+        ));
+    }
+    println!(
+        "{{\"ok\":true,\"dir\":\"{}\",\"files_checked\":{},\"bytes_checked\":{},\"source_rows_checked\":{},\"phase_rows_checked\":{},\"summary_rows_checked\":{},\"proofs_checked\":{},\"proofs_verified\":{},\"verify_report_json\":\"{}\",\"verify_report_html\":\"{}\"}}",
+        json_escape(&run_dir.display().to_string()),
+        after_report.files_checked,
+        after_report.bytes_checked,
+        after_report.source_rows_checked,
+        after_report.phase_rows_checked,
+        after_report.summary_rows_checked,
+        proof_report.outcomes.len(),
+        proof_report
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.verified)
+            .count(),
+        json_escape(&proof_report.report_json.display().to_string()),
+        json_escape(&proof_report.report_html.display().to_string())
+    );
     Ok(())
 }
 
@@ -1120,6 +1560,60 @@ fn benchmark_total_jobs(command: &BenchmarkCommand, runner_variant_count: usize)
         * command.sizes.len()
         * command.workers.len()
         * command.repeats
+}
+
+struct BenchmarkJobOutput {
+    record: MetricRecord,
+    proof: StoredProof,
+}
+
+fn run_single_positive_job(
+    runner: BenchmarkRunner,
+    protocol: Protocol,
+    config: &Config,
+    network_addrs: Option<&[String]>,
+) -> Result<BenchmarkJobOutput, CliError> {
+    match (runner, protocol) {
+        (BenchmarkRunner::Local, Protocol::R1cs) => {
+            let (record, proof) = run_r1cs_case_with_proof(config, "positive", false)?;
+            Ok(BenchmarkJobOutput {
+                record,
+                proof: StoredProof::R1cs(Box::new(proof)),
+            })
+        }
+        (BenchmarkRunner::Local, Protocol::Plonkish) => {
+            let (record, proof) = run_plonkish_case_with_proof(config, "positive", false)?;
+            Ok(BenchmarkJobOutput {
+                record,
+                proof: StoredProof::Plonkish(Box::new(proof)),
+            })
+        }
+        (BenchmarkRunner::Network, Protocol::R1cs) => {
+            let addrs = network_addrs.ok_or_else(|| {
+                CliError("network proof job requires prepared worker addresses".to_owned())
+            })?;
+            let (record, proof) =
+                run_r1cs_case_network_with_proof(config, addrs, "positive", false)?;
+            Ok(BenchmarkJobOutput {
+                record,
+                proof: StoredProof::R1cs(Box::new(proof)),
+            })
+        }
+        (BenchmarkRunner::Network, Protocol::Plonkish) => {
+            let addrs = network_addrs.ok_or_else(|| {
+                CliError("network proof job requires prepared worker addresses".to_owned())
+            })?;
+            let (record, proof) =
+                run_plonkish_case_network_with_proof(config, addrs, "positive", false)?;
+            Ok(BenchmarkJobOutput {
+                record,
+                proof: StoredProof::Plonkish(Box::new(proof)),
+            })
+        }
+        (BenchmarkRunner::Both, _) => Err(CliError(
+            "single proof job runner must be local or network".to_owned(),
+        )),
+    }
 }
 
 fn benchmark_progress(completed_jobs: usize, total_jobs: usize) -> String {
@@ -1195,6 +1689,182 @@ fn validate_benchmark_job_records(
         negative_rejected,
         details
     )))
+}
+
+fn run_proof_experiment_command(args: &[String]) -> Result<(), CliError> {
+    let command = parse_proof_experiment_command(args)?;
+    let (run_id, run_label, run_dir) = create_result_run_dir(&command.out_dir, "proof")?;
+
+    let mut records = Vec::new();
+    let mut proof_entries = Vec::new();
+    let mut network_pools = BenchmarkNetworkPools::new();
+    let mut proof_phase_timings = Vec::new();
+    let protocols = command.protocol.variants();
+    let total_jobs = protocols.len();
+    for (protocol_index, protocol) in protocols.into_iter().enumerate() {
+        let job_index = protocol_index + 1;
+        eprintln!(
+            "[proof-experiment job {job_index}/{total_jobs}] start runner={} protocol={} n={} nv={} workers={} pcs_queries={}",
+            command.runner.as_str(),
+            protocol.as_str(),
+            nv_power(command.size),
+            command.size,
+            command.workers,
+            command.pcs_queries
+        );
+        let config = Config {
+            protocol,
+            workers: command.workers,
+            size: command.size,
+            format: OutputFormat::Json,
+            case: CaseSelection::Positive,
+            pcs_queries: command.pcs_queries,
+            worker_core_plan: None,
+        };
+        let network_addrs = if command.runner == BenchmarkRunner::Network {
+            Some(network_pools.addrs_for(config.workers, &None, &mut proof_phase_timings)?)
+        } else {
+            None
+        };
+        let job =
+            run_single_positive_job(command.runner, protocol, &config, network_addrs.as_deref())?;
+        let record = job.record;
+        let entry = write_proof_bundle(
+            &run_dir,
+            "proof-experiment",
+            &record,
+            job.proof,
+            unix_timestamp_label(run_id)?,
+        )?;
+        proof_entries.push(entry);
+        records.push(record);
+        eprintln!("[proof-experiment job {job_index}/{total_jobs}] done verified=true");
+    }
+    network_pools.shutdown_all(&mut proof_phase_timings)?;
+
+    write_text_file(&run_dir.join("source.csv"), &records_to_csv(&records))?;
+    write_text_file(&run_dir.join("source.json"), &records_to_json(&records))?;
+    write_proof_index(&run_dir, &proof_entries)?;
+    write_text_file(
+        &run_dir.join("proof_experiment_report.json"),
+        &proof_experiment_report_json(run_id, &run_label, &command, &records, &proof_entries)?,
+    )?;
+    write_text_file(
+        &run_dir.join(OVERVIEW_HTML),
+        &proof_experiment_overview_html(run_id, &run_label, &command, &records, &proof_entries),
+    )?;
+    match command.format {
+        OutputFormat::Json => println!(
+            "{{\"ok\":true,\"run_id\":{},\"proofs\":{}}}",
+            run_id,
+            proof_entries.len()
+        ),
+        OutputFormat::Csv => {
+            println!("ok,run_id,proofs");
+            println!("true,{},{}", run_id, proof_entries.len());
+        }
+    }
+    Ok(())
+}
+
+fn run_list_proofs_command(args: &[String]) -> Result<(), CliError> {
+    let command = parse_list_proofs_command(args)?;
+    let entries = discover_proof_benches(&command.results_dir)?;
+    match command.format {
+        ProofListFormat::Text => {
+            if entries.is_empty() {
+                println!(
+                    "No bench directories found under {}.",
+                    command.results_dir.display()
+                );
+            } else {
+                println!(
+                    "Detected bench proof inventory under {}:",
+                    command.results_dir.display()
+                );
+                for (index, entry) in entries.iter().enumerate() {
+                    let status = if entry.proof_count == 0 {
+                        "no proof".to_owned()
+                    } else if entry.invalid_proof_count > 0 {
+                        format!(
+                            "{} proof file(s), {} invalid: {}",
+                            entry.proof_count,
+                            entry.invalid_proof_count,
+                            entry.proof_ids.join(", ")
+                        )
+                    } else {
+                        format!(
+                            "{} proof(s): {}",
+                            entry.proof_count,
+                            entry.proof_ids.join(", ")
+                        )
+                    };
+                    println!("{:>2}. {}  {}", index + 1, entry.bench_name, status);
+                }
+            }
+        }
+        ProofListFormat::Json => {
+            println!("{}", proof_list_to_json(&entries));
+        }
+        ProofListFormat::Csv => {
+            println!("index,bench,dir,proof_count,invalid_proof_count,proof_ids");
+            for (index, entry) in entries.iter().enumerate() {
+                println!(
+                    "{},{},{},{},{},{}",
+                    index + 1,
+                    csv_escape(&entry.bench_name),
+                    csv_escape(&entry.dir.display().to_string()),
+                    entry.proof_count,
+                    entry.invalid_proof_count,
+                    csv_escape(&entry.proof_ids.join(";"))
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_verify_proof_command(args: &[String]) -> Result<(), CliError> {
+    let command = parse_verify_proof_command(args)?;
+    let report = verify_stored_proofs(&command)?;
+    let failed = report
+        .outcomes
+        .iter()
+        .filter(|outcome| !outcome.verified)
+        .count();
+    match command.format {
+        OutputFormat::Json => println!("{}", proof_verify_report_to_json(&report, true)),
+        OutputFormat::Csv => {
+            println!("ok,bench_dir,report_json,report_html,total,verified,failed");
+            println!(
+                "{},{},{},{},{},{},{}",
+                report.outcomes.iter().all(|outcome| outcome.verified),
+                csv_escape(&report.bench_dir.display().to_string()),
+                csv_escape(&report.report_json.display().to_string()),
+                csv_escape(&report.report_html.display().to_string()),
+                report.outcomes.len(),
+                report
+                    .outcomes
+                    .iter()
+                    .filter(|outcome| outcome.verified)
+                    .count(),
+                report
+                    .outcomes
+                    .iter()
+                    .filter(|outcome| !outcome.verified)
+                    .count()
+            );
+        }
+    }
+    if failed > 0 {
+        return Err(CliError(format!(
+            "stored proof verification failed: {failed}/{} selected proof(s) failed; reports written to {} and {}",
+            report.outcomes.len(),
+            report.report_json.display(),
+            report.report_html.display()
+        )));
+    }
+    Ok(())
 }
 
 fn run_verify_results_command(args: &[String]) -> Result<(), CliError> {
@@ -1383,9 +2053,9 @@ fn verify_benchmark_result_semantics(
         )));
     }
     for (nv_power, size) in nv_powers.iter().zip(&sizes) {
-        if *size != (1_usize << *nv_power) {
+        if *nv_power != crate::nv_power(*size) {
             return Err(CliError(format!(
-                "metadata size {size} does not equal 2^{nv_power}"
+                "metadata nv_power {nv_power} does not match size {size}"
             )));
         }
     }
@@ -1461,13 +2131,13 @@ fn verify_benchmark_source_csv_semantics(
     let mut expected = BTreeSet::new();
     for runner in grid.runner_names {
         for protocol in ["r1cs", "plonkish"] {
-            for nv_power in grid.nv_powers {
+            for size in grid.sizes {
                 for worker in grid.workers {
                     for trial in 1..=grid.repeats {
                         expected.insert((
                             (*runner).to_owned(),
                             protocol.to_owned(),
-                            *nv_power,
+                            *size,
                             *worker,
                             trial,
                         ));
@@ -1499,13 +2169,13 @@ fn verify_benchmark_source_csv_semantics(
     if actual != expected {
         if let Some(missing) = expected.difference(&actual).next() {
             return Err(CliError(format!(
-                "source.csv missing runner={} protocol={} n={} workers={} trial={}",
+                "source.csv missing runner={} protocol={} size={} workers={} trial={}",
                 missing.0, missing.1, missing.2, missing.3, missing.4
             )));
         }
         if let Some(extra) = actual.difference(&expected).next() {
             return Err(CliError(format!(
-                "source.csv has unexpected runner={} protocol={} n={} workers={} trial={}",
+                "source.csv has unexpected runner={} protocol={} size={} workers={} trial={}",
                 extra.0, extra.1, extra.2, extra.3, extra.4
             )));
         }
@@ -1579,9 +2249,9 @@ fn verify_source_csv_row(
             "{context} row {row} n/size pair {nv_power}/{size} is not listed in metadata"
         )));
     }
-    if size != (1_usize << nv_power) {
+    if nv_power != crate::nv_power(size) {
         return Err(CliError(format!(
-            "{context} row {row} size {size} does not equal 2^{nv_power}"
+            "{context} row {row} nv_power {nv_power} does not match size {size}"
         )));
     }
     if constraints == 0 || proof_bytes == 0 || communication_bytes == 0 {
@@ -1626,12 +2296,12 @@ fn verify_source_csv_row(
     if !actual.insert((
         runner.to_owned(),
         protocol.to_owned(),
-        nv_power,
+        size,
         row_workers,
         trial,
     )) {
         return Err(CliError(format!(
-            "{context} duplicates runner={runner} protocol={protocol} n={nv_power} workers={row_workers} trial={trial}"
+            "{context} duplicates runner={runner} protocol={protocol} size={size} workers={row_workers} trial={trial}"
         )));
     }
     Ok(())
@@ -1731,7 +2401,7 @@ fn verify_summary_stats_csv_semantics(
             || !grid.workers.contains(&row_workers)
             || !grid.nv_powers.contains(&nv_power)
             || !grid.sizes.contains(&size)
-            || size != (1_usize << nv_power)
+            || nv_power != crate::nv_power(size)
             || row_pcs_queries != grid.pcs_queries
             || samples != grid.repeats
             || verified_count != grid.repeats
@@ -1747,12 +2417,12 @@ fn verify_summary_stats_csv_semantics(
         if !actual.insert((
             runner.to_owned(),
             protocol.to_owned(),
-            nv_power,
+            size,
             row_workers,
             samples,
         )) {
             return Err(CliError(format!(
-                "summary_stats.csv duplicates runner={runner} protocol={protocol} n={nv_power} workers={row_workers}"
+                "summary_stats.csv duplicates runner={runner} protocol={protocol} size={size} workers={row_workers}"
             )));
         }
         rows += 1;
@@ -1783,6 +2453,8 @@ fn verify_phase_timing_csv_semantics(dir: &Path, expected_jobs: usize) -> Result
     let mut has_source_artifacts = false;
     let mut has_final_artifacts = false;
     let mut has_total = false;
+    let mut has_figure_compile_failed = false;
+    let mut has_total_before_error = false;
     for (line_index, line) in lines.enumerate() {
         let fields = split_csv_line(line).map_err(|error| {
             CliError(format!(
@@ -1818,8 +2490,11 @@ fn verify_phase_timing_csv_semantics(dir: &Path, expected_jobs: usize) -> Result
                 }
             }
             "source_and_chart_artifacts" => has_source_artifacts = true,
+            "figure_compile" => {}
+            "figure_compile_failed" => has_figure_compile_failed = true,
             "final_result_artifacts" => has_final_artifacts = true,
             "total" => has_total = true,
+            "total_before_error" => has_total_before_error = true,
             "network_worker_pool_start" | "network_worker_pool_shutdown" => {
                 if elapsed_ms <= 0.0 {
                     return Err(CliError(format!(
@@ -1843,9 +2518,12 @@ fn verify_phase_timing_csv_semantics(dir: &Path, expected_jobs: usize) -> Result
             "phase_timing.csv expected {expected_jobs} job rows, got {job_rows}"
         )));
     }
-    if !has_source_artifacts || !has_final_artifacts || !has_total {
+    let completed = has_source_artifacts && has_final_artifacts && has_total;
+    let failed_during_figure_compile =
+        has_source_artifacts && has_figure_compile_failed && has_total_before_error;
+    if !completed && !failed_during_figure_compile {
         return Err(CliError(
-            "phase_timing.csv must include source_and_chart_artifacts, final_result_artifacts, and total phases"
+            "phase_timing.csv must include complete final phases or a figure_compile_failed total_before_error phase pair"
                 .to_owned(),
         ));
     }
@@ -2393,6 +3071,15 @@ fn require_metadata_usize_array(
 
 fn benchmark_result_dir_entries(dir: &Path) -> Result<BTreeSet<String>, CliError> {
     let mut files = BTreeSet::new();
+    collect_result_dir_entries(dir, dir, &mut files)?;
+    Ok(files)
+}
+
+fn collect_result_dir_entries(
+    root: &Path,
+    dir: &Path,
+    files: &mut BTreeSet<String>,
+) -> Result<(), CliError> {
     for entry in fs::read_dir(dir).map_err(|error| {
         CliError(format!(
             "read benchmark dir {} failed: {error}",
@@ -2413,16 +3100,22 @@ fn benchmark_result_dir_entries(dir: &Path) -> Result<BTreeSet<String>, CliError
                 name
             ))
         })?;
-        if !file_type.is_file() {
+        if file_type.is_dir() {
+            if dir == root && name == "verifications" {
+                continue;
+            }
+            collect_result_dir_entries(root, &entry.path(), files)?;
+        } else if file_type.is_file() {
+            files.insert(relative_artifact_path(root, &entry.path())?);
+        } else {
             return Err(CliError(format!(
                 "unexpected non-file artifact '{}' in {}",
                 name,
                 dir.display()
             )));
         }
-        files.insert(name);
     }
-    Ok(files)
+    Ok(())
 }
 
 fn parse_manifest_entries(manifest: &str) -> Result<Vec<ResultManifestEntry>, CliError> {
@@ -2435,9 +3128,13 @@ fn parse_manifest_entries(manifest: &str) -> Result<Vec<ResultManifestEntry>, Cl
         let path = parse_json_string_field(trimmed, "path")?;
         let bytes = parse_json_usize_field(trimmed, "bytes")?;
         let sha256 = parse_json_string_field(trimmed, "sha256")?;
-        if path.contains("..") || path.contains('/') || path.contains('\\') {
+        if path.contains("..")
+            || path.contains('\\')
+            || path.starts_with('/')
+            || path.split('/').any(str::is_empty)
+        {
             return Err(CliError(format!(
-                "manifest artifact path must be a filename, got '{path}'"
+                "manifest artifact path must be a relative file path under the result directory, got '{path}'"
             )));
         }
         if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -2794,6 +3491,26 @@ fn parse_nv_range_to_sizes(value: &str, flag: &str) -> Result<Vec<usize>, CliErr
         .collect()
 }
 
+fn parse_size_range_to_sizes(value: &str) -> Result<Vec<usize>, CliError> {
+    let (start, end) = parse_inclusive_range(value, "--size-range")?;
+    if start == 0 {
+        return Err(CliError("--size-range start must be positive".to_owned()));
+    }
+    Ok((start..=end).collect())
+}
+
+fn parse_worker_power_range_to_workers(value: &str) -> Result<Vec<usize>, CliError> {
+    let (start, end) = parse_inclusive_range(value, "--worker-power-range")?;
+    let mut workers = vec![1];
+    workers.extend(
+        (start..=end)
+            .map(|power| nv_power_to_size(power, "--worker-power-range"))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    normalize_unique(&mut workers);
+    Ok(workers)
+}
+
 fn parse_inclusive_range(value: &str, flag: &str) -> Result<(usize, usize), CliError> {
     let trimmed = value.trim();
     let parts = if let Some((start, end)) = trimmed.split_once("..=") {
@@ -2832,7 +3549,11 @@ fn normalize_unique(values: &mut Vec<usize>) {
 }
 
 fn nv_power(size: usize) -> usize {
-    size.trailing_zeros() as usize
+    if size == 0 {
+        0
+    } else {
+        (usize::BITS - 1 - size.leading_zeros()) as usize
+    }
 }
 
 fn run_worker_command(args: &[String]) -> Result<(), CliError> {
@@ -3371,6 +4092,14 @@ fn run_r1cs_case(
     case_name: &'static str,
     tamper: bool,
 ) -> Result<MetricRecord, CliError> {
+    Ok(run_r1cs_case_with_proof(config, case_name, tamper)?.0)
+}
+
+fn run_r1cs_case_with_proof(
+    config: &Config,
+    case_name: &'static str,
+    tamper: bool,
+) -> Result<(MetricRecord, R1csPiopProof), CliError> {
     let (instance, witness) = sample_r1cs(config.size)?;
 
     let prove_start = Instant::now();
@@ -3394,7 +4123,7 @@ fn run_r1cs_case(
         .map(|metrics| (metrics.proof_bytes, metrics.communication_bytes))
         .unwrap_or_else(|_| r1cs_fallback_metrics(&proof));
 
-    Ok(MetricRecord {
+    let record = MetricRecord {
         protocol: Protocol::R1cs.as_str(),
         runner: BenchmarkRunner::Local.as_str(),
         case_name,
@@ -3413,7 +4142,8 @@ fn run_r1cs_case(
         core_affinity: None,
         verified,
         failure_reason,
-    })
+    };
+    Ok((record, proof))
 }
 
 fn run_r1cs_case_network(
@@ -3422,6 +4152,15 @@ fn run_r1cs_case_network(
     case_name: &'static str,
     tamper: bool,
 ) -> Result<MetricRecord, CliError> {
+    Ok(run_r1cs_case_network_with_proof(config, addrs, case_name, tamper)?.0)
+}
+
+fn run_r1cs_case_network_with_proof(
+    config: &Config,
+    addrs: &[String],
+    case_name: &'static str,
+    tamper: bool,
+) -> Result<(MetricRecord, R1csPiopProof), CliError> {
     let (instance, witness) = sample_r1cs(config.size)?;
     let backend = RefCell::new(NetworkPcsClient::new(
         addrs.to_vec(),
@@ -3486,7 +4225,7 @@ fn run_r1cs_case_network(
         .map(|metrics| (metrics.proof_bytes, metrics.communication_bytes))
         .unwrap_or_else(|_| r1cs_fallback_metrics(&proof));
 
-    Ok(MetricRecord {
+    let record = MetricRecord {
         protocol: Protocol::R1cs.as_str(),
         runner: BenchmarkRunner::Network.as_str(),
         case_name,
@@ -3514,7 +4253,8 @@ fn run_r1cs_case_network(
             .map(|_| worker_affinity_mode()),
         verified,
         failure_reason,
-    })
+    };
+    Ok((record, proof))
 }
 
 fn prove_r1cs_for_instance(
@@ -3951,6 +4691,14 @@ fn run_plonkish_case(
     case_name: &'static str,
     tamper: bool,
 ) -> Result<MetricRecord, CliError> {
+    Ok(run_plonkish_case_with_proof(config, case_name, tamper)?.0)
+}
+
+fn run_plonkish_case_with_proof(
+    config: &Config,
+    case_name: &'static str,
+    tamper: bool,
+) -> Result<(MetricRecord, PlonkishPiopProof), CliError> {
     let instance = sample_plonkish_instance(config.size)
         .map_err(|error| CliError(format!("Plonkish sample failed: {error:?}")))?;
 
@@ -4012,7 +4760,7 @@ fn run_plonkish_case(
             )
         };
 
-    Ok(MetricRecord {
+    let record = MetricRecord {
         protocol: Protocol::Plonkish.as_str(),
         runner: BenchmarkRunner::Local.as_str(),
         case_name,
@@ -4031,7 +4779,8 @@ fn run_plonkish_case(
         core_affinity: None,
         verified,
         failure_reason,
-    })
+    };
+    Ok((record, proof))
 }
 
 fn run_plonkish_case_network(
@@ -4040,6 +4789,15 @@ fn run_plonkish_case_network(
     case_name: &'static str,
     tamper: bool,
 ) -> Result<MetricRecord, CliError> {
+    Ok(run_plonkish_case_network_with_proof(config, addrs, case_name, tamper)?.0)
+}
+
+fn run_plonkish_case_network_with_proof(
+    config: &Config,
+    addrs: &[String],
+    case_name: &'static str,
+    tamper: bool,
+) -> Result<(MetricRecord, PlonkishPiopProof), CliError> {
     let instance = sample_plonkish_instance(config.size)
         .map_err(|error| CliError(format!("Plonkish sample failed: {error:?}")))?;
     let backend = RefCell::new(NetworkPcsClient::new(
@@ -4129,7 +4887,7 @@ fn run_plonkish_case_network(
             )
         };
 
-    Ok(MetricRecord {
+    let record = MetricRecord {
         protocol: Protocol::Plonkish.as_str(),
         runner: BenchmarkRunner::Network.as_str(),
         case_name,
@@ -4157,7 +4915,8 @@ fn run_plonkish_case_network(
             .map(|_| worker_affinity_mode()),
         verified,
         failure_reason,
-    })
+    };
+    Ok((record, proof))
 }
 
 fn verify_plonkish_negative_variants(
@@ -4738,16 +5497,20 @@ fn csv_escape(input: &str) -> String {
     }
 }
 
-fn create_benchmark_run_dir(out_dir: &Path) -> Result<(u64, PathBuf), CliError> {
+fn create_result_run_dir(out_dir: &Path, suffix: &str) -> Result<(u64, String, PathBuf), CliError> {
     fs::create_dir_all(out_dir)
         .map_err(|error| CliError(format!("create benchmark root failed: {error}")))?;
+    let run_id = unix_timestamp_seconds()?;
+    let timestamp = unix_timestamp_label(run_id)?;
     for attempt in 0..128_u64 {
-        let run_id = unix_timestamp_nanos()?
-            .checked_add(attempt)
-            .ok_or_else(|| CliError("benchmark run id overflowed".to_owned()))?;
-        let run_dir = out_dir.join(format!("bench-{run_id}"));
+        let run_label = if attempt == 0 {
+            format!("bench-{timestamp}-{suffix}")
+        } else {
+            format!("bench-{timestamp}-{suffix}-{attempt:02}")
+        };
+        let run_dir = out_dir.join(&run_label);
         match fs::create_dir(&run_dir) {
-            Ok(()) => return Ok((run_id, run_dir)),
+            Ok(()) => return Ok((run_id, run_label, run_dir)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(CliError(format!(
@@ -4763,13 +5526,38 @@ fn create_benchmark_run_dir(out_dir: &Path) -> Result<(u64, PathBuf), CliError> 
     )))
 }
 
-fn unix_timestamp_nanos() -> Result<u64, CliError> {
-    let nanos = SystemTime::now()
+fn unix_timestamp_seconds() -> Result<u64, CliError> {
+    SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .map_err(|error| CliError(format!("system clock before UNIX epoch: {error}")))?;
-    u64::try_from(nanos)
-        .map_err(|_| CliError("UNIX timestamp nanoseconds overflowed u64".to_owned()))
+        .map(|duration| duration.as_secs())
+        .map_err(|error| CliError(format!("system clock before UNIX epoch: {error}")))
+}
+
+fn unix_timestamp_label(seconds: u64) -> Result<String, CliError> {
+    let days = i64::try_from(seconds / 86_400)
+        .map_err(|_| CliError("UNIX timestamp day count overflowed i64".to_owned()))?;
+    let seconds_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_unix_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    Ok(format!(
+        "{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}"
+    ))
+}
+
+fn civil_from_unix_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year as i32, m as u32, d as u32)
 }
 
 fn write_text_file(path: &Path, contents: &str) -> Result<(), CliError> {
@@ -4798,13 +5586,13 @@ fn benchmark_result_manifest_json(
     run_id: u64,
     figure_pdf_created: bool,
 ) -> Result<String, CliError> {
-    let artifacts = benchmark_artifacts(figure_pdf_created);
+    let artifacts = benchmark_manifest_artifacts(run_dir, figure_pdf_created)?;
     let mut entries = Vec::new();
     for artifact in artifacts {
         if artifact == RESULT_MANIFEST {
             continue;
         }
-        let path = run_dir.join(artifact);
+        let path = run_dir.join(&artifact);
         let bytes = fs::read(&path)
             .map_err(|error| CliError(format!("read {} failed: {error}", path.display())))?;
         let digest = hex_digest(sha256(&bytes));
@@ -4836,12 +5624,910 @@ fn benchmark_result_manifest_json(
     Ok(out)
 }
 
+fn benchmark_manifest_artifacts(
+    run_dir: &Path,
+    figure_pdf_created: bool,
+) -> Result<Vec<String>, CliError> {
+    let mut artifacts = benchmark_artifacts(figure_pdf_created)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let proofs_dir = run_dir.join("proofs");
+    if proofs_dir.exists() {
+        collect_relative_files(run_dir, &proofs_dir, &mut artifacts)?;
+    }
+    artifacts.sort();
+    artifacts.dedup();
+    Ok(artifacts)
+}
+
+fn collect_relative_files(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<String>,
+) -> Result<(), CliError> {
+    for entry in fs::read_dir(dir)
+        .map_err(|error| CliError(format!("read {} failed: {error}", dir.display())))?
+    {
+        let entry = entry.map_err(|error| {
+            CliError(format!(
+                "read entry under {} failed: {error}",
+                dir.display()
+            ))
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            CliError(format!(
+                "read file type for {} failed: {error}",
+                entry.path().display()
+            ))
+        })?;
+        if file_type.is_dir() {
+            collect_relative_files(root, &entry.path(), files)?;
+        } else if file_type.is_file() {
+            files.push(relative_artifact_path(root, &entry.path())?);
+        } else {
+            return Err(CliError(format!(
+                "unsupported special artifact in result directory: {}",
+                entry.path().display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn relative_artifact_path(root: &Path, path: &Path) -> Result<String, CliError> {
+    let relative = path.strip_prefix(root).map_err(|error| {
+        CliError(format!(
+            "artifact {} is not under result root {}: {error}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
 fn hex_digest(digest: [u8; 32]) -> String {
     let mut out = String::with_capacity(64);
     for byte in digest {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+fn proof_id(record: &MetricRecord) -> String {
+    format!(
+        "{}-{}-{}-n{}-w{}-q{}-trial{}",
+        record.runner,
+        record.protocol,
+        record.case_name,
+        nv_power(record.size),
+        record.workers,
+        record.pcs_queries,
+        record.trial
+    )
+}
+
+fn write_proof_bundle(
+    run_dir: &Path,
+    run_kind: &str,
+    record: &MetricRecord,
+    proof: StoredProof,
+    generated_utc: String,
+) -> Result<ProofIndexEntry, CliError> {
+    let proofs_dir = run_dir.join("proofs");
+    fs::create_dir_all(&proofs_dir).map_err(|error| {
+        CliError(format!(
+            "create proof directory {} failed: {error}",
+            proofs_dir.display()
+        ))
+    })?;
+    let proof_id = proof_id(record);
+    let bundle = ProofBundle {
+        schema_version: 1,
+        proof_id: proof_id.clone(),
+        run_kind: run_kind.to_owned(),
+        generated_utc,
+        protocol: record.protocol.to_owned(),
+        runner: record.runner.to_owned(),
+        case_name: record.case_name.to_owned(),
+        trial: record.trial,
+        nv_power: nv_power(record.size),
+        size: record.size,
+        workers: record.workers,
+        pcs_queries: record.pcs_queries,
+        proof_bytes: record.proof_bytes,
+        communication_bytes: record.communication_bytes,
+        network_bytes: record.network_bytes,
+        host_logical_cores: record.host_logical_cores,
+        cores_per_worker: record.cores_per_worker,
+        core_affinity: record.core_affinity.map(str::to_owned),
+        proof,
+    };
+    let path = proofs_dir.join(format!("{proof_id}.proof.json"));
+    let bytes = serde_json::to_vec(&bundle)
+        .map_err(|error| CliError(format!("serialize proof bundle {proof_id} failed: {error}")))?;
+    fs::write(&path, &bytes)
+        .map_err(|error| CliError(format!("write {} failed: {error}", path.display())))?;
+    Ok(ProofIndexEntry {
+        proof_id,
+        path: relative_artifact_path(run_dir, &path)?,
+        protocol: record.protocol.to_owned(),
+        runner: record.runner.to_owned(),
+        case_name: record.case_name.to_owned(),
+        trial: record.trial,
+        nv_power: nv_power(record.size),
+        size: record.size,
+        workers: record.workers,
+        pcs_queries: record.pcs_queries,
+        proof_bytes: record.proof_bytes,
+        communication_bytes: record.communication_bytes,
+        network_bytes: record.network_bytes,
+        file_bytes: bytes.len(),
+        sha256: hex_digest(sha256(&bytes)),
+    })
+}
+
+fn write_proof_index(run_dir: &Path, entries: &[ProofIndexEntry]) -> Result<(), CliError> {
+    let proofs_dir = run_dir.join("proofs");
+    fs::create_dir_all(&proofs_dir).map_err(|error| {
+        CliError(format!(
+            "create proof directory {} failed: {error}",
+            proofs_dir.display()
+        ))
+    })?;
+    let mut out = String::from("{\n");
+    out.push_str("  \"schema_version\": 1,\n");
+    out.push_str("  \"generated_by\": \"pq-experiments proof index\",\n");
+    out.push_str(&format!("  \"proof_count\": {},\n", entries.len()));
+    out.push_str("  \"proofs\": ");
+    out.push_str(
+        &serde_json::to_string_pretty(entries)
+            .map_err(|error| CliError(format!("serialize proof index failed: {error}")))?,
+    );
+    out.push_str("\n}\n");
+    write_text_file(&proofs_dir.join("index.json"), &out)
+}
+
+fn read_proof_bundle(path: &Path) -> Result<ProofBundle, CliError> {
+    Ok(read_proof_bundle_with_bytes(path)?.0)
+}
+
+fn read_proof_bundle_with_bytes(path: &Path) -> Result<(ProofBundle, Vec<u8>), CliError> {
+    let bytes = fs::read(path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", path.display())))?;
+    let bundle = serde_json::from_slice(&bytes).map_err(|error| {
+        CliError(format!(
+            "parse proof bundle {} failed: {error}",
+            path.display()
+        ))
+    })?;
+    Ok((bundle, bytes))
+}
+
+fn read_proof_index_lookup(dir: &Path) -> Result<HashMap<String, ProofIndexEntry>, CliError> {
+    let index_path = dir.join("proofs").join("index.json");
+    let bytes = fs::read(&index_path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", index_path.display())))?;
+    let index: ProofIndexFile = serde_json::from_slice(&bytes).map_err(|error| {
+        CliError(format!(
+            "parse proof index {} failed: {error}",
+            index_path.display()
+        ))
+    })?;
+    if index.schema_version != 1 {
+        return Err(CliError(format!(
+            "{} has unsupported proof index schema_version {}",
+            index_path.display(),
+            index.schema_version
+        )));
+    }
+    if index.generated_by != "pq-experiments proof index" {
+        return Err(CliError(format!(
+            "{} has unexpected generated_by '{}'",
+            index_path.display(),
+            index.generated_by
+        )));
+    }
+    if index.proof_count != index.proofs.len() {
+        return Err(CliError(format!(
+            "{} proof_count {} does not match {} proof entries",
+            index_path.display(),
+            index.proof_count,
+            index.proofs.len()
+        )));
+    }
+    let mut by_path = HashMap::new();
+    let mut proof_ids = BTreeSet::new();
+    for entry in index.proofs {
+        if entry.path.contains("..")
+            || entry.path.contains('\\')
+            || entry.path.starts_with('/')
+            || entry.path.split('/').any(str::is_empty)
+            || !entry.path.starts_with("proofs/")
+            || !entry.path.ends_with(".proof.json")
+        {
+            return Err(CliError(format!(
+                "{} contains invalid proof path '{}'",
+                index_path.display(),
+                entry.path
+            )));
+        }
+        if !proof_ids.insert(entry.proof_id.clone()) {
+            return Err(CliError(format!(
+                "{} contains duplicate proof_id '{}'",
+                index_path.display(),
+                entry.proof_id
+            )));
+        }
+        match by_path.entry(entry.path.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+            Entry::Occupied(existing) => {
+                return Err(CliError(format!(
+                    "{} contains duplicate proof path '{}'",
+                    index_path.display(),
+                    existing.key()
+                )));
+            }
+        }
+    }
+    Ok(by_path)
+}
+
+fn proof_files_in_bench(dir: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let proofs_dir = dir.join("proofs");
+    if !proofs_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&proofs_dir).map_err(|error| {
+        CliError(format!(
+            "read proof directory {} failed: {error}",
+            proofs_dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            CliError(format!(
+                "read entry under {} failed: {error}",
+                proofs_dir.display()
+            ))
+        })?;
+        let path = entry.path();
+        if entry
+            .file_type()
+            .map_err(|error| CliError(format!("read {} type failed: {error}", path.display())))?
+            .is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".proof.json"))
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn discover_proof_benches(results_dir: &Path) -> Result<Vec<ProofListEntry>, CliError> {
+    if !results_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(results_dir).map_err(|error| {
+        CliError(format!(
+            "read results directory {} failed: {error}",
+            results_dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            CliError(format!(
+                "read entry under {} failed: {error}",
+                results_dir.display()
+            ))
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            CliError(format!(
+                "read file type for {} failed: {error}",
+                entry.path().display()
+            ))
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let bench_name = entry.file_name().into_string().map_err(|name| {
+            CliError(format!(
+                "bench directory name is not valid UTF-8: {:?}",
+                name
+            ))
+        })?;
+        if !bench_name.starts_with("bench-") {
+            continue;
+        }
+        let proof_files = proof_files_in_bench(&entry.path())?;
+        let mut proof_ids = Vec::new();
+        let mut invalid_proof_count = 0;
+        for proof_file in &proof_files {
+            match read_proof_bundle(proof_file) {
+                Ok(bundle) => proof_ids.push(bundle.proof_id),
+                Err(_) => {
+                    invalid_proof_count += 1;
+                    proof_ids.push(format!(
+                        "{} [invalid]",
+                        proof_file
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("unreadable-proof")
+                    ));
+                }
+            }
+        }
+        entries.push(ProofListEntry {
+            dir: entry.path(),
+            bench_name,
+            proof_count: proof_files.len(),
+            invalid_proof_count,
+            proof_ids,
+        });
+    }
+    entries.sort_by(|left, right| left.bench_name.cmp(&right.bench_name));
+    Ok(entries)
+}
+
+fn proof_list_to_json(entries: &[ProofListEntry]) -> String {
+    let mut out = String::from("{\"benches\":[");
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"index\":{},\"bench\":\"{}\",\"dir\":\"{}\",\"proof_count\":{},\"invalid_proof_count\":{},\"proof_ids\":{}}}",
+            index + 1,
+            json_escape(&entry.bench_name),
+            json_escape(&entry.dir.display().to_string()),
+            entry.proof_count,
+            entry.invalid_proof_count,
+            json_string_array(&entry.proof_ids)
+        ));
+    }
+    out.push_str("]}");
+    out
+}
+
+fn verify_stored_proofs(command: &VerifyProofCommand) -> Result<ProofVerifyReport, CliError> {
+    let proof_files = proof_files_for_selection(&command.dir, &command.proof)?;
+    if proof_files.is_empty() {
+        return Err(CliError(format!(
+            "no stored proof bundles selected under {}",
+            command.dir.display()
+        )));
+    }
+    let (proof_index, proof_index_error) = match read_proof_index_lookup(&command.dir) {
+        Ok(index) => (Some(index), None),
+        Err(error) => (None, Some(error.0)),
+    };
+    let mut outcomes = Vec::with_capacity(proof_files.len());
+    for proof_file in proof_files {
+        let outcome = verify_stored_proof(
+            &command.dir,
+            &proof_file,
+            proof_index.as_ref(),
+            proof_index_error.as_deref(),
+        )
+        .unwrap_or_else(|error| failed_stored_proof_outcome(&proof_file, error.0));
+        outcomes.push(outcome);
+    }
+    let verifications_dir = command.dir.join("verifications");
+    fs::create_dir_all(&verifications_dir).map_err(|error| {
+        CliError(format!(
+            "create verification report directory {} failed: {error}",
+            verifications_dir.display()
+        ))
+    })?;
+    let timestamp = unix_timestamp_label(unix_timestamp_seconds()?)?;
+    let mut report_json = verifications_dir.join(format!("verify-{timestamp}.json"));
+    let mut report_html = verifications_dir.join(format!("verify-{timestamp}.html"));
+    for attempt in 1..128 {
+        if !report_json.exists() && !report_html.exists() {
+            break;
+        }
+        report_json = verifications_dir.join(format!("verify-{timestamp}-{attempt:02}.json"));
+        report_html = verifications_dir.join(format!("verify-{timestamp}-{attempt:02}.html"));
+    }
+    let report = ProofVerifyReport {
+        bench_dir: command.dir.clone(),
+        report_json: report_json.clone(),
+        report_html: report_html.clone(),
+        outcomes,
+    };
+    write_text_file(&report_json, &proof_verify_report_to_json(&report, false))?;
+    write_text_file(&report_html, &proof_verify_report_html(&report))?;
+    Ok(report)
+}
+
+fn proof_files_for_selection(
+    dir: &Path,
+    selection: &ProofSelection,
+) -> Result<Vec<PathBuf>, CliError> {
+    let files = proof_files_in_bench(dir)?;
+    match selection {
+        ProofSelection::All => Ok(files),
+        ProofSelection::One(id_or_file) => {
+            let mut matches = files
+                .into_iter()
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name == id_or_file || name == format!("{id_or_file}.proof.json")
+                        })
+                        || read_proof_bundle(path)
+                            .map(|bundle| bundle.proof_id == *id_or_file)
+                            .unwrap_or(false)
+                })
+                .collect::<Vec<_>>();
+            matches.sort();
+            if matches.is_empty() {
+                Err(CliError(format!(
+                    "proof '{}' was not found under {}",
+                    id_or_file,
+                    dir.join("proofs").display()
+                )))
+            } else {
+                Ok(matches)
+            }
+        }
+    }
+}
+
+fn verify_stored_proof(
+    bench_dir: &Path,
+    path: &Path,
+    proof_index: Option<&HashMap<String, ProofIndexEntry>>,
+    proof_index_error: Option<&str>,
+) -> Result<ProofVerificationOutcome, CliError> {
+    let (bundle, bundle_bytes) = read_proof_bundle_with_bytes(path)?;
+    if bundle.schema_version != 1 {
+        return Err(CliError(format!(
+            "{} has unsupported proof schema_version {}",
+            path.display(),
+            bundle.schema_version
+        )));
+    }
+    let verify_start = Instant::now();
+    let (proof_verified, proof_protocol, proof_bytes, communication_bytes, proof_failure) =
+        match &bundle.proof {
+            StoredProof::R1cs(proof) => {
+                let (instance, _) = sample_r1cs(bundle.size)?;
+                match verify_r1cs_for_instance(&instance, proof, bundle.pcs_queries) {
+                    Ok(metrics) => (
+                        true,
+                        "r1cs",
+                        metrics.proof_bytes,
+                        metrics.communication_bytes,
+                        None,
+                    ),
+                    Err(error) => (
+                        false,
+                        "r1cs",
+                        r1cs_proof_size_bytes(proof),
+                        r1cs_opening_communication_bytes(proof),
+                        Some(format!("Proof({error:?})")),
+                    ),
+                }
+            }
+            StoredProof::Plonkish(proof) => {
+                let instance = sample_plonkish_instance(bundle.size)
+                    .map_err(|error| CliError(format!("Plonkish sample failed: {error:?}")))?;
+                match verify_for_instance(&instance, proof, bundle.pcs_queries) {
+                    Ok(metrics) => (
+                        true,
+                        "plonkish",
+                        metrics.proof_bytes,
+                        metrics.communication_bytes,
+                        None,
+                    ),
+                    Err(error) => (
+                        false,
+                        "plonkish",
+                        pq_piop_plonkish::proof_size_bytes(proof),
+                        plonkish_proof_communication_bytes(proof),
+                        Some(format!("Proof({error:?})")),
+                    ),
+                }
+            }
+        };
+    let mut failures = Vec::new();
+    if let Some(failure) = proof_failure {
+        failures.push(failure);
+    }
+    validate_proof_bundle_metadata(
+        bench_dir,
+        path,
+        &bundle,
+        &bundle_bytes,
+        proof_protocol,
+        proof_bytes,
+        communication_bytes,
+        proof_index,
+        proof_index_error,
+        &mut failures,
+    )?;
+    let verified = proof_verified && failures.is_empty();
+    Ok(ProofVerificationOutcome {
+        proof_id: bundle.proof_id,
+        path: path.to_path_buf(),
+        protocol: bundle.protocol,
+        runner: bundle.runner,
+        size: bundle.size,
+        workers: bundle.workers,
+        pcs_queries: bundle.pcs_queries,
+        verified,
+        verify_ms: millis(verify_start.elapsed()),
+        proof_bytes,
+        communication_bytes,
+        failure_reason: if failures.is_empty() {
+            None
+        } else {
+            Some(failures.join("; "))
+        },
+    })
+}
+
+fn failed_stored_proof_outcome(path: &Path, reason: String) -> ProofVerificationOutcome {
+    let proof_id = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.trim_end_matches(".proof.json").to_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    ProofVerificationOutcome {
+        proof_id,
+        path: path.to_path_buf(),
+        protocol: "unknown".to_owned(),
+        runner: "unknown".to_owned(),
+        size: 0,
+        workers: 0,
+        pcs_queries: 0,
+        verified: false,
+        verify_ms: 0.0,
+        proof_bytes: 0,
+        communication_bytes: 0,
+        failure_reason: Some(format!("ProofBundle({reason})")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_proof_bundle_metadata(
+    bench_dir: &Path,
+    path: &Path,
+    bundle: &ProofBundle,
+    bundle_bytes: &[u8],
+    proof_protocol: &str,
+    proof_bytes: usize,
+    communication_bytes: usize,
+    proof_index: Option<&HashMap<String, ProofIndexEntry>>,
+    proof_index_error: Option<&str>,
+    failures: &mut Vec<String>,
+) -> Result<(), CliError> {
+    if bundle.protocol != proof_protocol {
+        failures.push(format!(
+            "Metadata(protocol '{}' does not match proof payload '{}')",
+            bundle.protocol, proof_protocol
+        ));
+    }
+    if bundle.size == 0 || !bundle.size.is_power_of_two() {
+        failures.push(format!(
+            "Metadata(size {} is not a positive power of two)",
+            bundle.size
+        ));
+    } else if bundle.nv_power != nv_power(bundle.size) {
+        failures.push(format!(
+            "Metadata(nv_power {} does not match size {})",
+            bundle.nv_power, bundle.size
+        ));
+    }
+    if bundle.workers == 0 || !bundle.workers.is_power_of_two() || bundle.workers > bundle.size {
+        failures.push(format!(
+            "Metadata(workers {} is not a valid power-of-two partition for size {})",
+            bundle.workers, bundle.size
+        ));
+    }
+    if bundle.pcs_queries == 0 {
+        failures.push("Metadata(pcs_queries must be positive)".to_owned());
+    }
+    if bundle.trial == 0 {
+        failures.push("Metadata(trial must be positive)".to_owned());
+    }
+    let expected_id = format!(
+        "{}-{}-{}-n{}-w{}-q{}-trial{}",
+        bundle.runner,
+        bundle.protocol,
+        bundle.case_name,
+        bundle.nv_power,
+        bundle.workers,
+        bundle.pcs_queries,
+        bundle.trial
+    );
+    if bundle.proof_id != expected_id {
+        failures.push(format!(
+            "Metadata(proof_id '{}' does not match expected '{}')",
+            bundle.proof_id, expected_id
+        ));
+    }
+    if bundle.proof_bytes != proof_bytes {
+        failures.push(format!(
+            "Metadata(proof_bytes {} does not match recomputed {})",
+            bundle.proof_bytes, proof_bytes
+        ));
+    }
+    if bundle.communication_bytes != communication_bytes {
+        failures.push(format!(
+            "Metadata(communication_bytes {} does not match recomputed {})",
+            bundle.communication_bytes, communication_bytes
+        ));
+    }
+    if bundle.runner == "local" && bundle.network_bytes != 0 {
+        failures.push(format!(
+            "Metadata(local runner has nonzero network_bytes {})",
+            bundle.network_bytes
+        ));
+    }
+
+    let relative_path = relative_artifact_path(bench_dir, path)?;
+    if let Some(index_error) = proof_index_error {
+        failures.push(format!("ProofIndex({index_error})"));
+        return Ok(());
+    }
+    let Some(index) = proof_index else {
+        failures.push("ProofIndex(missing proof index lookup)".to_owned());
+        return Ok(());
+    };
+    let Some(entry) = index.get(&relative_path) else {
+        failures.push(format!(
+            "ProofIndex(no index entry for '{}')",
+            relative_path
+        ));
+        return Ok(());
+    };
+    validate_index_entry_against_bundle(entry, bundle, bundle_bytes, &relative_path, failures);
+    Ok(())
+}
+
+fn validate_index_entry_against_bundle(
+    entry: &ProofIndexEntry,
+    bundle: &ProofBundle,
+    bundle_bytes: &[u8],
+    relative_path: &str,
+    failures: &mut Vec<String>,
+) {
+    if entry.path != relative_path {
+        failures.push(format!(
+            "ProofIndex(path '{}' does not match actual '{}')",
+            entry.path, relative_path
+        ));
+    }
+    if entry.proof_id != bundle.proof_id {
+        failures.push(format!(
+            "ProofIndex(proof_id '{}' does not match bundle '{}')",
+            entry.proof_id, bundle.proof_id
+        ));
+    }
+    if entry.protocol != bundle.protocol
+        || entry.runner != bundle.runner
+        || entry.case_name != bundle.case_name
+        || entry.trial != bundle.trial
+        || entry.nv_power != bundle.nv_power
+        || entry.size != bundle.size
+        || entry.workers != bundle.workers
+        || entry.pcs_queries != bundle.pcs_queries
+        || entry.proof_bytes != bundle.proof_bytes
+        || entry.communication_bytes != bundle.communication_bytes
+        || entry.network_bytes != bundle.network_bytes
+    {
+        failures.push("ProofIndex(index metadata does not match proof bundle metadata)".to_owned());
+    }
+    if entry.file_bytes != bundle_bytes.len() {
+        failures.push(format!(
+            "ProofIndex(file_bytes {} does not match actual {})",
+            entry.file_bytes,
+            bundle_bytes.len()
+        ));
+    }
+    let actual_sha = hex_digest(sha256(bundle_bytes));
+    if entry.sha256 != actual_sha {
+        failures.push(format!(
+            "ProofIndex(sha256 '{}' does not match actual '{}')",
+            entry.sha256, actual_sha
+        ));
+    }
+}
+
+fn proof_verify_report_to_json(report: &ProofVerifyReport, compact: bool) -> String {
+    let ok = report.outcomes.iter().all(|outcome| outcome.verified);
+    let verified = report
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.verified)
+        .count();
+    let failed = report.outcomes.len() - verified;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{{\"ok\":{},\"bench_dir\":\"{}\",\"report_json\":\"{}\",\"report_html\":\"{}\",\"total\":{},\"verified\":{},\"failed\":{},\"proofs\":[",
+        ok,
+        json_escape(&report.bench_dir.display().to_string()),
+        json_escape(&report.report_json.display().to_string()),
+        json_escape(&report.report_html.display().to_string()),
+        report.outcomes.len(),
+        verified,
+        failed
+    ));
+    for (index, outcome) in report.outcomes.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"proof_id\":\"{}\",\"path\":\"{}\",\"protocol\":\"{}\",\"runner\":\"{}\",\"nv_power\":{},\"size\":{},\"workers\":{},\"pcs_queries\":{},\"verified\":{},\"verify_ms\":{:.3},\"proof_bytes\":{},\"communication_bytes\":{},\"failure_reason\":{}}}",
+            json_escape(&outcome.proof_id),
+            json_escape(&outcome.path.display().to_string()),
+            json_escape(&outcome.protocol),
+            json_escape(&outcome.runner),
+            nv_power(outcome.size),
+            outcome.size,
+            outcome.workers,
+            outcome.pcs_queries,
+            outcome.verified,
+            outcome.verify_ms,
+            outcome.proof_bytes,
+            outcome.communication_bytes,
+            json_optional_string(outcome.failure_reason.as_deref())
+        ));
+    }
+    out.push_str("]}");
+    if compact { out } else { format!("{}\n", out) }
+}
+
+fn proof_verify_report_html(report: &ProofVerifyReport) -> String {
+    let ok = report.outcomes.iter().all(|outcome| outcome.verified);
+    let rows = report
+        .outcomes
+        .iter()
+        .map(|outcome| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.3}</td><td>{}</td></tr>",
+                html_escape(&outcome.proof_id),
+                html_escape(&outcome.protocol),
+                html_escape(&outcome.runner),
+                nv_power(outcome.size),
+                outcome.workers,
+                outcome.verify_ms,
+                outcome
+                    .failure_reason
+                    .as_deref()
+                    .map(html_escape)
+                    .unwrap_or_else(|| "verified".to_owned())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        concat!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>pq_dSNARK proof verification</title>",
+            "<style>body{{font-family:Inter,Segoe UI,Arial,sans-serif;margin:40px;color:#111827;background:#f8fafc}}",
+            "main{{max-width:1040px;margin:auto}}.status{{display:inline-block;padding:8px 12px;border-radius:6px;font-weight:700}}",
+            ".ok{{background:#dcfce7;color:#166534}}.bad{{background:#fee2e2;color:#991b1b}}",
+            "table{{width:100%;border-collapse:collapse;background:white;margin-top:24px}}th,td{{padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:left}}",
+            "th{{font-size:12px;text-transform:uppercase;color:#64748b}}</style></head><body><main>",
+            "<h1>pq_dSNARK proof verification</h1><p>{}</p><div class=\"status {}\">{}</div>",
+            "<table><thead><tr><th>proof</th><th>protocol</th><th>runner</th><th>n</th><th>workers</th><th>verify ms</th><th>result</th></tr></thead><tbody>{}</tbody></table>",
+            "</main></body></html>\n"
+        ),
+        html_escape(&report.bench_dir.display().to_string()),
+        if ok { "ok" } else { "bad" },
+        if ok {
+            "All selected proofs verified"
+        } else {
+            "At least one proof failed"
+        },
+        rows
+    )
+}
+
+fn proof_experiment_report_json(
+    run_id: u64,
+    run_label: &str,
+    command: &ProofExperimentCommand,
+    records: &[MetricRecord],
+    proofs: &[ProofIndexEntry],
+) -> Result<String, CliError> {
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str("  \"schema_version\": 1,\n");
+    out.push_str("  \"generated_by\": \"pq-experiments proof-experiment\",\n");
+    out.push_str(&format!("  \"run_id\": {run_id},\n"));
+    out.push_str(&format!(
+        "  \"run_label\": \"{}\",\n",
+        json_escape(run_label)
+    ));
+    out.push_str(&format!(
+        "  \"generated_utc\": \"{}\",\n",
+        json_escape(&unix_timestamp_label(run_id)?)
+    ));
+    out.push_str(&format!(
+        "  \"protocol\": \"{}\",\n",
+        command.protocol.as_str()
+    ));
+    out.push_str(&format!("  \"runner\": \"{}\",\n", command.runner.as_str()));
+    out.push_str(&format!("  \"nv_power\": {},\n", nv_power(command.size)));
+    out.push_str(&format!("  \"size\": {},\n", command.size));
+    out.push_str(&format!("  \"workers\": {},\n", command.workers));
+    out.push_str(&format!("  \"pcs_queries\": {},\n", command.pcs_queries));
+    out.push_str(&format!("  \"record_count\": {},\n", records.len()));
+    out.push_str(&format!("  \"proof_count\": {},\n", proofs.len()));
+    out.push_str("  \"proofs\": ");
+    out.push_str(
+        &serde_json::to_string_pretty(proofs)
+            .map_err(|error| CliError(format!("serialize proof report failed: {error}")))?,
+    );
+    out.push_str("\n}\n");
+    Ok(out)
+}
+
+fn proof_experiment_overview_html(
+    run_id: u64,
+    run_label: &str,
+    command: &ProofExperimentCommand,
+    records: &[MetricRecord],
+    proofs: &[ProofIndexEntry],
+) -> String {
+    let rows = records
+        .iter()
+        .map(|record| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{}</td></tr>",
+                html_escape(record.protocol),
+                html_escape(record.runner),
+                nv_power(record.size),
+                record.workers,
+                record.pcs_queries,
+                record.prove_ms,
+                record.verify_ms,
+                record.proof_bytes
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let proof_links = proofs
+        .iter()
+        .map(|proof| {
+            format!(
+                "<a href=\"{}\">{}</a>",
+                html_escape(&proof.path),
+                html_escape(&proof.proof_id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        concat!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>pq_dSNARK proof experiment</title>",
+            "<style>body{{font-family:Inter,Segoe UI,Arial,sans-serif;margin:40px;color:#111827;background:#f8fafc}}main{{max-width:1040px;margin:auto}}",
+            "table{{width:100%;border-collapse:collapse;background:white;margin-top:22px}}th,td{{padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:left}}",
+            "th{{font-size:12px;text-transform:uppercase;color:#64748b}}.links{{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}}",
+            ".links a{{background:white;border:1px solid #dbe3ee;border-radius:6px;padding:8px 10px;color:#0f766e;text-decoration:none}}</style></head><body><main>",
+            "<h1>pq_dSNARK proof experiment</h1><p>{} - run_id={} - protocol={} - runner={} - n={}</p>",
+            "<table><thead><tr><th>protocol</th><th>runner</th><th>n</th><th>workers</th><th>queries</th><th>prove ms</th><th>verify ms</th><th>proof bytes</th></tr></thead><tbody>{}</tbody></table>",
+            "<h2>Stored proofs</h2><div class=\"links\"><a href=\"proofs/index.json\">proofs/index.json</a>{}</div>",
+            "</main></body></html>\n"
+        ),
+        html_escape(run_label),
+        run_id,
+        command.protocol.as_str(),
+        command.runner.as_str(),
+        nv_power(command.size),
+        rows,
+        proof_links
+    )
 }
 
 fn benchmark_metadata_json(
@@ -5827,9 +7513,18 @@ fn compile_paper_figures(run_dir: &Path, compiler: FigureCompiler) -> Result<(),
         "tectonic" => vec![source],
         _ => unreachable!("selected compiler is constrained"),
     };
-    let output = process::Command::new(compiler)
-        .args(&args)
-        .current_dir(run_dir)
+    let mut command = process::Command::new(compiler);
+    command.args(&args).current_dir(run_dir);
+    if compiler == "tectonic" && env::var_os("TECTONIC_CACHE_DIR").is_none() {
+        let cache_dir = env::current_dir()
+            .map_err(|error| CliError(format!("read current directory failed: {error}")))?
+            .join("target")
+            .join("tectonic-cache");
+        fs::create_dir_all(&cache_dir)
+            .map_err(|error| CliError(format!("create tectonic cache dir failed: {error}")))?;
+        command.env("TECTONIC_CACHE_DIR", cache_dir);
+    }
+    let output = command
         .output()
         .map_err(|error| CliError(format!("failed to launch {compiler}: {error}")))?;
     if !output.status.success() {
@@ -7309,7 +9004,11 @@ fn usage() -> String {
     "usage:
   cargo run -p pq-experiments -- <r1cs|plonkish> [--workers N] [--size N] [--pcs-queries N] [--format json|csv] [--case positive|negative|both]
   cargo run -p pq-experiments -- interactive
-  cargo run -p pq-experiments -- benchmark [--paper-preset] [--runner local|network|both] [--sizes 4,8,16 | --nv-powers/--n-values 2,3,4 | --nv-range/--n-range 2..6] [--workers 1,2,4] [--pcs-queries N] [--host-cores N] [--worker-cores N] [--compile-figures] [--figure-compiler auto|pdflatex|tectonic] [--out results]
+  cargo run -p pq-experiments -- proof-experiment [--protocol r1cs|plonkish|both] [--runner local|network] [--size N | --n POWER] [--workers N] [--pcs-queries N] [--out DIR] [--format json|csv]
+  cargo run -p pq-experiments -- list-proofs [--results results] [--format text|json|csv]
+  cargo run -p pq-experiments -- verify-proof --dir results/bench-... [--all | --proof ID] [--format json|csv]
+  cargo run -p pq-experiments -- benchmark [--paper-preset] [--runner local|network|both] [--sizes 4,8,16 | --size-range 4..16 | --nv-powers/--n-values 2,3,4 | --nv-range/--n-range 2..6] [--workers 1,2,4 | --worker-power-range 0..2] [--pcs-queries N] [--host-cores N] [--worker-cores N] [--compile-figures] [--out DIR]
+  cargo run -p pq-experiments -- quick-smoke [--out DIR]
   cargo run -p pq-experiments -- verify-results --dir results/bench-... [--format json|csv] [--paper-quality]
   cargo run -p pq-experiments -- net-demo [--workers N] [--format json|csv]
   cargo run -p pq-experiments -- worker --addr HOST:PORT --id N
@@ -7322,6 +9021,62 @@ fn usage() -> String {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "{prefix}_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    fn write_base_benchmark_fixture(
+        run_dir: &Path,
+        run_id: u64,
+        command: &BenchmarkCommand,
+        records: &[MetricRecord],
+        timings: &[PhaseTimingRecord],
+    ) -> Result<(), CliError> {
+        let provenance = BenchmarkProvenance::capture();
+        write_text_file(
+            &run_dir.join("metadata.json"),
+            &benchmark_metadata_json(run_id, command, records, false, &provenance),
+        )?;
+        write_text_file(&run_dir.join("source.csv"), &records_to_csv(records))?;
+        write_text_file(&run_dir.join("source.json"), &records_to_json(records))?;
+        write_text_file(
+            &run_dir.join("summary_stats.csv"),
+            &summary_stats_to_csv(&benchmark_stats(records)),
+        )?;
+        write_text_file(
+            &run_dir.join("phase_timing.csv"),
+            &phase_timing_to_csv(timings),
+        )?;
+        write_text_file(
+            &run_dir.join("phase_timing.json"),
+            &phase_timing_to_json(timings),
+        )?;
+        write_text_file(
+            &run_dir.join(OVERVIEW_HTML),
+            &benchmark_overview_html(run_id, command, records, false),
+        )?;
+        write_text_file(
+            &run_dir.join("summary.txt"),
+            &benchmark_summary(command, records, timings, false, &provenance),
+        )?;
+        write_benchmark_charts(run_dir, records)?;
+        for artifact in benchmark_artifacts(false) {
+            if artifact != RESULT_MANIFEST && !run_dir.join(artifact).exists() {
+                write_text_file(
+                    &run_dir.join(artifact),
+                    &format!("test benchmark fixture for {artifact}\n"),
+                )?;
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn parses_experiment_protocol_flags() {
@@ -7357,6 +9112,14 @@ mod tests {
         );
         assert_eq!(csv_escape("Invalid,Proof"), "\"Invalid,Proof\"");
         assert_eq!(csv_escape("Pcs"), "Pcs");
+    }
+
+    #[test]
+    fn usage_help_exits_successfully() {
+        assert!(is_usage_help(&CliError(usage())));
+        assert!(!is_usage_help(&CliError("unknown argument".to_owned())));
+        assert_eq!(cli_exit_code(&CliError(usage())), 0);
+        assert_eq!(cli_exit_code(&CliError("unknown argument".to_owned())), 2);
     }
 
     #[test]
@@ -7510,6 +9273,25 @@ mod tests {
         assert!(overridden_preset.paper_preset);
         assert_eq!(overridden_preset.sizes, vec![4, 8]);
         assert_eq!(overridden_preset.repeats, 1);
+
+        let dense_range = parse_benchmark_command(&[
+            "--size-range".to_owned(),
+            "4..8".to_owned(),
+            "--worker-power-range".to_owned(),
+            "0..2".to_owned(),
+        ])
+        .expect("dense size range benchmark command");
+        assert_eq!(dense_range.sizes, vec![4, 5, 6, 7, 8]);
+        assert_eq!(dense_range.workers, vec![1, 2, 4]);
+
+        let distributed_worker_range = parse_benchmark_command(&[
+            "--size-range".to_owned(),
+            "16..16".to_owned(),
+            "--worker-power-range".to_owned(),
+            "1..3".to_owned(),
+        ])
+        .expect("distributed worker range benchmark command");
+        assert_eq!(distributed_worker_range.workers, vec![1, 2, 4, 8]);
     }
 
     #[test]
@@ -7657,8 +9439,145 @@ mod tests {
             vec![
                 "interactive-linux.sh",
                 "interactive-macos.sh",
-                "interactive-powershell.ps1",
+                "interactive-powershell.cmd",
             ]
+        );
+    }
+
+    #[test]
+    fn windows_cmd_embeds_powershell_payload_without_tools_directory() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+        let script_launcher =
+            fs::read_to_string(repo_root.join("scripts").join("interactive-powershell.cmd"))
+                .expect("read script PowerShell launcher");
+        assert!(script_launcher.contains("# POWERSHELL_PAYLOAD_BEGIN"));
+        assert!(script_launcher.contains("-ExecutionPolicy Bypass"));
+        assert!(script_launcher.contains("target\\windows\\interactive-powershell.generated.ps1"));
+        assert!(script_launcher.contains("if not defined NO_PAUSE pause"));
+        assert!(script_launcher.contains("function Invoke-Menu"));
+        assert!(!repo_root.join("tools").exists());
+    }
+
+    #[test]
+    fn interactive_scripts_offer_dependency_install_from_actions() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+        let linux_script =
+            fs::read_to_string(repo_root.join("scripts").join("interactive-linux.sh"))
+                .expect("read linux interactive script");
+        assert!(linux_script.contains("ensure_toolchain_for_action"));
+        assert!(linux_script.contains("Install missing dependencies now"));
+        assert!(linux_script.contains("Build debug pq-experiments now"));
+        assert!(linux_script.contains("build_experiment_binary debug"));
+        assert!(linux_script.contains("proof_wizard() {\n  ensure_toolchain_for_action false"));
+        assert!(linux_script.contains("benchmark_wizard() {\n  ensure_toolchain_for_action false"));
+        assert!(linux_script.contains("results_wizard() {\n  ensure_toolchain_for_action false"));
+
+        let powershell_script =
+            fs::read_to_string(repo_root.join("scripts").join("interactive-powershell.cmd"))
+                .expect("read embedded PowerShell interactive script");
+        let powershell_script = powershell_script.replace("\r\n", "\n");
+        assert!(powershell_script.contains("function Ensure-ToolchainForAction"));
+        assert!(powershell_script.contains("Install missing dependencies now"));
+        assert!(powershell_script.contains("Build debug pq-experiments now"));
+        assert!(powershell_script.contains("Build-ExperimentBinary -Release:$false"));
+        assert!(powershell_script.contains("choose menu option 1"));
+        assert!(!powershell_script.contains("choose menu option 2"));
+        assert!(
+            powershell_script
+                .contains("function Invoke-ProofWizard {\n    Ensure-ToolchainForAction")
+        );
+        assert!(
+            powershell_script
+                .contains("function Invoke-BenchmarkWizard {\n    Ensure-ToolchainForAction")
+        );
+        assert!(
+            powershell_script
+                .contains("function Invoke-ResultsWizard {\n    Ensure-ToolchainForAction")
+        );
+    }
+
+    #[test]
+    fn current_user_docs_do_not_reference_removed_script_entries() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+        let docs = [
+            repo_root.join("README.md"),
+            repo_root.join("Doc").join("reproducibility_runbook.md"),
+            repo_root.join("results").join("README.md"),
+            repo_root
+                .join("results")
+                .join("release_results")
+                .join("README.md"),
+        ];
+        let removed = [
+            "run_benchmarks.ps1",
+            "run_benchmarks.sh",
+            "run_experiments.ps1",
+            "run_experiments.sh",
+            "verify_results.ps1",
+            "verify_results.sh",
+            "publish-results",
+            "Verify/publish results",
+        ];
+        for path in docs {
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {} failed: {error}", path.display()));
+            for needle in removed {
+                assert!(
+                    !text.contains(needle),
+                    "{} still references removed entry '{}'",
+                    path.display(),
+                    needle
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ci_guards_fresh_clone_quick_smoke() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+        let ci = fs::read_to_string(repo_root.join(".github").join("workflows").join("ci.yml"))
+            .expect("read CI workflow");
+        assert!(ci.contains("macOS quick smoke"));
+        assert!(ci.contains("cargo run -p pq-experiments -- quick-smoke"));
+        assert!(ci.contains("proofs_verified"));
+        assert!(ci.contains("verify_report_html"));
+    }
+
+    #[test]
+    fn gitignore_preserves_scratch_vs_release_result_split() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+        let gitignore = fs::read_to_string(repo_root.join(".gitignore")).expect("read .gitignore");
+        assert!(gitignore.contains("/target/"));
+        assert!(gitignore.contains("/results/bench-*/"));
+        assert!(gitignore.contains("!/results/release_results/"));
+        assert!(gitignore.contains("!/results/release_results/**"));
+        assert!(gitignore.contains("*.log"));
+        assert!(
+            gitignore.find("/results/bench-*/").expect("bench ignore")
+                < gitignore
+                    .find("!/results/release_results/**")
+                    .expect("release unignore"),
+            "release_results unignore must appear after scratch bench ignore"
         );
     }
 
@@ -7681,6 +9600,513 @@ mod tests {
         assert_eq!(positional.dir, PathBuf::from("results/bench-2"));
         assert_eq!(positional.format, OutputFormat::Json);
         assert!(!positional.paper_quality);
+    }
+
+    #[test]
+    fn parses_quick_smoke_command_flags() {
+        let default = parse_quick_smoke_command(&[]).expect("default quick smoke");
+        assert_eq!(default.out_dir, PathBuf::from("target/quick-smoke"));
+
+        let custom =
+            parse_quick_smoke_command(&["--out".to_owned(), "target/fresh-clone-smoke".to_owned()])
+                .expect("custom quick smoke");
+        assert_eq!(custom.out_dir, PathBuf::from("target/fresh-clone-smoke"));
+
+        let error = parse_quick_smoke_command(&["--workers".to_owned(), "2".to_owned()])
+            .expect_err("quick-smoke should keep the smoke grid fixed");
+        assert!(error.0.contains("unknown quick-smoke argument"));
+    }
+
+    #[test]
+    fn parses_proof_storage_commands() {
+        let proof = parse_proof_experiment_command(&[
+            "--protocol".to_owned(),
+            "both".to_owned(),
+            "--runner".to_owned(),
+            "network".to_owned(),
+            "--n".to_owned(),
+            "5".to_owned(),
+            "--workers".to_owned(),
+            "4".to_owned(),
+            "--pcs-queries".to_owned(),
+            "2".to_owned(),
+            "--out".to_owned(),
+            "results".to_owned(),
+            "--format".to_owned(),
+            "csv".to_owned(),
+        ])
+        .expect("proof-experiment command");
+        assert_eq!(proof.protocol, ProofProtocolSelection::Both);
+        assert_eq!(proof.runner, BenchmarkRunner::Network);
+        assert_eq!(proof.size, 32);
+        assert_eq!(proof.workers, 4);
+        assert_eq!(proof.pcs_queries, 2);
+        assert_eq!(proof.format, OutputFormat::Csv);
+
+        let list = parse_list_proofs_command(&[
+            "--results".to_owned(),
+            "target/proofs".to_owned(),
+            "--format".to_owned(),
+            "json".to_owned(),
+        ])
+        .expect("list-proofs command");
+        assert_eq!(list.results_dir, PathBuf::from("target/proofs"));
+        assert_eq!(list.format, ProofListFormat::Json);
+
+        let verify = parse_verify_proof_command(&[
+            "results/bench-20260601-010203-performance".to_owned(),
+            "--proof".to_owned(),
+            "network-r1cs-positive-n2-w2-q1-trial1".to_owned(),
+            "--format".to_owned(),
+            "csv".to_owned(),
+        ])
+        .expect("verify-proof command");
+        assert_eq!(
+            verify.dir,
+            PathBuf::from("results/bench-20260601-010203-performance")
+        );
+        assert!(matches!(verify.proof, ProofSelection::One(_)));
+        assert_eq!(verify.format, OutputFormat::Csv);
+    }
+
+    #[test]
+    fn result_manifest_includes_proof_artifacts_with_hashes() {
+        let manifest_dir = temp_test_dir("pq_dsnark_proof_manifest_test");
+        fs::create_dir_all(&manifest_dir).expect("manifest temp dir");
+        for artifact in benchmark_artifacts(false) {
+            if artifact != RESULT_MANIFEST {
+                write_text_file(
+                    &manifest_dir.join(artifact),
+                    &format!("test artifact {artifact}\n"),
+                )
+                .expect("write base artifact");
+            }
+        }
+
+        let proofs_dir = manifest_dir.join("proofs");
+        fs::create_dir_all(&proofs_dir).expect("proofs dir");
+        let proof_bytes = br#"{"schema_version":1,"proof_id":"minimal-indexed"}"#;
+        let index_bytes = br#"{"schema_version":1,"generated_by":"pq-experiments proof index","proof_count":1,"proofs":[]}"#;
+        fs::write(proofs_dir.join("minimal-indexed.proof.json"), proof_bytes)
+            .expect("write proof bundle");
+        fs::write(proofs_dir.join("index.json"), index_bytes).expect("write proof index");
+
+        let manifest = benchmark_result_manifest_json(&manifest_dir, 789, false).expect("manifest");
+        assert!(manifest.contains(&format!(
+            "\"path\":\"proofs/minimal-indexed.proof.json\",\"bytes\":{},\"sha256\":\"{}\"",
+            proof_bytes.len(),
+            hex_digest(sha256(proof_bytes))
+        )));
+        assert!(manifest.contains(&format!(
+            "\"path\":\"proofs/index.json\",\"bytes\":{},\"sha256\":\"{}\"",
+            index_bytes.len(),
+            hex_digest(sha256(index_bytes))
+        )));
+        write_text_file(&manifest_dir.join(RESULT_MANIFEST), &manifest).expect("write manifest");
+
+        let report =
+            verify_benchmark_result_manifest(&manifest_dir).expect("verify proof manifest");
+        assert_eq!(report.run_id, 789);
+        assert_eq!(
+            report.files_checked,
+            benchmark_artifacts(false).len() - 1 + 2
+        );
+
+        fs::remove_dir_all(&manifest_dir).expect("cleanup proof manifest temp dir");
+    }
+
+    #[test]
+    fn proof_reverification_reports_do_not_pollute_benchmark_verification() {
+        let run_dir = temp_test_dir("bench-pq_dsnark_verify_pollution_test");
+        fs::create_dir_all(&run_dir).expect("pollution temp dir");
+        let config = Config {
+            protocol: Protocol::R1cs,
+            workers: 1,
+            size: 4,
+            format: OutputFormat::Json,
+            case: CaseSelection::Positive,
+            pcs_queries: 1,
+            worker_core_plan: None,
+        };
+        let output = run_single_positive_job(BenchmarkRunner::Local, Protocol::R1cs, &config, None)
+            .expect("positive R1CS proof job");
+        let mut plonkish_record = output.record.clone();
+        plonkish_record.protocol = "plonkish";
+        plonkish_record.constraints = 16;
+        plonkish_record.prove_ms += 1.0;
+        plonkish_record.verify_ms += 1.0;
+        plonkish_record.proof_bytes += 10;
+        plonkish_record.communication_bytes += 10;
+        let records = vec![output.record.clone(), plonkish_record];
+        let timings = vec![
+            PhaseTimingRecord {
+                phase: "setup".to_owned(),
+                detail: "test setup".to_owned(),
+                elapsed_ms: 0.1,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 0.1,
+            },
+            PhaseTimingRecord {
+                phase: "job".to_owned(),
+                detail: "runner=local protocol=r1cs n=2 nv=4 workers=1".to_owned(),
+                elapsed_ms: output.record.prove_ms + output.record.verify_ms,
+                recorded_prove_ms: output.record.prove_ms,
+                recorded_verify_ms: output.record.verify_ms,
+                inferred_overhead_ms: 0.0,
+            },
+            PhaseTimingRecord {
+                phase: "job".to_owned(),
+                detail: "runner=local protocol=plonkish n=2 nv=4 workers=1".to_owned(),
+                elapsed_ms: records[1].prove_ms + records[1].verify_ms,
+                recorded_prove_ms: records[1].prove_ms,
+                recorded_verify_ms: records[1].verify_ms,
+                inferred_overhead_ms: 0.0,
+            },
+            PhaseTimingRecord {
+                phase: "source_and_chart_artifacts".to_owned(),
+                detail: "charts".to_owned(),
+                elapsed_ms: 1.0,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 1.0,
+            },
+            PhaseTimingRecord {
+                phase: "final_result_artifacts".to_owned(),
+                detail: "final".to_owned(),
+                elapsed_ms: 1.0,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 1.0,
+            },
+            PhaseTimingRecord {
+                phase: "total".to_owned(),
+                detail: "total".to_owned(),
+                elapsed_ms: output.record.prove_ms + output.record.verify_ms + 3.1,
+                recorded_prove_ms: output.record.prove_ms + records[1].prove_ms,
+                recorded_verify_ms: output.record.verify_ms + records[1].verify_ms,
+                inferred_overhead_ms: 2.1,
+            },
+        ];
+        let command = BenchmarkCommand {
+            sizes: vec![4],
+            workers: vec![1],
+            pcs_queries: 1,
+            repeats: 1,
+            paper_preset: false,
+            runner: BenchmarkRunner::Local,
+            compile_figures: false,
+            figure_compiler: FigureCompiler::Auto,
+            out_dir: PathBuf::from("results"),
+            host_logical_cores: None,
+            worker_cores: None,
+            worker_core_plan: None,
+        };
+        write_base_benchmark_fixture(&run_dir, 790, &command, &records, &timings)
+            .expect("write benchmark fixture");
+        let proof_entry = write_proof_bundle(
+            &run_dir,
+            "performance-benchmark",
+            &output.record,
+            output.proof,
+            "2026-06-01T00:00:00Z".to_owned(),
+        )
+        .expect("write proof bundle");
+        write_proof_index(&run_dir, &[proof_entry]).expect("write proof index");
+        let manifest =
+            benchmark_result_manifest_json(&run_dir, 790, false).expect("write manifest");
+        write_text_file(&run_dir.join(RESULT_MANIFEST), &manifest).expect("write manifest");
+
+        let before =
+            verify_benchmark_result_dir(&run_dir).expect("verify benchmark before proof report");
+        let proof_report = verify_stored_proofs(&VerifyProofCommand {
+            dir: run_dir.clone(),
+            proof: ProofSelection::All,
+            format: OutputFormat::Json,
+        })
+        .expect("verify stored proof");
+        assert_eq!(proof_report.outcomes.len(), 1);
+        assert_eq!(
+            proof_report
+                .outcomes
+                .iter()
+                .filter(|outcome| outcome.verified)
+                .count(),
+            1
+        );
+        assert!(
+            proof_report
+                .report_json
+                .starts_with(run_dir.join("verifications"))
+        );
+        assert!(
+            proof_report
+                .report_html
+                .starts_with(run_dir.join("verifications"))
+        );
+
+        let after =
+            verify_benchmark_result_dir(&run_dir).expect("verify benchmark after proof report");
+        assert_eq!(after.files_checked, before.files_checked);
+        assert_eq!(after.bytes_checked, before.bytes_checked);
+        assert_eq!(after.source_rows_checked, before.source_rows_checked);
+        assert_eq!(after.phase_rows_checked, before.phase_rows_checked);
+        assert_eq!(after.summary_rows_checked, before.summary_rows_checked);
+
+        fs::remove_dir_all(&run_dir).expect("cleanup verify pollution temp dir");
+    }
+
+    #[test]
+    fn list_proofs_reports_corrupt_proof_files_without_failing() {
+        let results_dir = temp_test_dir("pq_dsnark_list_corrupt_proofs_test");
+        let bench_dir = results_dir.join("bench-20260601-010203-proof");
+        fs::create_dir_all(bench_dir.join("proofs")).expect("proofs dir");
+        let proof_file = bench_dir.join("proofs").join("corrupt.proof.json");
+        fs::write(&proof_file, b"{not valid json").expect("write corrupt proof");
+
+        let entries = discover_proof_benches(&results_dir).expect("discover corrupt proof bench");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].proof_count, 1);
+        assert_eq!(entries[0].invalid_proof_count, 1);
+        assert_eq!(entries[0].proof_ids, vec!["corrupt.proof.json [invalid]"]);
+
+        let json = proof_list_to_json(&entries);
+        assert!(json.contains("\"invalid_proof_count\":1"));
+        assert!(json.contains("corrupt.proof.json [invalid]"));
+
+        fs::remove_dir_all(&results_dir).expect("cleanup corrupt proof list temp dir");
+    }
+
+    #[test]
+    fn verify_proof_command_fails_when_stored_proof_is_tampered() {
+        let run_dir = env::temp_dir().join(format!(
+            "pq_dsnark_stored_proof_tamper_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&run_dir).expect("stored proof temp dir");
+
+        let config = Config {
+            protocol: Protocol::R1cs,
+            workers: 1,
+            size: 4,
+            format: OutputFormat::Json,
+            case: CaseSelection::Positive,
+            pcs_queries: 1,
+            worker_core_plan: None,
+        };
+        let output = run_single_positive_job(BenchmarkRunner::Local, Protocol::R1cs, &config, None)
+            .expect("positive R1CS proof job");
+        let proof_entry = write_proof_bundle(
+            &run_dir,
+            "unit-test",
+            &output.record,
+            output.proof,
+            "2026-06-01T00:00:00Z".to_owned(),
+        )
+        .expect("write proof bundle");
+        let proof_id = proof_entry.proof_id.clone();
+        write_proof_index(&run_dir, &[proof_entry]).expect("write proof index");
+
+        let good_report = verify_stored_proofs(&VerifyProofCommand {
+            dir: run_dir.clone(),
+            proof: ProofSelection::All,
+            format: OutputFormat::Json,
+        })
+        .expect("verify intact stored proof");
+        assert_eq!(good_report.outcomes.len(), 1);
+        assert!(good_report.outcomes[0].verified);
+
+        let proof_path = run_dir
+            .join("proofs")
+            .join(format!("{proof_id}.proof.json"));
+        let mut bundle = read_proof_bundle(&proof_path).expect("read stored proof bundle");
+        match &mut bundle.proof {
+            StoredProof::R1cs(proof) => {
+                let tampered = tamper_r1cs_proof(proof).expect("tamper R1CS proof");
+                **proof = tampered;
+            }
+            StoredProof::Plonkish(_) => panic!("test wrote an R1CS proof bundle"),
+        }
+        let tampered_bytes =
+            serde_json::to_vec(&bundle).expect("serialize tampered stored proof bundle");
+        fs::write(&proof_path, tampered_bytes).expect("overwrite stored proof bundle");
+
+        let tampered_report = verify_stored_proofs(&VerifyProofCommand {
+            dir: run_dir.clone(),
+            proof: ProofSelection::One(proof_id.clone()),
+            format: OutputFormat::Json,
+        })
+        .expect("tampered stored proof still produces a report");
+        assert_eq!(tampered_report.outcomes.len(), 1);
+        assert!(!tampered_report.outcomes[0].verified);
+        assert!(tampered_report.outcomes[0].failure_reason.is_some());
+
+        let error = run_verify_proof_command(&[
+            run_dir.display().to_string(),
+            "--proof".to_owned(),
+            proof_id,
+            "--format".to_owned(),
+            "json".to_owned(),
+        ])
+        .expect_err("tampered proof command must exit with an error");
+        assert!(error.0.contains("stored proof verification failed"));
+
+        assert!(run_dir.join("verifications").is_dir());
+        fs::remove_dir_all(&run_dir).expect("cleanup stored proof temp dir");
+    }
+
+    #[test]
+    fn verify_proof_command_fails_when_stored_metadata_is_tampered() {
+        let run_dir = env::temp_dir().join(format!(
+            "pq_dsnark_stored_metadata_tamper_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&run_dir).expect("stored metadata temp dir");
+
+        let config = Config {
+            protocol: Protocol::R1cs,
+            workers: 1,
+            size: 4,
+            format: OutputFormat::Json,
+            case: CaseSelection::Positive,
+            pcs_queries: 1,
+            worker_core_plan: None,
+        };
+        let output = run_single_positive_job(BenchmarkRunner::Local, Protocol::R1cs, &config, None)
+            .expect("positive R1CS proof job");
+        let proof_entry = write_proof_bundle(
+            &run_dir,
+            "unit-test",
+            &output.record,
+            output.proof,
+            "2026-06-01T00:00:00Z".to_owned(),
+        )
+        .expect("write proof bundle");
+        let proof_id = proof_entry.proof_id.clone();
+        write_proof_index(&run_dir, &[proof_entry]).expect("write proof index");
+
+        let proof_path = run_dir
+            .join("proofs")
+            .join(format!("{proof_id}.proof.json"));
+        let mut bundle = read_proof_bundle(&proof_path).expect("read stored proof bundle");
+        bundle.proof_bytes += 1;
+        let tampered_bytes =
+            serde_json::to_vec(&bundle).expect("serialize metadata-tampered proof bundle");
+        fs::write(&proof_path, tampered_bytes).expect("overwrite stored proof bundle");
+
+        let report = verify_stored_proofs(&VerifyProofCommand {
+            dir: run_dir.clone(),
+            proof: ProofSelection::All,
+            format: OutputFormat::Json,
+        })
+        .expect("metadata-tampered stored proof still produces a report");
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(!report.outcomes[0].verified);
+        let reason = report.outcomes[0]
+            .failure_reason
+            .as_deref()
+            .expect("metadata failure reason");
+        assert!(reason.contains("Metadata(proof_bytes"));
+        assert!(reason.contains("ProofIndex(sha256"));
+
+        let error = run_verify_proof_command(&[
+            run_dir.display().to_string(),
+            "--all".to_owned(),
+            "--format".to_owned(),
+            "json".to_owned(),
+        ])
+        .expect_err("metadata-tampered proof command must exit with an error");
+        assert!(error.0.contains("stored proof verification failed"));
+
+        assert!(run_dir.join("verifications").is_dir());
+        fs::remove_dir_all(&run_dir).expect("cleanup stored metadata temp dir");
+    }
+
+    #[test]
+    fn verify_proof_command_reports_corrupt_stored_proof_json() {
+        let run_dir = env::temp_dir().join(format!(
+            "pq_dsnark_corrupt_stored_proof_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&run_dir).expect("corrupt proof temp dir");
+
+        let config = Config {
+            protocol: Protocol::R1cs,
+            workers: 1,
+            size: 4,
+            format: OutputFormat::Json,
+            case: CaseSelection::Positive,
+            pcs_queries: 1,
+            worker_core_plan: None,
+        };
+        let output = run_single_positive_job(BenchmarkRunner::Local, Protocol::R1cs, &config, None)
+            .expect("positive R1CS proof job");
+        let proof_entry = write_proof_bundle(
+            &run_dir,
+            "unit-test",
+            &output.record,
+            output.proof,
+            "2026-06-01T00:00:00Z".to_owned(),
+        )
+        .expect("write proof bundle");
+        let proof_id = proof_entry.proof_id.clone();
+        write_proof_index(&run_dir, &[proof_entry]).expect("write proof index");
+
+        let proof_path = run_dir
+            .join("proofs")
+            .join(format!("{proof_id}.proof.json"));
+        fs::write(&proof_path, b"{not valid json").expect("overwrite proof with corrupt json");
+
+        let report = verify_stored_proofs(&VerifyProofCommand {
+            dir: run_dir.clone(),
+            proof: ProofSelection::All,
+            format: OutputFormat::Json,
+        })
+        .expect("corrupt stored proof still produces a report");
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(!report.outcomes[0].verified);
+        assert_eq!(report.outcomes[0].protocol, "unknown");
+        assert!(
+            report.outcomes[0]
+                .failure_reason
+                .as_deref()
+                .expect("corrupt proof failure reason")
+                .contains("ProofBundle(parse proof bundle")
+        );
+        assert!(report.report_json.exists());
+        assert!(report.report_html.exists());
+
+        let error = run_verify_proof_command(&[
+            run_dir.display().to_string(),
+            "--all".to_owned(),
+            "--format".to_owned(),
+            "json".to_owned(),
+        ])
+        .expect_err("corrupt proof command must exit with an error after reporting");
+        assert!(error.0.contains("stored proof verification failed"));
+
+        fs::remove_dir_all(&run_dir).expect("cleanup corrupt proof temp dir");
+    }
+
+    #[test]
+    fn unix_timestamp_label_is_second_precision_utc() {
+        assert_eq!(
+            unix_timestamp_label(0).expect("epoch label"),
+            "19700101-000000"
+        );
+        assert_eq!(
+            unix_timestamp_label(1_780_308_024).expect("sample label"),
+            "20260601-100024"
+        );
     }
 
     #[test]
@@ -8077,7 +10503,7 @@ mod tests {
         fs::remove_dir_all(&manifest_dir).expect("cleanup manifest temp dir");
 
         let semantic_dir = env::temp_dir().join(format!(
-            "pq_dsnark_semantic_result_test_{}",
+            "bench-pq_dsnark_semantic_result_test_{}",
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .expect("clock")
@@ -8247,9 +10673,9 @@ mod tests {
             if artifact != RESULT_MANIFEST && !semantic_dir.join(artifact).exists() {
                 write_text_file(
                     &semantic_dir.join(artifact),
-                    &format!("semantic placeholder for {artifact}\n"),
+                    &format!("invalid semantic fixture for {artifact}\n"),
                 )
-                .expect("write semantic placeholder");
+                .expect("write invalid semantic fixture");
             }
         }
         let semantic_manifest =
