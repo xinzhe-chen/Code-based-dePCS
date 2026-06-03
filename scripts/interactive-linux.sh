@@ -41,6 +41,22 @@ prompt_text() {
   printf '%s' "$value"
 }
 
+prompt_text_hidden_default() {
+  local prompt="$1"
+  local default="$2"
+  local value
+  printf '%s: ' "$prompt" >&2
+  if ! IFS= read -r value; then
+    value="$default"
+  fi
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ -z "$value" ]]; then
+    value="$default"
+  fi
+  printf '%s' "$value"
+}
+
 prompt_choice() {
   local prompt="$1"
   local default="$2"
@@ -431,7 +447,8 @@ proof_wizard() {
   fi
   n_power="$(prompt_required_text 'circuit size exponent n for nv=2^n')"
   workers="$(prompt_required_text 'worker count')"
-  pcs_queries="$(prompt_required_text 'PCS query count')"
+  pcs_queries="1"
+  step "PCS queries fixed at 1 for fastest interactive runs"
   args=(proof-experiment --protocol "$protocol" --runner "$runner" --n "$n_power" --workers "$workers" --pcs-queries "$pcs_queries")
   step "building release pq-experiments"
   build_experiment_binary release
@@ -451,6 +468,21 @@ max_worker_from_csv() {
     fi
   done
   printf '%s' "$max"
+}
+
+max_power_of_two_exponent() {
+  local value="$1"
+  local exponent=0
+  local power=1
+  if ((value < 1)); then
+    printf '0'
+    return 0
+  fi
+  while ((power * 2 <= value)); do
+    power=$((power * 2))
+    exponent=$((exponent + 1))
+  done
+  printf '%s' "$exponent"
 }
 
 power_range_to_csv() {
@@ -505,11 +537,6 @@ confirm_benchmark_grid() {
   runner_count="$(runner_variant_count "$runner")"
   total_jobs=$((size_count * worker_count * 2 * runner_count))
   step "benchmark grid: sizes=$size_label size_count=$size_count workers=$workers total_jobs=$total_jobs"
-  if confirm_required_choice "Run this benchmark grid"; then
-    return 0
-  fi
-  step "benchmark cancelled"
-  return 1
 }
 
 show_benchmark_core_plan() {
@@ -535,50 +562,50 @@ benchmark_wizard() {
   printf 'Each benchmark job runs one real end-to-end prove+verify path. Correctness tests are not included.\n'
   printf 'During execution, pq-experiments prints an exact completed-jobs progress bar before and after each real job.\n'
 
-  local runner args paper_preset compile_figures
-  if confirm_required_choice "Use the full paper-quality benchmark grid"; then
-    paper_preset=true
-  else
-    paper_preset=false
-  fi
+  local runner args
+  local host_cores host_worker_max default_worker_max
+  host_cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')"
+  host_worker_max="$(max_power_of_two_exponent "$host_cores")"
+  step "detected host logical cores: $host_cores; host can support worker exponent up to $host_worker_max before circuit-size limits"
   runner="$(prompt_required_choice 'runner local|network|both' local network both)"
   if [[ "$runner" != "local" ]]; then
     ensure_toolchain_for_action true
   fi
   args=(benchmark --runner "$runner" --repeats 1)
-  local size_count=5
-  local size_label="2^2..2^6"
-  local workers="1,2,4"
-  if [[ "$paper_preset" == "true" ]]; then
-    args+=(--paper-preset)
+  local n_min n_max n_range worker_min worker_max worker_range pcs_queries workers size_count size_label
+  n_min="$(prompt_text_hidden_default 'minimum circuit size exponent n for nv=2^n' '8')"
+  n_max="$(prompt_text_hidden_default 'maximum circuit size exponent n for nv=2^n' '10')"
+  if ((n_min > n_max)); then
+    printf 'minimum circuit size exponent must be <= maximum circuit size exponent\n' >&2
+    return 1
+  fi
+  n_range="${n_min}..${n_max}"
+  size_count="$((n_max - n_min + 1))"
+  size_label="2^${n_min}..2^${n_max}"
+  if ((host_worker_max < n_min)); then
+    default_worker_max="$host_worker_max"
   else
-    local n_min n_max n_range worker_min worker_max worker_range pcs_queries
-    n_min="$(prompt_required_text 'minimum circuit size exponent n for nv=2^n')"
-    n_max="$(prompt_required_text 'maximum circuit size exponent n for nv=2^n')"
-    if ((n_min > n_max)); then
-      printf 'minimum circuit size exponent must be <= maximum circuit size exponent\n' >&2
-      return 1
-    fi
-    n_range="${n_min}..${n_max}"
-    size_count="$((n_max - n_min + 1))"
-    size_label="2^${n_min}..2^${n_max}"
-    worker_min="$(prompt_required_text 'minimum worker exponent for workers=2^w')"
-    worker_max="$(prompt_required_text 'maximum worker exponent for workers=2^w')"
-    if ((worker_min > worker_max)); then
-      printf 'minimum worker exponent must be <= maximum worker exponent\n' >&2
-      return 1
-    fi
-    worker_range="${worker_min}..${worker_max}"
-    workers="$(power_range_to_csv "$worker_range")"
-    pcs_queries="$(prompt_required_text 'PCS query count')"
-    show_benchmark_core_plan "$runner" "$workers"
-    args+=(--n-range "$n_range" --worker-power-range "$worker_range" --pcs-queries "$pcs_queries")
+    default_worker_max="$n_min"
   fi
-  confirm_benchmark_grid "$runner" "$size_count" "$size_label" "$workers" || return 0
-  if confirm_required_choice "Compile paper figures after the run"; then
-    ensure_toolchain_for_action false true
-    args+=(--compile-figures --figure-compiler auto)
+  if ((default_worker_max > 3)); then
+    default_worker_max=3
   fi
+  worker_min="$(prompt_text_hidden_default 'minimum worker exponent for workers=2^w' '0')"
+  worker_max="$(prompt_text_hidden_default 'maximum worker exponent for workers=2^w' "$default_worker_max")"
+  if ((worker_min > worker_max)); then
+    printf 'minimum worker exponent must be <= maximum worker exponent\n' >&2
+    return 1
+  fi
+  worker_range="${worker_min}..${worker_max}"
+  workers="$(power_range_to_csv "$worker_range")"
+  pcs_queries="1"
+  step "PCS queries fixed at 1 for fastest interactive runs"
+  show_benchmark_core_plan "$runner" "$workers"
+  args+=(--n-range "$n_range" --worker-power-range "$worker_range" --pcs-queries "$pcs_queries")
+  confirm_benchmark_grid "$runner" "$size_count" "$size_label" "$workers"
+  step "figure compilation is enabled by default"
+  ensure_toolchain_for_action false true
+  args+=(--compile-figures --figure-compiler auto)
   step "building release pq-experiments"
   local bin
   build_experiment_binary release

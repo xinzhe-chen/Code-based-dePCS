@@ -22,15 +22,19 @@ use pq_pcs::{
     DistributedPcsParams, PcsError, WorkerOpening, WorkerOpeningRequest,
 };
 use pq_piop_plonkish::{
-    PlonkishInstance, PlonkishPcsOpening, PlonkishPiopError, PlonkishPiopProof,
-    proof_communication_bytes as plonkish_proof_communication_bytes, prove_plonkish_with_pcs_hooks,
+    PlonkishInstance, PlonkishPcsOpening, PlonkishPhaseTiming, PlonkishPiopError,
+    PlonkishPiopProof, collect_plonkish_phase_timings,
+    proof_communication_bytes as plonkish_proof_communication_bytes,
+    proof_size_breakdown as plonkish_proof_size_breakdown, prove_plonkish_with_pcs_hooks,
     prove_plonkish_with_pcs_params, sample_plonkish_instance, verify_plonkish_with_pcs_params,
 };
 use pq_piop_r1cs::{
-    R1csBatchProverHooks, R1csPcsOpening, R1csPiopError, R1csPiopProof, SparkWorkerClaimRequest,
-    SparkWorkerShardClaim, proof_communication_bytes as r1cs_proof_communication_bytes,
-    proof_size_bytes as r1cs_proof_size_bytes, prove_r1cs_with_pcs_and_spark_batch_hooks,
-    prove_r1cs_with_pcs_params, verify_r1cs_with_pcs_params,
+    R1csBatchProverHooks, R1csPcsOpening, R1csPhaseTiming, R1csPiopError, R1csPiopProof,
+    SparkWorkerClaimRequest, SparkWorkerShardClaim, collect_r1cs_phase_timings,
+    proof_communication_bytes as r1cs_proof_communication_bytes,
+    proof_size_breakdown as r1cs_proof_size_breakdown, proof_size_bytes as r1cs_proof_size_bytes,
+    prove_r1cs_with_pcs_and_spark_batch_hooks, prove_r1cs_with_pcs_params,
+    verify_r1cs_with_pcs_params,
 };
 use pq_transcript::{HashTranscript, Transcript, sha256};
 use serde::{Deserialize, Serialize};
@@ -239,6 +243,8 @@ struct ProofBundle {
     proof_bytes: usize,
     communication_bytes: usize,
     network_bytes: usize,
+    #[serde(default)]
+    stage_breakdown: StageBreakdown,
     host_logical_cores: Option<usize>,
     cores_per_worker: Option<usize>,
     core_affinity: Option<String>,
@@ -403,10 +409,10 @@ const BASE_BENCHMARK_ARTIFACTS: &[&str] = &[
 const COMPILED_PAPER_FIGURE: &str = "paper_figures_standalone.pdf";
 const RESULT_MANIFEST: &str = "result_manifest.json";
 const OVERVIEW_HTML: &str = "overview.html";
-const SOURCE_CSV_HEADER: &str = "protocol,runner,case,trial,workers,nv_power,size,constraints,pcs_queries,prove_ms,verify_ms,proof_bytes,communication_bytes,network_bytes,host_logical_cores,cores_per_worker,core_affinity,verified,failure_reason";
+const SOURCE_CSV_HEADER: &str = "protocol,runner,case,trial,workers,nv_power,size,constraints,pcs_queries,prove_ms,verify_ms,prove_pcs_commit_ms,prove_sumcheck_ms,prove_batch_open_ms,prove_other_ms,verify_pcs_open_ms,verify_sumcheck_ms,verify_other_ms,proof_bytes,proof_pcs_bytes,proof_sumcheck_bytes,proof_other_bytes,communication_bytes,network_bytes,host_logical_cores,cores_per_worker,core_affinity,verified,failure_reason";
 const PHASE_TIMING_CSV_HEADER: &str =
     "phase,detail,elapsed_ms,recorded_prove_ms,recorded_verify_ms,inferred_overhead_ms";
-const SUMMARY_STATS_CSV_HEADER: &str = "protocol,runner,case,workers,nv_power,size,constraints,pcs_queries,samples,verified_count,rejected_count,prove_ms_mean,prove_ms_stddev,verify_ms_mean,verify_ms_stddev,proof_bytes_mean,proof_bytes_stddev,communication_bytes_mean,communication_bytes_stddev,network_bytes_mean,network_bytes_stddev,failure_reasons";
+const SUMMARY_STATS_CSV_HEADER: &str = "protocol,runner,case,workers,nv_power,size,constraints,pcs_queries,samples,verified_count,rejected_count,prove_ms_mean,prove_ms_stddev,verify_ms_mean,verify_ms_stddev,prove_pcs_commit_ms_mean,prove_sumcheck_ms_mean,prove_batch_open_ms_mean,verify_pcs_open_ms_mean,verify_sumcheck_ms_mean,proof_bytes_mean,proof_bytes_stddev,proof_pcs_bytes_mean,proof_sumcheck_bytes_mean,proof_other_bytes_mean,communication_bytes_mean,communication_bytes_stddev,network_bytes_mean,network_bytes_stddev,failure_reasons";
 const PAPER_PRESET_NV_START: usize = 2;
 const PAPER_PRESET_NV_END: usize = 6;
 const PAPER_PRESET_WORKERS: &[usize] = &[1, 2, 4];
@@ -445,6 +451,7 @@ struct MetricRecord {
     constraints: usize,
     prove_ms: f64,
     verify_ms: f64,
+    stages: StageBreakdown,
     proof_bytes: usize,
     communication_bytes: usize,
     network_bytes: usize,
@@ -454,6 +461,20 @@ struct MetricRecord {
     core_affinity: Option<&'static str>,
     verified: bool,
     failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StageBreakdown {
+    prove_pcs_commit_ms: f64,
+    prove_sumcheck_ms: f64,
+    prove_batch_open_ms: f64,
+    prove_other_ms: f64,
+    verify_pcs_open_ms: f64,
+    verify_sumcheck_ms: f64,
+    verify_other_ms: f64,
+    proof_pcs_bytes: usize,
+    proof_sumcheck_bytes: usize,
+    proof_other_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -486,7 +507,15 @@ struct BenchmarkStatsRecord {
     rejected_count: usize,
     prove_ms: MeanStddev,
     verify_ms: MeanStddev,
+    prove_pcs_commit_ms: MeanStddev,
+    prove_sumcheck_ms: MeanStddev,
+    prove_batch_open_ms: MeanStddev,
+    verify_pcs_open_ms: MeanStddev,
+    verify_sumcheck_ms: MeanStddev,
     proof_bytes: MeanStddev,
+    proof_pcs_bytes: MeanStddev,
+    proof_sumcheck_bytes: MeanStddev,
+    proof_other_bytes: MeanStddev,
     communication_bytes: MeanStddev,
     network_bytes: MeanStddev,
     failure_reasons: Vec<String>,
@@ -915,6 +944,50 @@ fn configure_benchmark_core_plan(command: &mut BenchmarkCommand) -> Result<(), C
     Ok(())
 }
 
+fn configure_benchmark_rayon_pool(command: &BenchmarkCommand) {
+    let threads = benchmark_rayon_thread_count(command);
+    configure_rayon_pool(threads);
+}
+
+fn configure_rayon_pool(threads: usize) {
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+    {
+        Ok(()) => {
+            eprintln!("[pq_dSNARK] rayon worker threads configured: {threads}");
+        }
+        Err(error) => {
+            eprintln!(
+                "[pq_dSNARK] rayon global pool already active with {} threads ({error})",
+                rayon::current_num_threads()
+            );
+        }
+    }
+}
+
+fn benchmark_rayon_thread_count(command: &BenchmarkCommand) -> usize {
+    if let Some(plan) = &command.worker_core_plan {
+        return (plan.cores_per_worker * plan.max_workers)
+            .min(plan.host_logical_cores)
+            .max(1);
+    }
+    command
+        .host_logical_cores
+        .unwrap_or_else(detect_host_logical_cores)
+        .max(1)
+}
+
+fn detect_host_logical_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+}
+
+fn worker_rayon_threads(core_ids: &[usize]) -> usize {
+    core_ids.len().max(1)
+}
+
 fn parse_benchmark_runner(value: &str) -> Result<BenchmarkRunner, CliError> {
     match value {
         "local" => Ok(BenchmarkRunner::Local),
@@ -1213,6 +1286,7 @@ fn run_benchmark_command_inner(args: &[String]) -> Result<PathBuf, CliError> {
     let setup_start = Instant::now();
     let mut command = parse_benchmark_command(args)?;
     configure_benchmark_core_plan(&mut command)?;
+    configure_benchmark_rayon_pool(&command);
     let (run_id, _run_label, run_dir) = create_result_run_dir(&command.out_dir, "performance")?;
 
     let mut records = Vec::new();
@@ -1693,6 +1767,7 @@ fn validate_benchmark_job_records(
 
 fn run_proof_experiment_command(args: &[String]) -> Result<(), CliError> {
     let command = parse_proof_experiment_command(args)?;
+    configure_rayon_pool(detect_host_logical_cores());
     let (run_id, run_label, run_dir) = create_result_run_dir(&command.out_dir, "proof")?;
 
     let mut records = Vec::new();
@@ -2190,9 +2265,9 @@ fn verify_source_csv_row(
     actual: &mut BTreeSet<(String, String, usize, usize, usize)>,
     context: &str,
 ) -> Result<(), CliError> {
-    if fields.len() != 19 {
+    if fields.len() != 29 {
         return Err(CliError(format!(
-            "{context} row {row} has {} fields, expected 19",
+            "{context} row {row} has {} fields, expected 29",
             fields.len()
         )));
     }
@@ -2207,15 +2282,31 @@ fn verify_source_csv_row(
     let row_pcs_queries = parse_csv_usize_context(&fields[8], "pcs_queries", row, context)?;
     let prove_ms = parse_csv_f64_context(&fields[9], "prove_ms", row, context)?;
     let verify_ms = parse_csv_f64_context(&fields[10], "verify_ms", row, context)?;
-    let proof_bytes = parse_csv_usize_context(&fields[11], "proof_bytes", row, context)?;
+    let prove_pcs_commit_ms =
+        parse_csv_f64_context(&fields[11], "prove_pcs_commit_ms", row, context)?;
+    let prove_sumcheck_ms = parse_csv_f64_context(&fields[12], "prove_sumcheck_ms", row, context)?;
+    let prove_batch_open_ms =
+        parse_csv_f64_context(&fields[13], "prove_batch_open_ms", row, context)?;
+    let prove_other_ms = parse_csv_f64_context(&fields[14], "prove_other_ms", row, context)?;
+    let verify_pcs_open_ms =
+        parse_csv_f64_context(&fields[15], "verify_pcs_open_ms", row, context)?;
+    let verify_sumcheck_ms =
+        parse_csv_f64_context(&fields[16], "verify_sumcheck_ms", row, context)?;
+    let verify_other_ms = parse_csv_f64_context(&fields[17], "verify_other_ms", row, context)?;
+    let proof_bytes = parse_csv_usize_context(&fields[18], "proof_bytes", row, context)?;
+    let proof_pcs_bytes = parse_csv_usize_context(&fields[19], "proof_pcs_bytes", row, context)?;
+    let proof_sumcheck_bytes =
+        parse_csv_usize_context(&fields[20], "proof_sumcheck_bytes", row, context)?;
+    let proof_other_bytes =
+        parse_csv_usize_context(&fields[21], "proof_other_bytes", row, context)?;
     let communication_bytes =
-        parse_csv_usize_context(&fields[12], "communication_bytes", row, context)?;
-    let network_bytes = parse_csv_usize_context(&fields[13], "network_bytes", row, context)?;
-    let host_logical_cores = fields[14].as_str();
-    let cores_per_worker = fields[15].as_str();
-    let core_affinity = fields[16].as_str();
-    let verified = fields[17].as_str();
-    let failure_reason = fields[18].as_str();
+        parse_csv_usize_context(&fields[22], "communication_bytes", row, context)?;
+    let network_bytes = parse_csv_usize_context(&fields[23], "network_bytes", row, context)?;
+    let host_logical_cores = fields[24].as_str();
+    let cores_per_worker = fields[25].as_str();
+    let core_affinity = fields[26].as_str();
+    let verified = fields[27].as_str();
+    let failure_reason = fields[28].as_str();
 
     if !["r1cs", "plonkish"].contains(&protocol) {
         return Err(CliError(format!(
@@ -2259,6 +2350,11 @@ fn verify_source_csv_row(
             "{context} row {row} has zero constraints, proof bytes, or communication bytes"
         )));
     }
+    if proof_pcs_bytes + proof_sumcheck_bytes + proof_other_bytes != proof_bytes {
+        return Err(CliError(format!(
+            "{context} row {row} proof-size breakdown does not sum to proof_bytes"
+        )));
+    }
     if row_pcs_queries != grid.pcs_queries {
         return Err(CliError(format!(
             "{context} row {row} pcs_queries expected {}, got {row_pcs_queries}",
@@ -2268,6 +2364,27 @@ fn verify_source_csv_row(
     if !prove_ms.is_finite() || !verify_ms.is_finite() || prove_ms <= 0.0 || verify_ms <= 0.0 {
         return Err(CliError(format!(
             "{context} row {row} has non-positive or non-finite timing"
+        )));
+    }
+    for (name, value) in [
+        ("prove_pcs_commit_ms", prove_pcs_commit_ms),
+        ("prove_sumcheck_ms", prove_sumcheck_ms),
+        ("prove_batch_open_ms", prove_batch_open_ms),
+        ("prove_other_ms", prove_other_ms),
+        ("verify_pcs_open_ms", verify_pcs_open_ms),
+        ("verify_sumcheck_ms", verify_sumcheck_ms),
+        ("verify_other_ms", verify_other_ms),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(CliError(format!("{context} row {row} has invalid {name}")));
+        }
+    }
+    let prove_stage_sum =
+        prove_pcs_commit_ms + prove_sumcheck_ms + prove_batch_open_ms + prove_other_ms;
+    let verify_stage_sum = verify_pcs_open_ms + verify_sumcheck_ms + verify_other_ms;
+    if (prove_stage_sum - prove_ms).abs() > 2.0 || (verify_stage_sum - verify_ms).abs() > 2.0 {
+        return Err(CliError(format!(
+            "{context} row {row} stage timing sums do not match total prove/verify time"
         )));
     }
     match runner {
@@ -2347,9 +2464,9 @@ fn verify_summary_stats_csv_semantics(
                 error.0
             ))
         })?;
-        if fields.len() != 22 {
+        if fields.len() != 30 {
             return Err(CliError(format!(
-                "summary_stats.csv row {} has {} fields, expected 22",
+                "summary_stats.csv row {} has {} fields, expected 30",
                 line_index + 2,
                 fields.len()
             )));
@@ -2395,6 +2512,60 @@ fn verify_summary_stats_csv_semantics(
             line_index + 2,
             "summary_stats.csv",
         )?;
+        let prove_pcs_commit_ms = parse_csv_f64_context(
+            &fields[15],
+            "prove_pcs_commit_ms_mean",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let prove_sumcheck_ms = parse_csv_f64_context(
+            &fields[16],
+            "prove_sumcheck_ms_mean",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let prove_batch_open_ms = parse_csv_f64_context(
+            &fields[17],
+            "prove_batch_open_ms_mean",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let verify_pcs_open_ms = parse_csv_f64_context(
+            &fields[18],
+            "verify_pcs_open_ms_mean",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let verify_sumcheck_ms = parse_csv_f64_context(
+            &fields[19],
+            "verify_sumcheck_ms_mean",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let proof_bytes = parse_csv_f64_context(
+            &fields[20],
+            "proof_bytes_mean",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let proof_pcs_bytes = parse_csv_f64_context(
+            &fields[22],
+            "proof_pcs_bytes_mean",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let proof_sumcheck_bytes = parse_csv_f64_context(
+            &fields[23],
+            "proof_sumcheck_bytes_mean",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
+        let proof_other_bytes = parse_csv_f64_context(
+            &fields[24],
+            "proof_other_bytes_mean",
+            line_index + 2,
+            "summary_stats.csv",
+        )?;
         if !["r1cs", "plonkish"].contains(&protocol)
             || !grid.runner_names.contains(&runner)
             || case != "positive"
@@ -2408,6 +2579,15 @@ fn verify_summary_stats_csv_semantics(
             || rejected_count != 0
             || prove_ms <= 0.0
             || verify_ms <= 0.0
+            || prove_pcs_commit_ms < 0.0
+            || prove_sumcheck_ms < 0.0
+            || prove_batch_open_ms < 0.0
+            || verify_pcs_open_ms < 0.0
+            || verify_sumcheck_ms < 0.0
+            || proof_bytes <= 0.0
+            || proof_pcs_bytes < 0.0
+            || proof_sumcheck_bytes < 0.0
+            || proof_other_bytes < 0.0
         {
             return Err(CliError(format!(
                 "summary_stats.csv row {} is inconsistent with metadata/source performance grid",
@@ -3910,6 +4090,14 @@ fn spawn_platform_affinity_worker(
         .collect::<Vec<_>>()
         .join(",");
     Command::new("taskset")
+        .env(
+            "RAYON_NUM_THREADS",
+            worker_rayon_threads(core_ids).to_string(),
+        )
+        .env("PQ_CORE_PARALLEL_MIN_ITEMS", "64")
+        .env("PQ_CORE_PARALLEL_MIN_ROWS", "64")
+        .env("PQ_PCS_PARALLEL_MIN_ITEMS", "64")
+        .env("PQ_SUMCHECK_PARALLEL_MIN_ITEMS", "64")
         .arg("-c")
         .arg(&core_list)
         .arg(exe)
@@ -3944,8 +4132,10 @@ fn spawn_platform_affinity_worker(
         "--id".to_owned(),
         worker_id.to_string(),
     ];
+    let rayon_threads = worker_rayon_threads(core_ids);
     let command = format!(
-        "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath {} -ArgumentList {} -WindowStyle Hidden -PassThru; $p.ProcessorAffinity = [IntPtr]{}; $p.WaitForExit(); exit $p.ExitCode",
+        "$ErrorActionPreference='Stop'; $env:RAYON_NUM_THREADS='{}'; $env:PQ_CORE_PARALLEL_MIN_ITEMS='64'; $env:PQ_CORE_PARALLEL_MIN_ROWS='64'; $env:PQ_PCS_PARALLEL_MIN_ITEMS='64'; $env:PQ_SUMCHECK_PARALLEL_MIN_ITEMS='64'; $p = Start-Process -FilePath {} -ArgumentList {} -WindowStyle Hidden -PassThru; $p.ProcessorAffinity = [IntPtr]{}; $p.WaitForExit(); exit $p.ExitCode",
+        rayon_threads,
         powershell_quote(&exe.display().to_string()),
         powershell_array(&args),
         mask
@@ -4103,7 +4293,10 @@ fn run_r1cs_case_with_proof(
     let (instance, witness) = sample_r1cs(config.size)?;
 
     let prove_start = Instant::now();
-    let proof = prove_r1cs_for_instance(&instance, &witness, config.workers, config.pcs_queries)?;
+    let (proof_result, prove_phases) = collect_r1cs_phase_timings(|| {
+        prove_r1cs_for_instance(&instance, &witness, config.workers, config.pcs_queries)
+    });
+    let proof = proof_result?;
     let prove_time = prove_start.elapsed();
 
     let verify_proof = if tamper {
@@ -4112,7 +4305,9 @@ fn run_r1cs_case_with_proof(
         proof.clone()
     };
     let verify_start = Instant::now();
-    let verification = verify_r1cs_for_instance(&instance, &verify_proof, config.pcs_queries);
+    let (verification, verify_phases) = collect_r1cs_phase_timings(|| {
+        verify_r1cs_for_instance(&instance, &verify_proof, config.pcs_queries)
+    });
     let verify_time = verify_start.elapsed();
     let verified = verification.is_ok();
     let failure_reason = verification
@@ -4122,6 +4317,13 @@ fn run_r1cs_case_with_proof(
     let (proof_bytes, communication_bytes) = verification
         .map(|metrics| (metrics.proof_bytes, metrics.communication_bytes))
         .unwrap_or_else(|_| r1cs_fallback_metrics(&proof));
+    let stages = r1cs_stage_breakdown(
+        &proof,
+        prove_time,
+        verify_time,
+        &prove_phases,
+        &verify_phases,
+    );
 
     let record = MetricRecord {
         protocol: Protocol::R1cs.as_str(),
@@ -4133,6 +4335,7 @@ fn run_r1cs_case_with_proof(
         constraints: instance.num_constraints(),
         prove_ms: millis(prove_time),
         verify_ms: millis(verify_time),
+        stages,
         proof_bytes,
         communication_bytes,
         network_bytes: 0,
@@ -4172,39 +4375,43 @@ fn run_r1cs_case_network_with_proof(
 
     let prove_start = Instant::now();
     let mut transcript = HashTranscript::new(b"pq-experiments-r1cs");
-    let proof = prove_r1cs_with_pcs_and_spark_batch_hooks(
-        &instance,
-        &witness,
-        config.workers,
-        DistributedPcsParams::new(config.pcs_queries),
-        &mut transcript,
-        R1csBatchProverHooks {
-            commit_distributed: |evaluations: &[FieldElement], workers: usize| {
-                backend
-                    .borrow_mut()
-                    .commit(evaluations, workers)
-                    .map_err(|_| R1csPiopError::Pcs)
+    let (proof_result, prove_phases) = collect_r1cs_phase_timings(|| {
+        prove_r1cs_with_pcs_and_spark_batch_hooks(
+            &instance,
+            &witness,
+            config.workers,
+            DistributedPcsParams::new(config.pcs_queries),
+            &mut transcript,
+            R1csBatchProverHooks {
+                commit_distributed: |evaluations: &[FieldElement], workers: usize| {
+                    backend
+                        .borrow_mut()
+                        .commit(evaluations, workers)
+                        .map_err(|_| R1csPiopError::Pcs)
+                },
+                open_distributed:
+                    |evaluations: &[FieldElement],
+                     commitment: &DistributedCommitment,
+                     point: &[FieldElement],
+                     params: DistributedPcsParams,
+                     transcript: &mut HashTranscript| {
+                        backend
+                            .borrow_mut()
+                            .open_compact(evaluations, commitment, point, params, transcript)
+                            .map(R1csPcsOpening::Compact)
+                            .map_err(|_| R1csPiopError::Pcs)
+                    },
+                spark_worker_provider: |requests: &[SparkWorkerClaimRequest<'_>]| {
+                    backend
+                        .borrow_mut()
+                        .r1cs_spark_claims(&instance, requests)
+                        .map_err(|_| R1csPiopError::InvalidProof)
+                },
             },
-            open_distributed: |evaluations: &[FieldElement],
-                               commitment: &DistributedCommitment,
-                               point: &[FieldElement],
-                               params: DistributedPcsParams,
-                               transcript: &mut HashTranscript| {
-                backend
-                    .borrow_mut()
-                    .open_compact(evaluations, commitment, point, params, transcript)
-                    .map(R1csPcsOpening::Compact)
-                    .map_err(|_| R1csPiopError::Pcs)
-            },
-            spark_worker_provider: |requests: &[SparkWorkerClaimRequest<'_>]| {
-                backend
-                    .borrow_mut()
-                    .r1cs_spark_claims(&instance, requests)
-                    .map_err(|_| R1csPiopError::InvalidProof)
-            },
-        },
-    )
-    .map_err(|error| CliError(format!("network R1CS prove failed: {error:?}")))?;
+        )
+    });
+    let proof =
+        proof_result.map_err(|error| CliError(format!("network R1CS prove failed: {error:?}")))?;
     let prove_time = prove_start.elapsed();
     let network_bytes = backend.borrow().bytes();
 
@@ -4214,7 +4421,9 @@ fn run_r1cs_case_network_with_proof(
         proof.clone()
     };
     let verify_start = Instant::now();
-    let verification = verify_r1cs_for_instance(&instance, &verify_proof, config.pcs_queries);
+    let (verification, verify_phases) = collect_r1cs_phase_timings(|| {
+        verify_r1cs_for_instance(&instance, &verify_proof, config.pcs_queries)
+    });
     let verify_time = verify_start.elapsed();
     let verified = verification.is_ok();
     let failure_reason = verification
@@ -4224,6 +4433,13 @@ fn run_r1cs_case_network_with_proof(
     let (proof_bytes, communication_bytes) = verification
         .map(|metrics| (metrics.proof_bytes, metrics.communication_bytes))
         .unwrap_or_else(|_| r1cs_fallback_metrics(&proof));
+    let stages = r1cs_stage_breakdown(
+        &proof,
+        prove_time,
+        verify_time,
+        &prove_phases,
+        &verify_phases,
+    );
 
     let record = MetricRecord {
         protocol: Protocol::R1cs.as_str(),
@@ -4235,6 +4451,7 @@ fn run_r1cs_case_network_with_proof(
         constraints: instance.num_constraints(),
         prove_ms: millis(prove_time),
         verify_ms: millis(verify_time),
+        stages,
         proof_bytes,
         communication_bytes,
         network_bytes,
@@ -4703,62 +4920,85 @@ fn run_plonkish_case_with_proof(
         .map_err(|error| CliError(format!("Plonkish sample failed: {error:?}")))?;
 
     let prove_start = Instant::now();
-    let proof = prove_for_instance(&instance, config.workers, config.pcs_queries)?;
+    let (proof_result, prove_phases) = collect_plonkish_phase_timings(|| {
+        prove_for_instance(&instance, config.workers, config.pcs_queries)
+    });
+    let proof = proof_result?;
     let prove_time = prove_start.elapsed();
 
-    let (verify_time, verified, failure_reason, proof_bytes, communication_bytes, constraints) =
-        if tamper {
-            let verify_start = Instant::now();
-            let failure_reason =
-                verify_plonkish_negative_variants(&instance, &proof, config.pcs_queries)?;
-            let verify_time = verify_start.elapsed();
-            let residuals = instance
-                .constraint_residuals()
-                .map_err(|error| CliError(format!("Plonkish residuals failed: {error:?}")))?;
-            (
-                verify_time,
-                false,
-                Some(failure_reason),
-                pq_piop_plonkish::proof_size_bytes(&proof),
-                plonkish_proof_communication_bytes(&proof),
-                residuals.len(),
-            )
-        } else {
-            let verify_start = Instant::now();
-            let verification = verify_for_instance(&instance, &proof, config.pcs_queries);
-            let verify_time = verify_start.elapsed();
-            let verified = verification.is_ok();
-            let failure_reason = verification
-                .as_ref()
-                .err()
-                .map(|error| format!("{error:?}"));
-            let (proof_bytes, communication_bytes, constraints) = match verification {
-                Ok(metrics) => (
-                    metrics.proof_bytes,
-                    metrics.communication_bytes,
-                    metrics.constraints,
-                ),
-                Err(_) => {
-                    let residuals = instance.constraint_residuals().map_err(|error| {
-                        CliError(format!("Plonkish residuals failed: {error:?}"))
-                    })?;
-                    let communication_bytes = plonkish_proof_communication_bytes(&proof);
-                    (
-                        pq_piop_plonkish::proof_size_bytes(&proof),
-                        communication_bytes,
-                        residuals.len(),
-                    )
-                }
-            };
-            (
-                verify_time,
-                verified,
-                failure_reason,
-                proof_bytes,
-                communication_bytes,
-                constraints,
-            )
+    let (
+        verify_time,
+        verify_phases,
+        verified,
+        failure_reason,
+        proof_bytes,
+        communication_bytes,
+        constraints,
+    ) = if tamper {
+        let verify_start = Instant::now();
+        let (failure_result, verify_phases) = collect_plonkish_phase_timings(|| {
+            verify_plonkish_negative_variants(&instance, &proof, config.pcs_queries)
+        });
+        let failure_reason = failure_result?;
+        let verify_time = verify_start.elapsed();
+        let residuals = instance
+            .constraint_residuals()
+            .map_err(|error| CliError(format!("Plonkish residuals failed: {error:?}")))?;
+        (
+            verify_time,
+            verify_phases,
+            false,
+            Some(failure_reason),
+            pq_piop_plonkish::proof_size_bytes(&proof),
+            plonkish_proof_communication_bytes(&proof),
+            residuals.len(),
+        )
+    } else {
+        let verify_start = Instant::now();
+        let (verification, verify_phases) = collect_plonkish_phase_timings(|| {
+            verify_for_instance(&instance, &proof, config.pcs_queries)
+        });
+        let verify_time = verify_start.elapsed();
+        let verified = verification.is_ok();
+        let failure_reason = verification
+            .as_ref()
+            .err()
+            .map(|error| format!("{error:?}"));
+        let (proof_bytes, communication_bytes, constraints) = match verification {
+            Ok(metrics) => (
+                metrics.proof_bytes,
+                metrics.communication_bytes,
+                metrics.constraints,
+            ),
+            Err(_) => {
+                let residuals = instance
+                    .constraint_residuals()
+                    .map_err(|error| CliError(format!("Plonkish residuals failed: {error:?}")))?;
+                let communication_bytes = plonkish_proof_communication_bytes(&proof);
+                (
+                    pq_piop_plonkish::proof_size_bytes(&proof),
+                    communication_bytes,
+                    residuals.len(),
+                )
+            }
         };
+        (
+            verify_time,
+            verify_phases,
+            verified,
+            failure_reason,
+            proof_bytes,
+            communication_bytes,
+            constraints,
+        )
+    };
+    let stages = plonkish_stage_breakdown(
+        &proof,
+        prove_time,
+        verify_time,
+        &prove_phases,
+        &verify_phases,
+    );
 
     let record = MetricRecord {
         protocol: Protocol::Plonkish.as_str(),
@@ -4770,6 +5010,7 @@ fn run_plonkish_case_with_proof(
         constraints,
         prove_ms: millis(prove_time),
         verify_ms: millis(verify_time),
+        stages,
         proof_bytes,
         communication_bytes,
         network_bytes: 0,
@@ -4810,82 +5051,105 @@ fn run_plonkish_case_network_with_proof(
 
     let prove_start = Instant::now();
     let mut transcript = HashTranscript::new(b"pq-experiments-plonkish");
-    let proof = prove_plonkish_with_pcs_hooks(
-        &instance,
-        config.workers,
-        DistributedPcsParams::new(config.pcs_queries),
-        &mut transcript,
-        |evaluations, workers| {
-            backend
-                .borrow_mut()
-                .commit(evaluations, workers)
-                .map_err(|_| PlonkishPiopError::InvalidProof)
-        },
-        |evaluations, commitment, point, params, transcript| {
-            backend
-                .borrow_mut()
-                .open_compact(evaluations, commitment, point, params, transcript)
-                .map(PlonkishPcsOpening::Compact)
-                .map_err(|_| PlonkishPiopError::InvalidProof)
-        },
-    )
-    .map_err(|error| CliError(format!("network Plonkish prove failed: {error:?}")))?;
+    let (proof_result, prove_phases) = collect_plonkish_phase_timings(|| {
+        prove_plonkish_with_pcs_hooks(
+            &instance,
+            config.workers,
+            DistributedPcsParams::new(config.pcs_queries),
+            &mut transcript,
+            |evaluations, workers| {
+                backend
+                    .borrow_mut()
+                    .commit(evaluations, workers)
+                    .map_err(|_| PlonkishPiopError::InvalidProof)
+            },
+            |evaluations, commitment, point, params, transcript| {
+                backend
+                    .borrow_mut()
+                    .open_compact(evaluations, commitment, point, params, transcript)
+                    .map(PlonkishPcsOpening::Compact)
+                    .map_err(|_| PlonkishPiopError::InvalidProof)
+            },
+        )
+    });
+    let proof = proof_result
+        .map_err(|error| CliError(format!("network Plonkish prove failed: {error:?}")))?;
     let prove_time = prove_start.elapsed();
     let network_bytes = backend.borrow().bytes();
 
-    let (verify_time, verified, failure_reason, proof_bytes, communication_bytes, constraints) =
-        if tamper {
-            let verify_start = Instant::now();
-            let failure_reason =
-                verify_plonkish_negative_variants(&instance, &proof, config.pcs_queries)?;
-            let verify_time = verify_start.elapsed();
-            let residuals = instance
-                .constraint_residuals()
-                .map_err(|error| CliError(format!("Plonkish residuals failed: {error:?}")))?;
-            (
-                verify_time,
-                false,
-                Some(failure_reason),
-                pq_piop_plonkish::proof_size_bytes(&proof),
-                plonkish_proof_communication_bytes(&proof),
-                residuals.len(),
-            )
-        } else {
-            let verify_start = Instant::now();
-            let verification = verify_for_instance(&instance, &proof, config.pcs_queries);
-            let verify_time = verify_start.elapsed();
-            let verified = verification.is_ok();
-            let failure_reason = verification
-                .as_ref()
-                .err()
-                .map(|error| format!("{error:?}"));
-            let (proof_bytes, communication_bytes, constraints) = match verification {
-                Ok(metrics) => (
-                    metrics.proof_bytes,
-                    metrics.communication_bytes,
-                    metrics.constraints,
-                ),
-                Err(_) => {
-                    let residuals = instance.constraint_residuals().map_err(|error| {
-                        CliError(format!("Plonkish residuals failed: {error:?}"))
-                    })?;
-                    let communication_bytes = plonkish_proof_communication_bytes(&proof);
-                    (
-                        pq_piop_plonkish::proof_size_bytes(&proof),
-                        communication_bytes,
-                        residuals.len(),
-                    )
-                }
-            };
-            (
-                verify_time,
-                verified,
-                failure_reason,
-                proof_bytes,
-                communication_bytes,
-                constraints,
-            )
+    let (
+        verify_time,
+        verify_phases,
+        verified,
+        failure_reason,
+        proof_bytes,
+        communication_bytes,
+        constraints,
+    ) = if tamper {
+        let verify_start = Instant::now();
+        let (failure_result, verify_phases) = collect_plonkish_phase_timings(|| {
+            verify_plonkish_negative_variants(&instance, &proof, config.pcs_queries)
+        });
+        let failure_reason = failure_result?;
+        let verify_time = verify_start.elapsed();
+        let residuals = instance
+            .constraint_residuals()
+            .map_err(|error| CliError(format!("Plonkish residuals failed: {error:?}")))?;
+        (
+            verify_time,
+            verify_phases,
+            false,
+            Some(failure_reason),
+            pq_piop_plonkish::proof_size_bytes(&proof),
+            plonkish_proof_communication_bytes(&proof),
+            residuals.len(),
+        )
+    } else {
+        let verify_start = Instant::now();
+        let (verification, verify_phases) = collect_plonkish_phase_timings(|| {
+            verify_for_instance(&instance, &proof, config.pcs_queries)
+        });
+        let verify_time = verify_start.elapsed();
+        let verified = verification.is_ok();
+        let failure_reason = verification
+            .as_ref()
+            .err()
+            .map(|error| format!("{error:?}"));
+        let (proof_bytes, communication_bytes, constraints) = match verification {
+            Ok(metrics) => (
+                metrics.proof_bytes,
+                metrics.communication_bytes,
+                metrics.constraints,
+            ),
+            Err(_) => {
+                let residuals = instance
+                    .constraint_residuals()
+                    .map_err(|error| CliError(format!("Plonkish residuals failed: {error:?}")))?;
+                let communication_bytes = plonkish_proof_communication_bytes(&proof);
+                (
+                    pq_piop_plonkish::proof_size_bytes(&proof),
+                    communication_bytes,
+                    residuals.len(),
+                )
+            }
         };
+        (
+            verify_time,
+            verify_phases,
+            verified,
+            failure_reason,
+            proof_bytes,
+            communication_bytes,
+            constraints,
+        )
+    };
+    let stages = plonkish_stage_breakdown(
+        &proof,
+        prove_time,
+        verify_time,
+        &prove_phases,
+        &verify_phases,
+    );
 
     let record = MetricRecord {
         protocol: Protocol::Plonkish.as_str(),
@@ -4897,6 +5161,7 @@ fn run_plonkish_case_network_with_proof(
         constraints,
         prove_ms: millis(prove_time),
         verify_ms: millis(verify_time),
+        stages,
         proof_bytes,
         communication_bytes,
         network_bytes,
@@ -5103,7 +5368,7 @@ fn records_to_json(records: &[MetricRecord]) -> String {
         let comma = if index + 1 == records.len() { "" } else { "," };
         let failure_reason = json_optional_string(record.failure_reason.as_deref());
         out.push_str(&format!(
-            "  {{\"protocol\":\"{}\",\"runner\":\"{}\",\"case\":\"{}\",\"trial\":{},\"workers\":{},\"nv_power\":{},\"size\":{},\"constraints\":{},\"pcs_queries\":{},\"prove_ms\":{:.3},\"verify_ms\":{:.3},\"proof_bytes\":{},\"communication_bytes\":{},\"network_bytes\":{},\"host_logical_cores\":{},\"cores_per_worker\":{},\"core_affinity\":{},\"verified\":{},\"failure_reason\":{}}}{}\n",
+            "  {{\"protocol\":\"{}\",\"runner\":\"{}\",\"case\":\"{}\",\"trial\":{},\"workers\":{},\"nv_power\":{},\"size\":{},\"constraints\":{},\"pcs_queries\":{},\"prove_ms\":{:.3},\"verify_ms\":{:.3},\"stage_breakdown\":{{\"prove_pcs_commit_ms\":{:.3},\"prove_sumcheck_ms\":{:.3},\"prove_batch_open_ms\":{:.3},\"prove_other_ms\":{:.3},\"verify_pcs_open_ms\":{:.3},\"verify_sumcheck_ms\":{:.3},\"verify_other_ms\":{:.3}}},\"proof_bytes\":{},\"proof_size_breakdown\":{{\"pcs_bytes\":{},\"sumcheck_bytes\":{},\"other_bytes\":{},\"pcs_ratio\":{:.6}}},\"communication_bytes\":{},\"network_bytes\":{},\"host_logical_cores\":{},\"cores_per_worker\":{},\"core_affinity\":{},\"verified\":{},\"failure_reason\":{}}}{}\n",
             record.protocol,
             record.runner,
             record.case_name,
@@ -5115,7 +5380,18 @@ fn records_to_json(records: &[MetricRecord]) -> String {
             record.pcs_queries,
             record.prove_ms,
             record.verify_ms,
+            record.stages.prove_pcs_commit_ms,
+            record.stages.prove_sumcheck_ms,
+            record.stages.prove_batch_open_ms,
+            record.stages.prove_other_ms,
+            record.stages.verify_pcs_open_ms,
+            record.stages.verify_sumcheck_ms,
+            record.stages.verify_other_ms,
             record.proof_bytes,
+            record.stages.proof_pcs_bytes,
+            record.stages.proof_sumcheck_bytes,
+            record.stages.proof_other_bytes,
+            ratio(record.stages.proof_pcs_bytes as f64, record.proof_bytes as f64),
             record.communication_bytes,
             record.network_bytes,
             json_optional_usize(record.host_logical_cores),
@@ -5139,7 +5415,7 @@ fn records_to_csv(records: &[MetricRecord]) -> String {
             .map(csv_escape)
             .unwrap_or_default();
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{}\n",
             record.protocol,
             record.runner,
             record.case_name,
@@ -5151,7 +5427,17 @@ fn records_to_csv(records: &[MetricRecord]) -> String {
             record.pcs_queries,
             record.prove_ms,
             record.verify_ms,
+            record.stages.prove_pcs_commit_ms,
+            record.stages.prove_sumcheck_ms,
+            record.stages.prove_batch_open_ms,
+            record.stages.prove_other_ms,
+            record.stages.verify_pcs_open_ms,
+            record.stages.verify_sumcheck_ms,
+            record.stages.verify_other_ms,
             record.proof_bytes,
+            record.stages.proof_pcs_bytes,
+            record.stages.proof_sumcheck_bytes,
+            record.stages.proof_other_bytes,
             record.communication_bytes,
             record.network_bytes,
             record
@@ -5264,6 +5550,43 @@ fn phase_timing_summary(timings: &[PhaseTimingRecord]) -> String {
     out
 }
 
+fn pcs_text_analysis(records: &[MetricRecord]) -> String {
+    let mut out = String::from("\npcs_stage_analysis:\n");
+    let positives = records
+        .iter()
+        .filter(|record| record.case_name == "positive" && record.verified)
+        .collect::<Vec<_>>();
+    if positives.is_empty() {
+        out.push_str("  no verified positive records available\n");
+        return out;
+    }
+    for record in positives {
+        let pcs_commit_share = ratio(record.stages.prove_pcs_commit_ms, record.prove_ms) * 100.0;
+        let pcs_proof_share = ratio(
+            record.stages.proof_pcs_bytes as f64,
+            record.proof_bytes as f64,
+        ) * 100.0;
+        out.push_str(&format!(
+            "  runner={} protocol={} n={} workers={} prove_ms={:.3} pcs_commit_ms={:.3} pcs_commit_share={:.2}% sumcheck_ms={:.3} batch_open_ms={:.3} verify_pcs_open_ms={:.3} verify_sumcheck_ms={:.3} proof_bytes={} pcs_proof_bytes={} pcs_proof_share={:.2}%\n",
+            record.runner,
+            record.protocol,
+            nv_power(record.size),
+            record.workers,
+            record.prove_ms,
+            record.stages.prove_pcs_commit_ms,
+            pcs_commit_share,
+            record.stages.prove_sumcheck_ms,
+            record.stages.prove_batch_open_ms,
+            record.stages.verify_pcs_open_ms,
+            record.stages.verify_sumcheck_ms,
+            record.proof_bytes,
+            record.stages.proof_pcs_bytes,
+            pcs_proof_share
+        ));
+    }
+    out
+}
+
 fn benchmark_stats(records: &[MetricRecord]) -> Vec<BenchmarkStatsRecord> {
     let mut groups: Vec<Vec<&MetricRecord>> = Vec::new();
     for record in records {
@@ -5310,7 +5633,37 @@ fn benchmark_stats(records: &[MetricRecord]) -> Vec<BenchmarkStatsRecord> {
                 rejected_count,
                 prove_ms: mean_stddev(group.iter().map(|record| record.prove_ms)),
                 verify_ms: mean_stddev(group.iter().map(|record| record.verify_ms)),
+                prove_pcs_commit_ms: mean_stddev(
+                    group.iter().map(|record| record.stages.prove_pcs_commit_ms),
+                ),
+                prove_sumcheck_ms: mean_stddev(
+                    group.iter().map(|record| record.stages.prove_sumcheck_ms),
+                ),
+                prove_batch_open_ms: mean_stddev(
+                    group.iter().map(|record| record.stages.prove_batch_open_ms),
+                ),
+                verify_pcs_open_ms: mean_stddev(
+                    group.iter().map(|record| record.stages.verify_pcs_open_ms),
+                ),
+                verify_sumcheck_ms: mean_stddev(
+                    group.iter().map(|record| record.stages.verify_sumcheck_ms),
+                ),
                 proof_bytes: mean_stddev(group.iter().map(|record| record.proof_bytes as f64)),
+                proof_pcs_bytes: mean_stddev(
+                    group
+                        .iter()
+                        .map(|record| record.stages.proof_pcs_bytes as f64),
+                ),
+                proof_sumcheck_bytes: mean_stddev(
+                    group
+                        .iter()
+                        .map(|record| record.stages.proof_sumcheck_bytes as f64),
+                ),
+                proof_other_bytes: mean_stddev(
+                    group
+                        .iter()
+                        .map(|record| record.stages.proof_other_bytes as f64),
+                ),
                 communication_bytes: mean_stddev(
                     group.iter().map(|record| record.communication_bytes as f64),
                 ),
@@ -5359,7 +5712,7 @@ fn summary_stats_to_csv(stats: &[BenchmarkStatsRecord]) -> String {
     let mut out = format!("{SUMMARY_STATS_CSV_HEADER}\n");
     for record in stats {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{}\n",
             record.protocol,
             record.runner,
             record.case_name,
@@ -5375,8 +5728,16 @@ fn summary_stats_to_csv(stats: &[BenchmarkStatsRecord]) -> String {
             record.prove_ms.stddev,
             record.verify_ms.mean,
             record.verify_ms.stddev,
+            record.prove_pcs_commit_ms.mean,
+            record.prove_sumcheck_ms.mean,
+            record.prove_batch_open_ms.mean,
+            record.verify_pcs_open_ms.mean,
+            record.verify_sumcheck_ms.mean,
             record.proof_bytes.mean,
             record.proof_bytes.stddev,
+            record.proof_pcs_bytes.mean,
+            record.proof_sumcheck_bytes.mean,
+            record.proof_other_bytes.mean,
             record.communication_bytes.mean,
             record.communication_bytes.stddev,
             record.network_bytes.mean,
@@ -5401,6 +5762,25 @@ fn mean_positive_records(records: &[MetricRecord]) -> Vec<MetricRecord> {
             constraints: record.constraints,
             prove_ms: record.prove_ms.mean,
             verify_ms: record.verify_ms.mean,
+            stages: StageBreakdown {
+                prove_pcs_commit_ms: record.prove_pcs_commit_ms.mean,
+                prove_sumcheck_ms: record.prove_sumcheck_ms.mean,
+                prove_batch_open_ms: record.prove_batch_open_ms.mean,
+                prove_other_ms: (record.prove_ms.mean
+                    - record.prove_pcs_commit_ms.mean
+                    - record.prove_sumcheck_ms.mean
+                    - record.prove_batch_open_ms.mean)
+                    .max(0.0),
+                verify_pcs_open_ms: record.verify_pcs_open_ms.mean,
+                verify_sumcheck_ms: record.verify_sumcheck_ms.mean,
+                verify_other_ms: (record.verify_ms.mean
+                    - record.verify_pcs_open_ms.mean
+                    - record.verify_sumcheck_ms.mean)
+                    .max(0.0),
+                proof_pcs_bytes: record.proof_pcs_bytes.mean.round() as usize,
+                proof_sumcheck_bytes: record.proof_sumcheck_bytes.mean.round() as usize,
+                proof_other_bytes: record.proof_other_bytes.mean.round() as usize,
+            },
             proof_bytes: record.proof_bytes.mean.round() as usize,
             communication_bytes: record.communication_bytes.mean.round() as usize,
             network_bytes: record.network_bytes.mean.round() as usize,
@@ -5416,6 +5796,123 @@ fn mean_positive_records(records: &[MetricRecord]) -> Vec<MetricRecord> {
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn r1cs_stage_breakdown(
+    proof: &R1csPiopProof,
+    prove_time: Duration,
+    verify_time: Duration,
+    prove_phases: &[R1csPhaseTiming],
+    verify_phases: &[R1csPhaseTiming],
+) -> StageBreakdown {
+    let size = r1cs_proof_size_breakdown(proof);
+    let mut stages = StageBreakdown {
+        proof_pcs_bytes: size.pcs_bytes,
+        proof_sumcheck_bytes: size.sumcheck_bytes,
+        proof_other_bytes: size.other_bytes,
+        ..StageBreakdown::default()
+    };
+    apply_prove_phase_breakdown(
+        &mut stages,
+        millis(prove_time),
+        prove_phases
+            .iter()
+            .map(|phase| (phase.label.as_str(), phase.elapsed)),
+    );
+    apply_verify_phase_breakdown(
+        &mut stages,
+        millis(verify_time),
+        verify_phases
+            .iter()
+            .map(|phase| (phase.label.as_str(), phase.elapsed)),
+    );
+    stages
+}
+
+fn plonkish_stage_breakdown(
+    proof: &PlonkishPiopProof,
+    prove_time: Duration,
+    verify_time: Duration,
+    prove_phases: &[PlonkishPhaseTiming],
+    verify_phases: &[PlonkishPhaseTiming],
+) -> StageBreakdown {
+    let size = plonkish_proof_size_breakdown(proof);
+    let mut stages = StageBreakdown {
+        proof_pcs_bytes: size.pcs_bytes,
+        proof_sumcheck_bytes: size.sumcheck_bytes,
+        proof_other_bytes: size.other_bytes,
+        ..StageBreakdown::default()
+    };
+    apply_prove_phase_breakdown(
+        &mut stages,
+        millis(prove_time),
+        prove_phases
+            .iter()
+            .map(|phase| (phase.label.as_str(), phase.elapsed)),
+    );
+    apply_verify_phase_breakdown(
+        &mut stages,
+        millis(verify_time),
+        verify_phases
+            .iter()
+            .map(|phase| (phase.label.as_str(), phase.elapsed)),
+    );
+    stages
+}
+
+fn apply_prove_phase_breakdown<'a>(
+    stages: &mut StageBreakdown,
+    prove_total_ms: f64,
+    phases: impl Iterator<Item = (&'a str, Duration)>,
+) {
+    for (label, elapsed) in phases {
+        let elapsed_ms = millis(elapsed);
+        if is_prove_pcs_commit_phase(label) {
+            stages.prove_pcs_commit_ms += elapsed_ms;
+        } else if is_sumcheck_phase(label) {
+            stages.prove_sumcheck_ms += elapsed_ms;
+        } else if is_opening_phase(label) {
+            stages.prove_batch_open_ms += elapsed_ms;
+        }
+    }
+    let classified =
+        stages.prove_pcs_commit_ms + stages.prove_sumcheck_ms + stages.prove_batch_open_ms;
+    stages.prove_other_ms = (prove_total_ms - classified).max(0.0);
+}
+
+fn apply_verify_phase_breakdown<'a>(
+    stages: &mut StageBreakdown,
+    verify_total_ms: f64,
+    phases: impl Iterator<Item = (&'a str, Duration)>,
+) {
+    for (label, elapsed) in phases {
+        let elapsed_ms = millis(elapsed);
+        if is_sumcheck_phase(label) {
+            stages.verify_sumcheck_ms += elapsed_ms;
+        } else if is_opening_phase(label) {
+            stages.verify_pcs_open_ms += elapsed_ms;
+        }
+    }
+    let classified = stages.verify_pcs_open_ms + stages.verify_sumcheck_ms;
+    stages.verify_other_ms = (verify_total_ms - classified).max(0.0);
+}
+
+fn is_prove_pcs_commit_phase(label: &str) -> bool {
+    label.starts_with("prove/")
+        && (label.contains("commitment") || label.contains("commitments"))
+        && !label.contains("opening")
+}
+
+fn is_sumcheck_phase(label: &str) -> bool {
+    label.contains("sumcheck") || label.contains("multiset")
+}
+
+fn is_opening_phase(label: &str) -> bool {
+    label.contains("opening")
+        || label.contains("openings")
+        || label.contains("queries")
+        || label == "prove/gate_subclaim"
+        || label == "verify/gate_subclaim"
 }
 
 fn net_application_bytes(session: &str, payload: &str, replies: &[String]) -> usize {
@@ -5738,6 +6235,7 @@ fn write_proof_bundle(
         proof_bytes: record.proof_bytes,
         communication_bytes: record.communication_bytes,
         network_bytes: record.network_bytes,
+        stage_breakdown: record.stages.clone(),
         host_logical_cores: record.host_logical_cores,
         cores_per_worker: record.cores_per_worker,
         core_affinity: record.core_affinity.map(str::to_owned),
@@ -6464,6 +6962,13 @@ fn proof_experiment_report_json(
     out.push_str(&format!("  \"pcs_queries\": {},\n", command.pcs_queries));
     out.push_str(&format!("  \"record_count\": {},\n", records.len()));
     out.push_str(&format!("  \"proof_count\": {},\n", proofs.len()));
+    out.push_str(&format!(
+        "  \"pcs_analysis\": {},\n",
+        proof_experiment_pcs_analysis_json(records)
+    ));
+    out.push_str("  \"records\": ");
+    out.push_str(&records_to_json(records));
+    out.push_str(",\n");
     out.push_str("  \"proofs\": ");
     out.push_str(
         &serde_json::to_string_pretty(proofs)
@@ -6484,7 +6989,7 @@ fn proof_experiment_overview_html(
         .iter()
         .map(|record| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.1}%</td><td>{}</td></tr>",
                 html_escape(record.protocol),
                 html_escape(record.runner),
                 nv_power(record.size),
@@ -6492,6 +6997,9 @@ fn proof_experiment_overview_html(
                 record.pcs_queries,
                 record.prove_ms,
                 record.verify_ms,
+                record.stages.prove_pcs_commit_ms,
+                record.stages.prove_batch_open_ms,
+                ratio(record.stages.proof_pcs_bytes as f64, record.proof_bytes as f64) * 100.0,
                 record.proof_bytes
             )
         })
@@ -6516,7 +7024,8 @@ fn proof_experiment_overview_html(
             "th{{font-size:12px;text-transform:uppercase;color:#64748b}}.links{{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}}",
             ".links a{{background:white;border:1px solid #dbe3ee;border-radius:6px;padding:8px 10px;color:#0f766e;text-decoration:none}}</style></head><body><main>",
             "<h1>pq_dSNARK proof experiment</h1><p>{} - run_id={} - protocol={} - runner={} - n={}</p>",
-            "<table><thead><tr><th>protocol</th><th>runner</th><th>n</th><th>workers</th><th>queries</th><th>prove ms</th><th>verify ms</th><th>proof bytes</th></tr></thead><tbody>{}</tbody></table>",
+            "<h2>PCS analysis</h2>{}",
+            "<table><thead><tr><th>protocol</th><th>runner</th><th>n</th><th>workers</th><th>queries</th><th>prove ms</th><th>verify ms</th><th>PCS commit ms</th><th>batch/open ms</th><th>PCS proof share</th><th>proof bytes</th></tr></thead><tbody>{}</tbody></table>",
             "<h2>Stored proofs</h2><div class=\"links\"><a href=\"proofs/index.json\">proofs/index.json</a>{}</div>",
             "</main></body></html>\n"
         ),
@@ -6525,8 +7034,29 @@ fn proof_experiment_overview_html(
         command.protocol.as_str(),
         command.runner.as_str(),
         nv_power(command.size),
+        benchmark_pcs_analysis_html(records),
         rows,
         proof_links
+    )
+}
+
+fn proof_experiment_pcs_analysis_json(records: &[MetricRecord]) -> String {
+    let max_commit = records.iter().max_by(|left, right| {
+        left.stages
+            .prove_pcs_commit_ms
+            .partial_cmp(&right.stages.prove_pcs_commit_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let Some(record) = max_commit else {
+        return "{\"record_count\":0}".to_owned();
+    };
+    format!(
+        "{{\"record_count\":{},\"max_pcs_commit_ms\":{:.3},\"max_pcs_commit_protocol\":\"{}\",\"max_pcs_commit_runner\":\"{}\",\"max_pcs_commit_share\":{:.6}}}",
+        records.len(),
+        record.stages.prove_pcs_commit_ms,
+        json_escape(record.protocol),
+        json_escape(record.runner),
+        ratio(record.stages.prove_pcs_commit_ms, record.prove_ms)
     )
 }
 
@@ -6688,6 +7218,8 @@ fn benchmark_overview_html(
     let stats = benchmark_stats(records);
     let scaling_rows = benchmark_overview_scaling_rows(&stats, command);
     let stats_rows = benchmark_overview_stats_rows(&stats);
+    let stage_rows = benchmark_overview_stage_rows(&stats);
+    let pcs_analysis = benchmark_pcs_analysis_html(records);
     let artifact_rows = benchmark_overview_artifact_rows(figure_pdf_created);
     let chart_cards = benchmark_overview_chart_cards();
     let core_allocation = benchmark_overview_core_allocation(command);
@@ -6766,6 +7298,15 @@ fn benchmark_overview_html(
             "      <div class=\"table-wrap\"><table><thead><tr><th>runner</th><th>protocol</th><th>workers</th><th>speedup</th><th>efficiency</th><th>serial+overhead</th><th>assessment</th></tr></thead><tbody>{scaling_rows}</tbody></table></div>\n",
             "    </section>\n",
             "    <section class=\"panel\">\n",
+            "      <h2>PCS Cost And Proof-Size Share</h2>\n",
+            "      {pcs_analysis}",
+            "    </section>\n",
+            "    <section class=\"panel\">\n",
+            "      <h2>Stage Breakdown</h2>\n",
+            "      <p class=\"note\">Stage timings are collected inside the prover/verifier code path. Prover other is the measured total minus PCS commitment, sumcheck, and batch-open/query phases.</p>\n",
+            "      <div class=\"table-wrap\"><table><thead><tr><th>runner</th><th>protocol</th><th>n</th><th>workers</th><th>PCS commit ms</th><th>sumcheck ms</th><th>batch/open ms</th><th>prove other ms</th><th>verify PCS open ms</th><th>verify sumcheck ms</th><th>PCS proof share</th></tr></thead><tbody>{stage_rows}</tbody></table></div>\n",
+            "    </section>\n",
+            "    <section class=\"panel\">\n",
             "      <h2>Summary Statistics</h2>\n",
             "      <div class=\"table-wrap\"><table><thead><tr><th>runner</th><th>protocol</th><th>case</th><th>n</th><th>workers</th><th>samples</th><th>prove ms</th><th>verify ms</th><th>proof bytes</th><th>network bytes</th></tr></thead><tbody>{stats_rows}</tbody></table></div>\n",
             "    </section>\n",
@@ -6798,6 +7339,8 @@ fn benchmark_overview_html(
         },
         core_allocation = core_allocation,
         chart_cards = chart_cards,
+        pcs_analysis = pcs_analysis,
+        stage_rows = stage_rows,
         scaling_rows = scaling_rows,
         stats_rows = stats_rows,
         artifact_rows = artifact_rows
@@ -7037,6 +7580,96 @@ fn benchmark_overview_stats_rows(stats: &[BenchmarkStatsRecord]) -> String {
         .collect::<String>()
 }
 
+fn benchmark_overview_stage_rows(stats: &[BenchmarkStatsRecord]) -> String {
+    stats
+        .iter()
+        .filter(|record| record.case_name == "positive" && record.verified_count > 0)
+        .map(|record| {
+            let proof_pcs_share = ratio(record.proof_pcs_bytes.mean, record.proof_bytes.mean);
+            let prove_other = (record.prove_ms.mean
+                - record.prove_pcs_commit_ms.mean
+                - record.prove_sumcheck_ms.mean
+                - record.prove_batch_open_ms.mean)
+                .max(0.0);
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.1}%</td></tr>",
+                html_escape(record.runner),
+                html_escape(record.protocol),
+                nv_power(record.size),
+                record.workers,
+                record.prove_pcs_commit_ms.mean,
+                record.prove_sumcheck_ms.mean,
+                record.prove_batch_open_ms.mean,
+                prove_other,
+                record.verify_pcs_open_ms.mean,
+                record.verify_sumcheck_ms.mean,
+                proof_pcs_share * 100.0
+            )
+        })
+        .collect::<String>()
+}
+
+fn benchmark_pcs_analysis_html(records: &[MetricRecord]) -> String {
+    let positives = records
+        .iter()
+        .filter(|record| record.case_name == "positive" && record.verified)
+        .collect::<Vec<_>>();
+    if positives.is_empty() {
+        return "<p class=\"note\">No verified positive records are available for PCS analysis.</p>"
+            .to_owned();
+    }
+    let max_commit = positives
+        .iter()
+        .max_by(|left, right| {
+            left.stages
+                .prove_pcs_commit_ms
+                .partial_cmp(&right.stages.prove_pcs_commit_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("non-empty positives");
+    let max_size_share = positives
+        .iter()
+        .max_by(|left, right| {
+            ratio(left.stages.proof_pcs_bytes as f64, left.proof_bytes as f64)
+                .partial_cmp(&ratio(
+                    right.stages.proof_pcs_bytes as f64,
+                    right.proof_bytes as f64,
+                ))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("non-empty positives");
+    let commit_share = ratio(
+        max_commit.stages.prove_pcs_commit_ms,
+        max_commit.prove_ms.max(0.001),
+    ) * 100.0;
+    let proof_share = ratio(
+        max_size_share.stages.proof_pcs_bytes as f64,
+        max_size_share.proof_bytes as f64,
+    ) * 100.0;
+    format!(
+        concat!(
+            "<p class=\"note\">PCS commitment time is measured from the actual commitment calls inside the prover. ",
+            "PCS proof-size share counts PCS commitments, Merkle/distributed openings, sampled folding proofs, and distributed index openings in the serialized proof-size accounting.</p>",
+            "<div class=\"table-wrap\"><table><thead><tr><th>metric</th><th>runner</th><th>protocol</th><th>n</th><th>workers</th><th>value</th><th>share</th></tr></thead><tbody>",
+            "<tr><td>max PCS commitment time</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.3} ms</td><td>{:.1}% of prove</td></tr>",
+            "<tr><td>max PCS proof-size share</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.1}% of proof</td></tr>",
+            "</tbody></table></div>"
+        ),
+        html_escape(max_commit.runner),
+        html_escape(max_commit.protocol),
+        nv_power(max_commit.size),
+        max_commit.workers,
+        max_commit.stages.prove_pcs_commit_ms,
+        commit_share,
+        html_escape(max_size_share.runner),
+        html_escape(max_size_share.protocol),
+        nv_power(max_size_share.size),
+        max_size_share.workers,
+        format_bytes(max_size_share.stages.proof_pcs_bytes as f64),
+        proof_share
+    )
+}
+
 fn benchmark_overview_artifact_rows(figure_pdf_created: bool) -> String {
     benchmark_artifacts(figure_pdf_created)
         .into_iter()
@@ -7051,6 +7684,14 @@ fn format_bytes(value: f64) -> String {
         format!("{:.2} KiB", value / 1024.0)
     } else {
         format!("{} B", value.round() as usize)
+    }
+}
+
+fn ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator > 0.0 && numerator.is_finite() && denominator.is_finite() {
+        numerator / denominator
+    } else {
+        0.0
     }
 }
 
@@ -7117,6 +7758,7 @@ fn benchmark_summary(
             .unwrap_or("unavailable")
     ));
     out.push_str(&phase_timing_summary(phase_timings));
+    out.push_str(&pcs_text_analysis(records));
     out.push_str("\nscaling_analysis:\n");
     out.push_str(&format!("  runner: {}\n", command.runner.as_str()));
     out.push_str("  baseline: speedup is measured against the workers=1 run for the same runner, protocol, and size.\n");
@@ -9032,6 +9674,23 @@ mod tests {
         ))
     }
 
+    fn test_stage_breakdown(prove_ms: f64, verify_ms: f64, proof_bytes: usize) -> StageBreakdown {
+        let proof_pcs_bytes = proof_bytes / 2;
+        let proof_sumcheck_bytes = proof_bytes / 4;
+        StageBreakdown {
+            prove_pcs_commit_ms: prove_ms * 0.2,
+            prove_sumcheck_ms: prove_ms * 0.3,
+            prove_batch_open_ms: prove_ms * 0.2,
+            prove_other_ms: prove_ms * 0.3,
+            verify_pcs_open_ms: verify_ms * 0.4,
+            verify_sumcheck_ms: verify_ms * 0.2,
+            verify_other_ms: verify_ms * 0.4,
+            proof_pcs_bytes,
+            proof_sumcheck_bytes,
+            proof_other_bytes: proof_bytes - proof_pcs_bytes - proof_sumcheck_bytes,
+        }
+    }
+
     fn write_base_benchmark_fixture(
         run_dir: &Path,
         run_id: u64,
@@ -9256,6 +9915,40 @@ mod tests {
         assert_eq!(plan.cores_per_worker, 2);
         assert_eq!(plan.core_ids_for_worker(1), vec![2, 3]);
 
+        let mut host20_max4 = parse_benchmark_command(&[
+            "--sizes".to_owned(),
+            "4".to_owned(),
+            "--workers".to_owned(),
+            "1,4".to_owned(),
+            "--runner".to_owned(),
+            "network".to_owned(),
+            "--host-cores".to_owned(),
+            "20".to_owned(),
+        ])
+        .expect("20-core max-4 worker command");
+        configure_benchmark_core_plan(&mut host20_max4).expect("20-core max-4 plan");
+        let plan = host20_max4.worker_core_plan.expect("worker core plan");
+        assert_eq!(plan.max_workers, 4);
+        assert_eq!(plan.cores_per_worker, 5);
+        assert_eq!(plan.core_ids_for_worker(3), vec![15, 16, 17, 18, 19]);
+
+        let mut host20_max8 = parse_benchmark_command(&[
+            "--sizes".to_owned(),
+            "8".to_owned(),
+            "--workers".to_owned(),
+            "1,2,4,8".to_owned(),
+            "--runner".to_owned(),
+            "network".to_owned(),
+            "--host-cores".to_owned(),
+            "20".to_owned(),
+        ])
+        .expect("20-core max-8 worker command");
+        configure_benchmark_core_plan(&mut host20_max8).expect("20-core max-8 plan");
+        let plan = host20_max8.worker_core_plan.expect("worker core plan");
+        assert_eq!(plan.max_workers, 8);
+        assert_eq!(plan.cores_per_worker, 2);
+        assert_eq!(plan.core_ids_for_worker(7), vec![14, 15]);
+
         let preset =
             parse_benchmark_command(&["--paper-preset".to_owned()]).expect("paper preset command");
         assert!(preset.paper_preset);
@@ -9456,7 +10149,7 @@ mod tests {
                 .expect("read script PowerShell launcher");
         assert!(script_launcher.contains("# POWERSHELL_PAYLOAD_BEGIN"));
         assert!(script_launcher.contains("-ExecutionPolicy Bypass"));
-        assert!(script_launcher.contains("target\\windows\\interactive-powershell.generated.ps1"));
+        assert!(script_launcher.contains("target\\windows\\interactive-powershell-"));
         assert!(script_launcher.contains("if not defined NO_PAUSE pause"));
         assert!(script_launcher.contains("function Invoke-Menu"));
         assert!(!repo_root.join("tools").exists());
@@ -9479,6 +10172,31 @@ mod tests {
         assert!(linux_script.contains("proof_wizard() {\n  ensure_toolchain_for_action false"));
         assert!(linux_script.contains("benchmark_wizard() {\n  ensure_toolchain_for_action false"));
         assert!(linux_script.contains("results_wizard() {\n  ensure_toolchain_for_action false"));
+        assert!(!linux_script.contains("Use the full paper-quality benchmark grid"));
+        assert!(!linux_script.contains("PCS query count"));
+        assert!(!linux_script.contains("Compile paper figures after the run"));
+        assert!(!linux_script.contains("Run this benchmark grid"));
+        assert!(!linux_script.contains("suggested max worker exponent"));
+        assert!(linux_script.contains(
+            "prompt_text_hidden_default 'minimum circuit size exponent n for nv=2^n' '8'"
+        ));
+        assert!(linux_script.contains(
+            "prompt_text_hidden_default 'maximum circuit size exponent n for nv=2^n' '10'"
+        ));
+        assert!(linux_script.contains("default_worker_max > 3"));
+        assert!(
+            linux_script.contains(
+                "prompt_text_hidden_default 'minimum worker exponent for workers=2^w' '0'"
+            )
+        );
+        assert!(
+            linux_script
+                .contains("prompt_text_hidden_default 'maximum worker exponent for workers=2^w'")
+        );
+        assert!(linux_script.contains("pcs_queries=\"1\""));
+        assert!(linux_script.contains("PCS queries fixed at 1"));
+        assert!(linux_script.contains("figure compilation is enabled by default"));
+        assert!(linux_script.contains("--compile-figures --figure-compiler auto"));
 
         let powershell_script =
             fs::read_to_string(repo_root.join("scripts").join("interactive-powershell.cmd"))
@@ -9488,6 +10206,29 @@ mod tests {
         assert!(powershell_script.contains("Install missing dependencies now"));
         assert!(powershell_script.contains("Build debug pq-experiments now"));
         assert!(powershell_script.contains("Build-ExperimentBinary -Release:$false"));
+        assert!(!powershell_script.contains("Use the full paper-quality benchmark grid"));
+        assert!(!powershell_script.contains("PCS query count"));
+        assert!(!powershell_script.contains("Compile paper figures after the run"));
+        assert!(!powershell_script.contains("Run this benchmark grid"));
+        assert!(!powershell_script.contains("suggested max worker exponent"));
+        assert!(powershell_script.contains("function Read-TextWithHiddenDefault"));
+        assert!(powershell_script.contains(
+            "Read-TextWithHiddenDefault -Prompt \"minimum circuit size exponent n for nv=2^n\" -Default \"8\""
+        ));
+        assert!(powershell_script.contains(
+            "Read-TextWithHiddenDefault -Prompt \"maximum circuit size exponent n for nv=2^n\" -Default \"10\""
+        ));
+        assert!(powershell_script.contains("[Math]::Min([Math]::Min($hostWorkerMax, $nMin), 3)"));
+        assert!(powershell_script.contains(
+            "Read-TextWithHiddenDefault -Prompt \"minimum worker exponent for workers=2^w\" -Default \"0\""
+        ));
+        assert!(powershell_script.contains(
+            "Read-TextWithHiddenDefault -Prompt \"maximum worker exponent for workers=2^w\""
+        ));
+        assert!(powershell_script.contains("$pcsQueries = \"1\""));
+        assert!(powershell_script.contains("PCS queries fixed at 1"));
+        assert!(powershell_script.contains("figure compilation is enabled by default"));
+        assert!(powershell_script.contains("--compile-figures\", \"--figure-compiler\", \"auto"));
         assert!(powershell_script.contains("choose menu option 1"));
         assert!(!powershell_script.contains("choose menu option 2"));
         assert!(
@@ -9736,6 +10477,9 @@ mod tests {
         plonkish_record.prove_ms += 1.0;
         plonkish_record.verify_ms += 1.0;
         plonkish_record.proof_bytes += 10;
+        plonkish_record.stages.prove_other_ms += 1.0;
+        plonkish_record.stages.verify_other_ms += 1.0;
+        plonkish_record.stages.proof_other_bytes += 10;
         plonkish_record.communication_bytes += 10;
         let records = vec![output.record.clone(), plonkish_record];
         let timings = vec![
@@ -10165,6 +10909,7 @@ mod tests {
             constraints: 4,
             prove_ms: 10.0,
             verify_ms: 2.0,
+            stages: test_stage_breakdown(10.0, 2.0, 100),
             proof_bytes: 100,
             communication_bytes: 50,
             network_bytes: 0,
@@ -10185,6 +10930,7 @@ mod tests {
             constraints: 4,
             prove_ms: 11.0,
             verify_ms: 2.5,
+            stages: test_stage_breakdown(11.0, 2.5, 100),
             proof_bytes: 100,
             communication_bytes: 50,
             network_bytes: 0,
@@ -10231,6 +10977,7 @@ mod tests {
                 constraints: 4,
                 prove_ms: 10.0,
                 verify_ms: 2.0,
+                stages: test_stage_breakdown(10.0, 2.0, 100),
                 proof_bytes: 100,
                 communication_bytes: 50,
                 network_bytes: 0,
@@ -10251,6 +10998,7 @@ mod tests {
                 constraints: 4,
                 prove_ms: 6.0,
                 verify_ms: 2.0,
+                stages: test_stage_breakdown(6.0, 2.0, 110),
                 proof_bytes: 110,
                 communication_bytes: 60,
                 network_bytes: 0,
@@ -10271,6 +11019,7 @@ mod tests {
                 constraints: 4,
                 prove_ms: 14.0,
                 verify_ms: 4.0,
+                stages: test_stage_breakdown(14.0, 4.0, 100),
                 proof_bytes: 100,
                 communication_bytes: 50,
                 network_bytes: 0,
@@ -10291,6 +11040,7 @@ mod tests {
                 constraints: 4,
                 prove_ms: 20.0,
                 verify_ms: 5.0,
+                stages: test_stage_breakdown(20.0, 5.0, 100),
                 proof_bytes: 100,
                 communication_bytes: 50,
                 network_bytes: 4096,
@@ -10535,6 +11285,7 @@ mod tests {
                 constraints: 4,
                 prove_ms: 10.0,
                 verify_ms: 2.0,
+                stages: test_stage_breakdown(10.0, 2.0, 100),
                 proof_bytes: 100,
                 communication_bytes: 50,
                 network_bytes: 0,
@@ -10555,6 +11306,7 @@ mod tests {
                 constraints: 16,
                 prove_ms: 12.0,
                 verify_ms: 3.0,
+                stages: test_stage_breakdown(12.0, 3.0, 140),
                 proof_bytes: 140,
                 communication_bytes: 70,
                 network_bytes: 0,

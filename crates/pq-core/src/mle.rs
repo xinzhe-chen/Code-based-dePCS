@@ -1,4 +1,7 @@
 use crate::{CoreError, FieldElement, Result, inner_product};
+use rayon::prelude::*;
+
+const DEFAULT_PARALLEL_MIN_ITEMS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MultilinearExtension {
@@ -77,7 +80,7 @@ impl MultilinearExtension {
     }
 
     pub fn sum_over_boolean_hypercube(&self) -> FieldElement {
-        self.evaluations.iter().copied().sum()
+        parallel_sum(&self.evaluations)
     }
 
     pub fn evaluate(&self, point: &[FieldElement]) -> Result<FieldElement> {
@@ -92,10 +95,17 @@ impl MultilinearExtension {
         for r in point {
             let one_minus_r = FieldElement::ONE - *r;
             let next_len = layer.len() / 2;
-            for i in 0..next_len {
-                layer[i] = layer[2 * i] * one_minus_r + layer[2 * i + 1] * *r;
+            if next_len >= parallel_min_items() {
+                layer = (0..next_len)
+                    .into_par_iter()
+                    .map(|i| layer[2 * i] * one_minus_r + layer[2 * i + 1] * *r)
+                    .collect();
+            } else {
+                for i in 0..next_len {
+                    layer[i] = layer[2 * i] * one_minus_r + layer[2 * i + 1] * *r;
+                }
+                layer.truncate(next_len);
             }
-            layer.truncate(next_len);
         }
         Ok(layer[0])
     }
@@ -120,10 +130,21 @@ impl MultilinearExtension {
         }
         let half = self.evaluations.len() / 2;
         let one_minus = FieldElement::ONE - challenge;
-        let mut next = Vec::with_capacity(half);
-        for pair in self.evaluations.chunks_exact(2) {
-            next.push(pair[0] * one_minus + pair[1] * challenge);
-        }
+        let next = if half >= parallel_min_items() {
+            (0..half)
+                .into_par_iter()
+                .map(|idx| {
+                    self.evaluations[idx * 2] * one_minus
+                        + self.evaluations[idx * 2 + 1] * challenge
+                })
+                .collect()
+        } else {
+            let mut next = Vec::with_capacity(half);
+            for pair in self.evaluations.chunks_exact(2) {
+                next.push(pair[0] * one_minus + pair[1] * challenge);
+            }
+            next
+        };
         Self::from_evaluations(next)
     }
 }
@@ -165,7 +186,34 @@ pub fn eq_basis(point: &[FieldElement], index: usize) -> Result<FieldElement> {
 
 pub fn eq_evaluations(point: &[FieldElement]) -> Result<Vec<FieldElement>> {
     let len = checked_allocating_hypercube_len(point.len())?;
-    (0..len).map(|index| eq_basis(point, index)).collect()
+    let mut evals = Vec::with_capacity(len);
+    evals.push(FieldElement::ONE);
+    for r in point {
+        let old_len = evals.len();
+        let one_minus = FieldElement::ONE - *r;
+        let challenge = *r;
+        let mut next = vec![FieldElement::ZERO; old_len * 2];
+        let (zero_bit, one_bit) = next.split_at_mut(old_len);
+        if old_len >= parallel_min_items() {
+            zero_bit
+                .par_iter_mut()
+                .zip(one_bit.par_iter_mut())
+                .enumerate()
+                .for_each(|(idx, (zero_slot, one_slot))| {
+                    let value = evals[idx];
+                    *zero_slot = value * one_minus;
+                    *one_slot = value * challenge;
+                });
+        } else {
+            for idx in 0..old_len {
+                let value = evals[idx];
+                zero_bit[idx] = value * one_minus;
+                one_bit[idx] = value * challenge;
+            }
+        }
+        evals = next;
+    }
+    Ok(evals)
 }
 
 pub fn evaluate_mle(evaluations: &[FieldElement], point: &[FieldElement]) -> Result<FieldElement> {
@@ -214,4 +262,23 @@ fn bits_le(mut index: usize, num_vars: usize) -> Vec<bool> {
         index >>= 1;
     }
     bits
+}
+
+fn parallel_sum(values: &[FieldElement]) -> FieldElement {
+    if values.len() < parallel_min_items() {
+        values.iter().copied().sum()
+    } else {
+        values
+            .par_iter()
+            .copied()
+            .reduce(|| FieldElement::ZERO, |left, right| left + right)
+    }
+}
+
+fn parallel_min_items() -> usize {
+    std::env::var("PQ_CORE_PARALLEL_MIN_ITEMS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PARALLEL_MIN_ITEMS)
 }

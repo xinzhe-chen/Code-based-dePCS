@@ -83,6 +83,38 @@ mod tests {
     }
 
     #[test]
+    fn parallel_eq_evaluations_match_basis_order() {
+        let point = (1_u64..=12).map(fe).collect::<Vec<_>>();
+        let evals = eq_evaluations(&point).expect("eq evals");
+        assert_eq!(evals.len(), 1 << point.len());
+        for index in [0, 1, 2, 3, 17, 255, 1023, 2048, 4095] {
+            assert_eq!(
+                evals[index],
+                eq_basis(&point, index).expect("basis index"),
+                "eq evaluation order changed at index {index}"
+            );
+        }
+        assert_eq!(
+            evals.iter().copied().sum::<FieldElement>(),
+            FieldElement::ONE
+        );
+    }
+
+    #[test]
+    fn parallel_mle_evaluation_matches_naive_at_medium_size() {
+        let evaluations = (0..4096)
+            .map(|index| fe((index as u64).wrapping_mul(17).wrapping_add(5)))
+            .collect::<Vec<_>>();
+        let mle = MultilinearExtension::from_evaluations(evaluations).expect("mle");
+        let point = (2_u64..=13).map(fe).collect::<Vec<_>>();
+
+        assert_eq!(
+            mle.evaluate(&point).expect("parallel fold evaluation"),
+            mle.evaluate_naive(&point).expect("eq-basis evaluation")
+        );
+    }
+
+    #[test]
     fn mle_rejects_wrong_length_and_oversized_dimensions() {
         let mle = MultilinearExtension::from_evaluations(vec![fe(1), fe(2)])
             .expect("two evaluations should define one variable");

@@ -1,6 +1,9 @@
 use pq_core::{CoreError, FieldElement, MultilinearPolynomial, eq_eval, eq_evaluations};
-use pq_transcript::{HashTranscript, Transcript};
+use pq_transcript::{HashTranscript, Transcript, sha256};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+
+const DEFAULT_PARALLEL_MIN_ITEMS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SumcheckError {
@@ -101,16 +104,7 @@ pub fn prove_sumcheck<T: Transcript>(
     let mut rounds = Vec::with_capacity(poly.num_vars());
     let mut challenges = Vec::with_capacity(poly.num_vars());
     for round in 0..poly.num_vars() {
-        let mut eval_at_0 = FieldElement::ZERO;
-        let mut eval_at_1 = FieldElement::ZERO;
-        for pair in current.evaluations().chunks_exact(2) {
-            eval_at_0 += pair[0];
-            eval_at_1 += pair[1];
-        }
-        let round_poly = RoundPolynomial {
-            eval_at_0,
-            eval_at_1,
-        };
+        let round_poly = linear_round_polynomial(&current);
         transcript.absorb_field(b"round-0", round_poly.eval_at_0);
         transcript.absorb_field(b"round-1", round_poly.eval_at_1);
         transcript.absorb_public(b"round-index", &(round as u64).to_le_bytes());
@@ -186,14 +180,11 @@ pub fn prove_distributed_sumcheck<T: Transcript>(
     if partitions.iter().any(|p| p.evaluations().len() != len) {
         return Err(SumcheckError::LengthMismatch);
     }
-    let mut aggregate = vec![FieldElement::ZERO; len];
-    let mut local_sums = Vec::with_capacity(partitions.len());
-    for partition in partitions {
-        local_sums.push(partition.sum_over_boolean_hypercube());
-        for (idx, value) in partition.evaluations().iter().copied().enumerate() {
-            aggregate[idx] += value;
-        }
-    }
+    let local_sums = partitions
+        .par_iter()
+        .map(MultilinearPolynomial::sum_over_boolean_hypercube)
+        .collect::<Vec<_>>();
+    let aggregate = aggregate_partitions(partitions, len);
     transcript.absorb_domain(b"distributed-sumcheck-v1");
     transcript.absorb_public(b"workers", &(partitions.len() as u64).to_le_bytes());
     let aggregate_poly = MultilinearPolynomial::new(aggregate)?;
@@ -218,21 +209,23 @@ pub fn verify_distributed_sumcheck<T: Transcript>(
         .ok_or(SumcheckError::LengthMismatch)?
         .evaluations()
         .len();
-    let mut aggregate = vec![FieldElement::ZERO; len];
-    let mut sum = FieldElement::ZERO;
-    for (idx, partition) in partitions.iter().enumerate() {
-        if partition.evaluations().len() != len {
-            return Err(SumcheckError::LengthMismatch);
-        }
-        let local = partition.sum_over_boolean_hypercube();
+    if partitions
+        .par_iter()
+        .any(|partition| partition.evaluations().len() != len)
+    {
+        return Err(SumcheckError::LengthMismatch);
+    }
+    let local_sums = partitions
+        .par_iter()
+        .map(MultilinearPolynomial::sum_over_boolean_hypercube)
+        .collect::<Vec<_>>();
+    for (idx, local) in local_sums.iter().copied().enumerate() {
         if proof.local_sums[idx] != local {
             return Err(SumcheckError::InvalidProof);
         }
-        sum += local;
-        for (item, value) in aggregate.iter_mut().zip(partition.evaluations()) {
-            *item += *value;
-        }
     }
+    let sum = parallel_sum(&local_sums);
+    let aggregate = aggregate_partitions(partitions, len);
     if sum != proof.aggregate.claimed_sum {
         return Err(SumcheckError::InvalidClaim);
     }
@@ -905,11 +898,11 @@ fn log_derivative_sum(
     let denominators = log_derivative_denominators(values, gamma);
     let inverses =
         FieldElement::batch_inverse(&denominators).ok_or(SumcheckError::ZeroDenominator)?;
-    Ok(inverses.into_iter().sum())
+    Ok(parallel_sum(&inverses))
 }
 
 fn log_derivative_denominators(values: &[FieldElement], gamma: FieldElement) -> Vec<FieldElement> {
-    values.iter().map(|value| gamma + *value).collect()
+    parallel_map(values, |value| gamma + value)
 }
 
 fn multiset_product(chunks: &[&[FieldElement]], gamma: FieldElement) -> FieldElement {
@@ -928,10 +921,8 @@ fn absorb_polynomial<T: Transcript>(poly: &MultilinearPolynomial, transcript: &m
         b"eval-len",
         &(poly.evaluations().len() as u64).to_le_bytes(),
     );
-    for (index, value) in poly.evaluations().iter().copied().enumerate() {
-        transcript.absorb_public(b"eval-index", &(index as u64).to_le_bytes());
-        transcript.absorb_field(b"eval", value);
-    }
+    let digest = field_values_digest(b"sumcheck-polynomial", b"eval", poly.evaluations());
+    transcript.absorb_commitment(b"eval-digest", &digest);
 }
 
 fn absorb_labeled_values<T: Transcript>(
@@ -940,10 +931,8 @@ fn absorb_labeled_values<T: Transcript>(
     values: &[FieldElement],
 ) {
     transcript.absorb_public(label, &(values.len() as u64).to_le_bytes());
-    for (index, value) in values.iter().copied().enumerate() {
-        transcript.absorb_public(b"multiset-index", &(index as u64).to_le_bytes());
-        transcript.absorb_field(label, value);
-    }
+    let digest = field_values_digest(b"sumcheck-labeled-values", label, values);
+    transcript.absorb_commitment(label, &digest);
 }
 
 fn absorb_multiset_statement<T: Transcript>(
@@ -969,11 +958,146 @@ fn absorb_rational_statement<T: Transcript>(
     absorb_labeled_values(transcript, b"rational-denominator", denominator);
 }
 
+fn linear_round_polynomial(current: &MultilinearPolynomial) -> RoundPolynomial {
+    if current.evaluations().len() / 2 >= parallel_min_items() {
+        let (eval_at_0, eval_at_1) = current
+            .evaluations()
+            .par_chunks_exact(2)
+            .map(|pair| (pair[0], pair[1]))
+            .reduce(
+                || (FieldElement::ZERO, FieldElement::ZERO),
+                |left, right| (left.0 + right.0, left.1 + right.1),
+            );
+        return RoundPolynomial {
+            eval_at_0,
+            eval_at_1,
+        };
+    }
+    let mut eval_at_0 = FieldElement::ZERO;
+    let mut eval_at_1 = FieldElement::ZERO;
+    for pair in current.evaluations().chunks_exact(2) {
+        eval_at_0 += pair[0];
+        eval_at_1 += pair[1];
+    }
+    RoundPolynomial {
+        eval_at_0,
+        eval_at_1,
+    }
+}
+
+fn aggregate_partitions(partitions: &[MultilinearPolynomial], len: usize) -> Vec<FieldElement> {
+    if len < parallel_min_items() {
+        let mut aggregate = vec![FieldElement::ZERO; len];
+        for partition in partitions {
+            for (item, value) in aggregate.iter_mut().zip(partition.evaluations()) {
+                *item += *value;
+            }
+        }
+        return aggregate;
+    }
+    (0..len)
+        .into_par_iter()
+        .map(|idx| {
+            partitions
+                .iter()
+                .map(|partition| partition.evaluations()[idx])
+                .sum()
+        })
+        .collect()
+}
+
+fn parallel_sum(values: &[FieldElement]) -> FieldElement {
+    if values.len() < parallel_min_items() {
+        values.iter().copied().sum()
+    } else {
+        values
+            .par_iter()
+            .copied()
+            .reduce(|| FieldElement::ZERO, |left, right| left + right)
+    }
+}
+
+fn parallel_map<F>(values: &[FieldElement], f: F) -> Vec<FieldElement>
+where
+    F: Fn(FieldElement) -> FieldElement + Send + Sync,
+{
+    if values.len() < parallel_min_items() {
+        values.iter().copied().map(f).collect()
+    } else {
+        values.par_iter().copied().map(f).collect()
+    }
+}
+
 fn inner_product(left: &[FieldElement], right: &[FieldElement]) -> FieldElement {
-    left.iter()
-        .zip(right)
-        .map(|(left, right)| *left * *right)
-        .sum()
+    if left.len() < parallel_min_items() {
+        left.iter()
+            .zip(right)
+            .map(|(left, right)| *left * *right)
+            .sum()
+    } else {
+        left.par_iter()
+            .zip(right.par_iter())
+            .map(|(left, right)| *left * *right)
+            .reduce(|| FieldElement::ZERO, |left, right| left + right)
+    }
+}
+
+fn parallel_min_items() -> usize {
+    std::env::var("PQ_SUMCHECK_PARALLEL_MIN_ITEMS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PARALLEL_MIN_ITEMS)
+}
+
+fn field_values_digest(domain: &[u8], label: &[u8], values: &[FieldElement]) -> [u8; 32] {
+    const DIGEST_CHUNK_ITEMS: usize = 1024;
+    let chunk_hashes = if values.len() < DIGEST_CHUNK_ITEMS {
+        vec![field_values_chunk_digest(domain, label, 0, values)]
+    } else {
+        values
+            .par_chunks(DIGEST_CHUNK_ITEMS)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                field_values_chunk_digest(domain, label, chunk_index * DIGEST_CHUNK_ITEMS, chunk)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut input = Vec::with_capacity(64 + chunk_hashes.len() * 40);
+    append_len_prefixed(&mut input, b"pq-sumcheck-field-values-digest-v1");
+    append_len_prefixed(&mut input, domain);
+    append_len_prefixed(&mut input, label);
+    input.extend_from_slice(&(values.len() as u64).to_le_bytes());
+    input.extend_from_slice(&(chunk_hashes.len() as u64).to_le_bytes());
+    for (chunk_index, digest) in chunk_hashes.iter().enumerate() {
+        input.extend_from_slice(&(chunk_index as u64).to_le_bytes());
+        input.extend_from_slice(digest);
+    }
+    sha256(&input)
+}
+
+fn field_values_chunk_digest(
+    domain: &[u8],
+    label: &[u8],
+    start_index: usize,
+    values: &[FieldElement],
+) -> [u8; 32] {
+    let mut input = Vec::with_capacity(64 + values.len() * 16);
+    append_len_prefixed(&mut input, b"pq-sumcheck-field-values-chunk-v1");
+    append_len_prefixed(&mut input, domain);
+    append_len_prefixed(&mut input, label);
+    input.extend_from_slice(&(start_index as u64).to_le_bytes());
+    input.extend_from_slice(&(values.len() as u64).to_le_bytes());
+    for (offset, value) in values.iter().copied().enumerate() {
+        input.extend_from_slice(&((start_index + offset) as u64).to_le_bytes());
+        input.extend_from_slice(&value.to_le_bytes());
+    }
+    sha256(&input)
+}
+
+fn append_len_prefixed(dst: &mut Vec<u8>, value: &[u8]) {
+    dst.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    dst.extend_from_slice(value);
 }
 
 fn challenge_point<T: Transcript>(num_vars: usize, transcript: &mut T) -> Vec<FieldElement> {
@@ -1024,6 +1148,30 @@ fn product_round_polynomial(
     current_eq: &MultilinearPolynomial,
 ) -> QuadraticRoundPolynomial {
     let two = FieldElement::from(2_u64);
+    if current_poly.evaluations().len() / 2 >= parallel_min_items() {
+        let (eval_at_0, eval_at_1, eval_at_2) = current_poly
+            .evaluations()
+            .par_chunks_exact(2)
+            .zip(current_eq.evaluations().par_chunks_exact(2))
+            .map(|(poly_pair, eq_pair)| {
+                let poly_at_2 = (FieldElement::ZERO - poly_pair[0]) + poly_pair[1] * two;
+                let eq_at_2 = (FieldElement::ZERO - eq_pair[0]) + eq_pair[1] * two;
+                (
+                    poly_pair[0] * eq_pair[0],
+                    poly_pair[1] * eq_pair[1],
+                    poly_at_2 * eq_at_2,
+                )
+            })
+            .reduce(
+                || (FieldElement::ZERO, FieldElement::ZERO, FieldElement::ZERO),
+                |left, right| (left.0 + right.0, left.1 + right.1, left.2 + right.2),
+            );
+        return QuadraticRoundPolynomial {
+            eval_at_0,
+            eval_at_1,
+            eval_at_2,
+        };
+    }
     let mut eval_at_0 = FieldElement::ZERO;
     let mut eval_at_1 = FieldElement::ZERO;
     let mut eval_at_2 = FieldElement::ZERO;
@@ -1057,6 +1205,40 @@ fn cubic_relation_round_polynomial(
         FieldElement::from(2_u64),
         FieldElement::from(3_u64),
     ];
+    if current_left.evaluations().len() / 2 >= parallel_min_items() {
+        let evals = current_left
+            .evaluations()
+            .par_chunks_exact(2)
+            .zip(current_right.evaluations().par_chunks_exact(2))
+            .zip(current_output.evaluations().par_chunks_exact(2))
+            .zip(current_eq.evaluations().par_chunks_exact(2))
+            .map(|(((left_pair, right_pair), output_pair), eq_pair)| {
+                let mut evals = [FieldElement::ZERO; 4];
+                for (idx, point) in points.iter().copied().enumerate() {
+                    let left = line_at(left_pair, point);
+                    let right = line_at(right_pair, point);
+                    let output = line_at(output_pair, point);
+                    let eq = line_at(eq_pair, point);
+                    evals[idx] += eq * (left * right - output);
+                }
+                evals
+            })
+            .reduce(
+                || [FieldElement::ZERO; 4],
+                |mut left, right| {
+                    for (left_item, right_item) in left.iter_mut().zip(right) {
+                        *left_item += right_item;
+                    }
+                    left
+                },
+            );
+        return CubicRoundPolynomial {
+            eval_at_0: evals[0],
+            eval_at_1: evals[1],
+            eval_at_2: evals[2],
+            eval_at_3: evals[3],
+        };
+    }
     let mut evals = [FieldElement::ZERO; 4];
     for (((left_pair, right_pair), output_pair), eq_pair) in current_left
         .evaluations()

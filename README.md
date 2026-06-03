@@ -100,6 +100,23 @@ are launched with hidden PowerShell child processes and `ProcessorAffinity`
 masks. The scripts print the derived core plan before the benchmark starts, and
 the result metadata records `host_logical_cores`, `cores_per_worker`, and
 `core_affinity`.
+The benchmark runner also configures the Rayon thread pool before the first
+job. Local runs use the detected logical-core count, while network worker
+processes set `RAYON_NUM_THREADS=cores_per_worker`, so the algorithmic thread
+count matches the affinity plan instead of merely pinning an otherwise serial
+worker process.
+The interactive benchmark wizard asks for a custom `n` range and worker power
+range. It no longer asks for a paper-preset grid or PCS query count; interactive
+proof and benchmark runs fix `pcs_queries=1` for the fastest soundness smoke
+path, while the Rust CLI still exposes `--pcs-queries N` for automation.
+To avoid underutilizing a many-core local machine while keeping the grid valid,
+the wizard detects logical cores and uses hidden defaults when an input is left
+blank: `n=8..10`, worker exponent
+`0..min(floor(log2(host_logical_cores)), n_min, 3)`. These defaults are not
+shown in square brackets in the benchmark prompts. On a 20-logical-core
+machine, leaving `n_min` blank yields workers `1,2,4,8` and
+`cores_per_worker=2`. You can still type smaller smoke grids or larger server
+grids manually, subject to the circuit and core-count checks.
 
 Open `results/bench-YYYYMMDD-HHMMSS-performance/overview.html` after a
 benchmark for the visual experiment dashboard. Proof experiments use
@@ -120,7 +137,7 @@ cargo run -p pq-experiments --release -- proof-experiment --protocol both --runn
 cargo run -p pq-experiments -- list-proofs --results results --format text
 cargo run -p pq-experiments -- verify-proof results/bench-YYYYMMDD-HHMMSS-proof --all --format json
 cargo run -p pq-experiments -- quick-smoke --out target/quick-smoke
-cargo run -p pq-experiments --release -- benchmark --runner both --n-range 2..5 --worker-power-range 0..2 --pcs-queries 1
+cargo run -p pq-experiments --release -- benchmark --runner both --n-range 8..10 --worker-power-range 0..3 --pcs-queries 1
 cargo run -p pq-experiments -- verify-results results/bench-YYYYMMDD-HHMMSS-performance --format json
 cargo run -p pq-experiments -- verify-proof results/bench-YYYYMMDD-HHMMSS-performance --all --format json
 ```
@@ -156,6 +173,15 @@ gate virtual-evaluation subclaims, Plonkish permutation accumulator random
 recurrence subclaims and cubic recurrence sumchecks, R1CS inner
 product-sumcheck openings, and PIOP
 consistency openings.
+`source.csv`, `source.json`, proof bundles, and `summary_stats.csv` also expose
+stage-level accounting: PCS commitment time, sumcheck time, batch/opening time,
+verifier PCS-opening time, verifier sumcheck time, and the remaining
+unclassified `other` time. The prover/verifier phase values are collected
+inside the R1CS and Plonkish protocol paths; only the `other` buckets are
+derived as total time minus classified phases. Proof-size rows are split into
+PCS, sumcheck, and other bytes from the proof structure, and `summary.txt` plus
+`overview.html` include a dedicated PCS commitment-cost and PCS proof-share
+analysis for each verified positive benchmark row.
 The benchmark command creates `results/bench-YYYYMMDD-HHMMSS-performance/`
 containing
 `metadata.json`, `result_manifest.json` with SHA-256 checksums for every other
@@ -216,9 +242,10 @@ cost, and `runner_overhead_by_size.*` shows network-runner prover time divided
 by local-runner prover time for matching protocol/worker/size settings. The
 SVG files are quick previews; the `.tex` outputs are the paper-facing artifacts
 and are annotated with their measured-data sources.
-Selecting figure compilation in the benchmark wizard, or passing
-`--compile-figures` to the Rust benchmark command, invokes `pdflatex` or
-`tectonic` from the result directory and writes `paper_figures_standalone.pdf`.
+The interactive benchmark wizard compiles paper figures by default. Passing
+`--compile-figures` to the Rust benchmark command provides the same behavior:
+it invokes `pdflatex` or `tectonic` from the result directory and writes
+`paper_figures_standalone.pdf`.
 The automatic compiler mode prefers `tectonic` when present because it is
 better suited to non-interactive runs. The interactive environment check reports
 whether a LaTeX figure compiler is installed and the setup path installs

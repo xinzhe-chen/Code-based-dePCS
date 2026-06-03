@@ -1,7 +1,6 @@
-use std::thread;
-
 use pq_core::{FieldElement, PartitionPlan, eq_basis, evaluate_mle, log2_power_of_two};
 use pq_transcript::{Transcript, sha256};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,17 +185,17 @@ pub fn encode_systematic(message: &[FieldElement]) -> PcsResult<Vec<FieldElement
     let stride = if len > 1 { len / 2 } else { 0 };
     let mut out = Vec::with_capacity(len * 4);
     out.extend_from_slice(message);
-    for idx in 0..len {
-        out.push(message[idx] + message[(idx + 1) % len]);
-    }
-    for idx in 0..len {
-        out.push(message[idx] + message[(idx + stride) % len]);
-    }
-    for idx in 0..len {
+    out.extend(parallel_field_section(len, |idx| {
+        message[idx] + message[(idx + 1) % len]
+    }));
+    out.extend(parallel_field_section(len, |idx| {
+        message[idx] + message[(idx + stride) % len]
+    }));
+    out.extend(parallel_field_section(len, |idx| {
         let adjacent = message[idx] + message[(idx + 1) % len];
         let strided = message[idx] + message[(idx + stride) % len];
-        out.push(adjacent + strided);
-    }
+        adjacent + strided
+    }));
     Ok(out)
 }
 
@@ -800,49 +799,42 @@ fn parallel_worker_commitments(
     evaluations: &[FieldElement],
     plan: &PartitionPlan,
 ) -> PcsResult<Vec<WorkerCommitment>> {
-    thread::scope(|scope| {
-        let handles = plan
-            .partitions()
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(ordinal, partition)| {
-                scope.spawn(move || {
-                    DistributedBrakedown::worker_commit(
-                        partition.id,
-                        partition.start,
-                        &evaluations[partition.start..partition.end],
-                    )
-                    .map(|commitment| (ordinal, commitment))
-                })
-            })
-            .collect::<Vec<_>>();
+    let results = plan
+        .partitions()
+        .par_iter()
+        .copied()
+        .enumerate()
+        .map(|(ordinal, partition)| {
+            DistributedBrakedown::worker_commit(
+                partition.id,
+                partition.start,
+                &evaluations[partition.start..partition.end],
+            )
+            .map(|commitment| (ordinal, commitment))
+        })
+        .collect::<Vec<_>>();
 
-        let mut commitments = vec![None; plan.len()];
-        for handle in handles {
-            let (ordinal, commitment) = handle.join().map_err(|_| PcsError::InvalidProof)??;
-            if ordinal >= commitments.len() {
-                return Err(PcsError::InvalidWorker);
-            }
-            commitments[ordinal] = Some(commitment);
+    let mut commitments = vec![None; plan.len()];
+    for result in results {
+        let (ordinal, commitment) = result?;
+        if ordinal >= commitments.len() {
+            return Err(PcsError::InvalidWorker);
         }
-        commitments
-            .into_iter()
-            .map(|commitment| commitment.ok_or(PcsError::InvalidWorker))
-            .collect()
-    })
+        commitments[ordinal] = Some(commitment);
+    }
+    commitments
+        .into_iter()
+        .map(|commitment| commitment.ok_or(PcsError::InvalidWorker))
+        .collect()
 }
 
 pub fn merkle_root(values: &[FieldElement]) -> PcsResult<[u8; 32]> {
     if values.is_empty() || !values.len().is_power_of_two() {
         return Err(PcsError::InvalidLength);
     }
-    let mut level = values.iter().copied().map(leaf_hash).collect::<Vec<_>>();
+    let mut level = parallel_leaf_hashes(values);
     while level.len() > 1 {
-        level = level
-            .chunks_exact(2)
-            .map(|pair| internal_hash(pair[0], pair[1]))
-            .collect();
+        level = parallel_internal_hashes(&level);
     }
     Ok(level[0])
 }
@@ -859,13 +851,10 @@ fn merkle_layers(values: &[FieldElement]) -> PcsResult<Vec<Vec<[u8; 32]>>> {
         return Err(PcsError::InvalidLength);
     }
     let mut layers = Vec::new();
-    let mut level = values.iter().copied().map(leaf_hash).collect::<Vec<_>>();
+    let mut level = parallel_leaf_hashes(values);
     layers.push(level.clone());
     while level.len() > 1 {
-        level = level
-            .chunks_exact(2)
-            .map(|pair| internal_hash(pair[0], pair[1]))
-            .collect();
+        level = parallel_internal_hashes(&level);
         layers.push(level.clone());
     }
     Ok(layers)
@@ -1495,10 +1484,46 @@ fn fold_once(values: &[FieldElement], challenge: FieldElement) -> PcsResult<Vec<
         return Err(PcsError::InvalidEvaluation);
     }
     let one_minus = FieldElement::ONE - challenge;
-    Ok(values
-        .chunks_exact(2)
-        .map(|pair| pair[0] * one_minus + pair[1] * challenge)
-        .collect())
+    Ok(parallel_field_section(values.len() / 2, |idx| {
+        values[idx * 2] * one_minus + values[idx * 2 + 1] * challenge
+    }))
+}
+
+fn parallel_leaf_hashes(values: &[FieldElement]) -> Vec<[u8; 32]> {
+    parallel_index_map(values.len(), |idx| leaf_hash(values[idx]))
+}
+
+fn parallel_internal_hashes(level: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    parallel_index_map(level.len() / 2, |idx| {
+        internal_hash(level[idx * 2], level[idx * 2 + 1])
+    })
+}
+
+fn parallel_field_section<F>(len: usize, f: F) -> Vec<FieldElement>
+where
+    F: Fn(usize) -> FieldElement + Send + Sync,
+{
+    parallel_index_map(len, f)
+}
+
+fn parallel_index_map<T, F>(len: usize, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Send + Sync,
+{
+    if len < parallel_min_items() {
+        (0..len).map(f).collect()
+    } else {
+        (0..len).into_par_iter().map(f).collect()
+    }
+}
+
+fn parallel_min_items() -> usize {
+    std::env::var("PQ_PCS_PARALLEL_MIN_ITEMS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64)
 }
 
 fn absorb_folding_proof<T: Transcript>(transcript: &mut T, proof: &MleFoldingProof) {
@@ -1728,10 +1753,67 @@ fn absorb_labeled_field_vec<T: Transcript>(
     values: &[FieldElement],
 ) {
     transcript.absorb_public(label, &(values.len() as u64).to_le_bytes());
-    for (index, value) in values.iter().copied().enumerate() {
-        transcript.absorb_public(b"field-vec-index", &(index as u64).to_le_bytes());
-        transcript.absorb_field(label, value);
+    let digest = field_values_digest(b"pq-pcs-labeled-field-vec", label, values);
+    transcript.absorb_commitment(label, &digest);
+}
+
+fn absorb_field_vec_digest<T: Transcript>(
+    transcript: &mut T,
+    label: &'static [u8],
+    values: &[FieldElement],
+) {
+    let digest = field_values_digest(b"pq-pcs-field-vec", label, values);
+    transcript.absorb_commitment(label, &digest);
+}
+
+fn field_values_digest(domain: &[u8], label: &[u8], values: &[FieldElement]) -> [u8; 32] {
+    const DIGEST_CHUNK_ITEMS: usize = 1024;
+    let chunk_hashes = if values.len() < DIGEST_CHUNK_ITEMS {
+        vec![field_values_chunk_digest(domain, label, 0, values)]
+    } else {
+        values
+            .par_chunks(DIGEST_CHUNK_ITEMS)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                field_values_chunk_digest(domain, label, chunk_index * DIGEST_CHUNK_ITEMS, chunk)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut input = Vec::with_capacity(64 + chunk_hashes.len() * 40);
+    append_digest_len_prefixed(&mut input, b"pq-pcs-field-values-digest-v1");
+    append_digest_len_prefixed(&mut input, domain);
+    append_digest_len_prefixed(&mut input, label);
+    input.extend_from_slice(&(values.len() as u64).to_le_bytes());
+    input.extend_from_slice(&(chunk_hashes.len() as u64).to_le_bytes());
+    for (chunk_index, digest) in chunk_hashes.iter().enumerate() {
+        input.extend_from_slice(&(chunk_index as u64).to_le_bytes());
+        input.extend_from_slice(digest);
     }
+    sha256(&input)
+}
+
+fn field_values_chunk_digest(
+    domain: &[u8],
+    label: &[u8],
+    start_index: usize,
+    values: &[FieldElement],
+) -> [u8; 32] {
+    let mut input = Vec::with_capacity(64 + values.len() * 16);
+    append_digest_len_prefixed(&mut input, b"pq-pcs-field-values-chunk-v1");
+    append_digest_len_prefixed(&mut input, domain);
+    append_digest_len_prefixed(&mut input, label);
+    input.extend_from_slice(&(start_index as u64).to_le_bytes());
+    input.extend_from_slice(&(values.len() as u64).to_le_bytes());
+    for (offset, value) in values.iter().copied().enumerate() {
+        input.extend_from_slice(&((start_index + offset) as u64).to_le_bytes());
+        input.extend_from_slice(&value.to_le_bytes());
+    }
+    sha256(&input)
+}
+
+fn append_digest_len_prefixed(dst: &mut Vec<u8>, value: &[u8]) {
+    dst.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    dst.extend_from_slice(value);
 }
 
 fn challenge_composition_point<T: Transcript>(
@@ -1826,9 +1908,7 @@ where
         b"combined-len",
         &(combined_column.len() as u64).to_le_bytes(),
     );
-    for value in &combined_column {
-        transcript.absorb_field(b"combined", *value);
-    }
+    absorb_field_vec_digest(transcript, b"combined", &combined_column);
     let combined_codeword = encode_systematic(&combined_column)?;
     absorb_labeled_field_vec(transcript, b"combined-codeword", &combined_codeword);
     let folding_proof = prove_mle_folding(&combined_column, &point[..col_vars])?;
@@ -2163,32 +2243,28 @@ fn validate_worker_query_order(opening: &WorkerOpening, query_indices: &[usize])
 fn parallel_local_worker_openings(
     requests: &[WorkerOpeningRequest<'_>],
 ) -> PcsResult<Vec<WorkerOpening>> {
-    thread::scope(|scope| {
-        let handles = requests
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(ordinal, request)| {
-                scope.spawn(move || {
-                    local_worker_opening(request.worker, request.row, request.query_indices)
-                        .map(|opening| (ordinal, opening))
-                })
-            })
-            .collect::<Vec<_>>();
+    let results = requests
+        .par_iter()
+        .copied()
+        .enumerate()
+        .map(|(ordinal, request)| {
+            local_worker_opening(request.worker, request.row, request.query_indices)
+                .map(|opening| (ordinal, opening))
+        })
+        .collect::<Vec<_>>();
 
-        let mut openings = vec![None; requests.len()];
-        for handle in handles {
-            let (ordinal, opening) = handle.join().map_err(|_| PcsError::InvalidProof)??;
-            if ordinal >= openings.len() {
-                return Err(PcsError::InvalidWorker);
-            }
-            openings[ordinal] = Some(opening);
+    let mut openings = vec![None; requests.len()];
+    for result in results {
+        let (ordinal, opening) = result?;
+        if ordinal >= openings.len() {
+            return Err(PcsError::InvalidWorker);
         }
-        openings
-            .into_iter()
-            .map(|opening| opening.ok_or(PcsError::InvalidWorker))
-            .collect()
-    })
+        openings[ordinal] = Some(opening);
+    }
+    openings
+        .into_iter()
+        .map(|opening| opening.ok_or(PcsError::InvalidWorker))
+        .collect()
 }
 
 fn local_worker_opening(
@@ -2619,9 +2695,7 @@ fn verify_opening_after_commitment<T: Transcript>(
         b"combined-len",
         &(opening.combined_column.len() as u64).to_le_bytes(),
     );
-    for value in &opening.combined_column {
-        transcript.absorb_field(b"combined", *value);
-    }
+    absorb_field_vec_digest(transcript, b"combined", &opening.combined_column);
     absorb_labeled_field_vec(transcript, b"combined-codeword", &opening.combined_codeword);
     absorb_folding_proof(transcript, &opening.folding_proof);
     let sampled_value = verify_sampled_mle_folding(
@@ -2760,6 +2834,43 @@ mod tests {
         let mut bad = proof;
         bad.value = 9_u64.into();
         assert!(MerklePcs::verify(&commitment, &bad).is_err());
+    }
+
+    #[test]
+    fn parallel_pcs_primitives_preserve_outputs() {
+        let values = (0..1024)
+            .map(|idx| FieldElement::from((idx as u64) + 1))
+            .collect::<Vec<_>>();
+        let encoded = encode_systematic(&values).expect("encode");
+        assert_eq!(&encoded[..values.len()], values.as_slice());
+        for idx in 0..values.len() {
+            assert_eq!(
+                encoded[values.len() + idx],
+                values[idx] + values[(idx + 1) % values.len()]
+            );
+        }
+
+        let root = merkle_root(&encoded).expect("root");
+        let layers = merkle_layers(&encoded).expect("layers");
+        assert_eq!(root, merkle_root_from_layers(&layers).expect("layer root"));
+        let opening = merkle_open_from_layers(&encoded, &layers, 513).expect("opening");
+        MerklePcs::verify(
+            &Commitment {
+                root,
+                len: encoded.len(),
+            },
+            &opening,
+        )
+        .expect("verify");
+
+        let challenge = FieldElement::from(7_u64);
+        let folded = fold_once(&values, challenge).expect("fold");
+        for idx in 0..folded.len() {
+            assert_eq!(
+                folded[idx],
+                values[idx * 2] * (FieldElement::ONE - challenge) + values[idx * 2 + 1] * challenge
+            );
+        }
     }
 
     #[test]

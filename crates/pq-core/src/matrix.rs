@@ -1,4 +1,7 @@
 use crate::{CoreError, FieldElement, Result};
+use rayon::prelude::*;
+
+const DEFAULT_PARALLEL_MIN_ROWS: usize = 64;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SparseEntry {
@@ -236,6 +239,12 @@ impl PrecomputedSparseMatrix {
 
     pub fn mul_vec(&self, vector: &[FieldElement]) -> Result<Vec<FieldElement>> {
         self.validate_vector_len(vector)?;
+        if self.rows >= parallel_min_rows() {
+            return Ok((0..self.rows)
+                .into_par_iter()
+                .map(|row| self.compute_row(row, vector))
+                .collect());
+        }
         let mut out = Vec::with_capacity(self.rows);
         for row in 0..self.rows {
             out.push(self.compute_row(row, vector));
@@ -322,6 +331,14 @@ fn small_mul(coeff: i8, value: FieldElement) -> FieldElement {
         _ => unreachable!("small coefficient classification only stores 2..=7"),
     };
     if coeff < 0 { -result } else { result }
+}
+
+fn parallel_min_rows() -> usize {
+    std::env::var("PQ_CORE_PARALLEL_MIN_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PARALLEL_MIN_ROWS)
 }
 
 #[cfg(test)]

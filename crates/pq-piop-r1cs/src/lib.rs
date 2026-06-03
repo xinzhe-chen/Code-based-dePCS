@@ -1,6 +1,6 @@
 use pq_core::{
     FieldElement, MultilinearPolynomial, Partition, PartitionPlan, R1csInstance, SparseEntry,
-    SparseMatrix, eq_basis, evaluate_mle, log2_power_of_two, sample_r1cs,
+    SparseMatrix, eq_basis, eq_evaluations, evaluate_mle, log2_power_of_two, sample_r1cs,
 };
 use pq_pcs::{
     Commitment, CompactDistributedOpening, DistributedBrakedown, DistributedCommitment,
@@ -18,8 +18,10 @@ use pq_sumcheck::{
     verify_cubic_zerocheck_rounds, verify_product_multiset_equality,
     verify_product_sumcheck_rounds, verify_zerocheck_rounds, zerocheck_final_evaluation,
 };
-use pq_transcript::{HashTranscript, Transcript};
+use pq_transcript::{HashTranscript, Transcript, sha256};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +34,36 @@ pub enum R1csPiopError {
 }
 
 pub type R1csPiopResult<T> = Result<T, R1csPiopError>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct R1csPhaseTiming {
+    pub label: String,
+    pub elapsed: Duration,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R1csProofSizeBreakdown {
+    pub total_bytes: usize,
+    pub pcs_bytes: usize,
+    pub sumcheck_bytes: usize,
+    pub other_bytes: usize,
+}
+
+thread_local! {
+    static R1CS_PHASE_TIMINGS: RefCell<Option<Vec<R1csPhaseTiming>>> = const { RefCell::new(None) };
+}
+
+pub fn collect_r1cs_phase_timings<F, T>(f: F) -> (T, Vec<R1csPhaseTiming>)
+where
+    F: FnOnce() -> T,
+{
+    R1CS_PHASE_TIMINGS.with(|timings| {
+        *timings.borrow_mut() = Some(Vec::new());
+    });
+    let result = f();
+    let timings = R1CS_PHASE_TIMINGS.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+    (result, timings)
+}
 
 pub struct R1csPiop;
 
@@ -698,6 +730,8 @@ where
         .map_err(|_| R1csPiopError::InvalidShape)?;
     let sumcheck =
         prove_zerocheck_proof(&residual_poly, transcript).map_err(|_| R1csPiopError::Sumcheck)?;
+    trace_r1cs_phase(trace, "prove/residual_sumcheck", phase.elapsed());
+    let phase = Instant::now();
     let point = sumcheck.challenges.clone();
     let residual_opening = (hooks.open_distributed)(
         &vectors.residual,
@@ -706,7 +740,7 @@ where
         pcs_params,
         transcript,
     )?;
-    trace_r1cs_phase(trace, "prove/residual_sumcheck_open", phase.elapsed());
+    trace_r1cs_phase(trace, "prove/residual_opening", phase.elapsed());
     let phase = Instant::now();
     let row_indices = challenge_row_indices(instance, pcs_params, transcript)?;
     let row_queries = row_indices
@@ -769,18 +803,26 @@ pub fn verify_r1cs_with_pcs_params<T: Transcript>(
     pcs_params: DistributedPcsParams,
     transcript: &mut T,
 ) -> R1csPiopResult<R1csMetrics> {
+    let trace = trace_r1cs_enabled();
+    let phase = Instant::now();
     if proof.workers == 0 || proof.workers != proof.residual_commitment.workers.len() {
         return Err(R1csPiopError::InvalidShape);
     }
     validate_commitment_shape(instance, proof)?;
+    trace_r1cs_phase(trace, "verify/shape", phase.elapsed());
+    let phase = Instant::now();
     transcript.absorb_domain(b"r1cs-piop-v1");
     absorb_instance_shape(instance, proof.workers, transcript);
     absorb_oracle_commitments(&proof.oracle_commitments, transcript);
     absorb_outer_commitments(&proof.outer_commitments, transcript);
+    trace_r1cs_phase(trace, "verify/commitment_absorb", phase.elapsed());
+    let phase = Instant::now();
     let row_vars = log2_power_of_two(proof.outer_commitments.az.original_len)
         .map_err(|_| R1csPiopError::InvalidShape)?;
     verify_cubic_zerocheck_rounds(row_vars, &proof.outer_sumcheck, transcript)
         .map_err(|_| R1csPiopError::Sumcheck)?;
+    trace_r1cs_phase(trace, "verify/outer_sumcheck", phase.elapsed());
+    let phase = Instant::now();
     verify_outer_openings(
         &proof.outer_commitments,
         &proof.outer_openings,
@@ -788,6 +830,8 @@ pub fn verify_r1cs_with_pcs_params<T: Transcript>(
         pcs_params,
         transcript,
     )?;
+    trace_r1cs_phase(trace, "verify/outer_openings", phase.elapsed());
+    let phase = Instant::now();
     verify_inner_linearization(
         instance,
         &proof.inner,
@@ -795,6 +839,8 @@ pub fn verify_r1cs_with_pcs_params<T: Transcript>(
         pcs_params,
         transcript,
     )?;
+    trace_r1cs_phase(trace, "verify/inner_linearization", phase.elapsed());
+    let phase = Instant::now();
     let witness_consistency_indices = challenge_witness_consistency_indices(
         &proof.oracle_commitments.witness,
         &proof.inner.witness_commitment,
@@ -808,11 +854,15 @@ pub fn verify_r1cs_with_pcs_params<T: Transcript>(
         &proof.witness_consistency_queries,
     )?;
     absorb_witness_consistency_queries(transcript, &proof.witness_consistency_queries);
+    trace_r1cs_phase(trace, "verify/witness_consistency", phase.elapsed());
+    let phase = Instant::now();
     DistributedBrakedown::absorb_distributed_commitment(&proof.residual_commitment, transcript);
     let num_vars = log2_power_of_two(proof.residual_commitment.original_len)
         .map_err(|_| R1csPiopError::InvalidShape)?;
     verify_zerocheck_rounds(num_vars, &proof.sumcheck, transcript)
         .map_err(|_| R1csPiopError::Sumcheck)?;
+    trace_r1cs_phase(trace, "verify/residual_sumcheck", phase.elapsed());
+    let phase = Instant::now();
     if proof.residual_opening.point() != proof.sumcheck.challenges.as_slice() {
         return Err(R1csPiopError::InvalidProof);
     }
@@ -827,6 +877,8 @@ pub fn verify_r1cs_with_pcs_params<T: Transcript>(
         pcs_params,
         transcript,
     )?;
+    trace_r1cs_phase(trace, "verify/residual_opening", phase.elapsed());
+    let phase = Instant::now();
     let row_indices = challenge_row_indices(instance, pcs_params, transcript)?;
     if row_indices.len() != proof.row_queries.len() {
         return Err(R1csPiopError::InvalidProof);
@@ -843,6 +895,8 @@ pub fn verify_r1cs_with_pcs_params<T: Transcript>(
         )?;
     }
     absorb_row_consistency_queries(transcript, &proof.row_queries);
+    trace_r1cs_phase(trace, "verify/row_queries", phase.elapsed());
+    let phase = Instant::now();
     verify_distributed_spark(
         instance,
         proof.workers,
@@ -853,7 +907,10 @@ pub fn verify_r1cs_with_pcs_params<T: Transcript>(
         &proof.spark,
         transcript,
     )?;
+    trace_r1cs_phase(trace, "verify/spark", phase.elapsed());
+    let phase = Instant::now();
     verify_inner_spark_link(&proof.inner, &proof.spark)?;
+    trace_r1cs_phase(trace, "verify/inner_spark_link", phase.elapsed());
     Ok(R1csMetrics {
         proof_bytes: proof_size_bytes(proof),
         communication_bytes: proof_communication_bytes(proof),
@@ -927,6 +984,14 @@ fn trace_r1cs_enabled() -> bool {
 }
 
 fn trace_r1cs_phase(enabled: bool, label: &str, elapsed: Duration) {
+    R1CS_PHASE_TIMINGS.with(|timings| {
+        if let Some(records) = timings.borrow_mut().as_mut() {
+            records.push(R1csPhaseTiming {
+                label: label.to_owned(),
+                elapsed,
+            });
+        }
+    });
     if enabled {
         eprintln!(
             "[r1cs trace] {label}: {:.3} ms",
@@ -1038,7 +1103,11 @@ where
         &mut T,
     ) -> R1csPiopResult<R1csPcsOpening>,
 {
+    let trace = trace_r1cs_enabled();
+    let phase = Instant::now();
     let witness_commitment = commit_distributed(&vectors.witness, config.workers)?;
+    trace_r1cs_phase(trace, "prove/inner_witness_commitment", phase.elapsed());
+    let phase = Instant::now();
     let matrix_challenges =
         derive_inner_matrix_challenges(outer_openings, &witness_commitment, transcript);
     let projected = projected_matrix_vector(
@@ -1054,6 +1123,8 @@ where
     let claimed_sum = inner_linearization_claim(outer_openings, matrix_challenges);
     let sumcheck = prove_product_sumcheck(&projected_poly, &witness_poly, claimed_sum, transcript)
         .map_err(|_| R1csPiopError::Sumcheck)?;
+    trace_r1cs_phase(trace, "prove/inner_sumcheck", phase.elapsed());
+    let phase = Instant::now();
     let witness_opening = open_distributed(
         &vectors.witness,
         &witness_commitment,
@@ -1061,11 +1132,14 @@ where
         config.pcs_params,
         transcript,
     )?;
+    trace_r1cs_phase(trace, "prove/inner_witness_opening", phase.elapsed());
+    let phase = Instant::now();
     let projected_eval =
         evaluate_mle(&projected, &sumcheck.challenges).map_err(|_| R1csPiopError::InvalidProof)?;
     if projected_eval * witness_opening.claimed_value() != sumcheck.final_evaluation {
         return Err(R1csPiopError::InvalidProof);
     }
+    trace_r1cs_phase(trace, "prove/inner_final_check", phase.elapsed());
     Ok(R1csInnerProof {
         matrix_challenges,
         witness_commitment,
@@ -1081,6 +1155,8 @@ fn verify_inner_linearization<T: Transcript>(
     pcs_params: DistributedPcsParams,
     transcript: &mut T,
 ) -> R1csPiopResult<()> {
+    let trace = trace_r1cs_enabled();
+    let phase = Instant::now();
     let matrix_challenges =
         derive_inner_matrix_challenges(outer_openings, &proof.witness_commitment, transcript);
     if proof.matrix_challenges != matrix_challenges {
@@ -1091,6 +1167,8 @@ fn verify_inner_linearization<T: Transcript>(
     let claimed_sum = inner_linearization_claim(outer_openings, matrix_challenges);
     verify_product_sumcheck_rounds(witness_vars, claimed_sum, &proof.sumcheck, transcript)
         .map_err(|_| R1csPiopError::Sumcheck)?;
+    trace_r1cs_phase(trace, "verify/inner_sumcheck", phase.elapsed());
+    let phase = Instant::now();
     if proof.witness_opening.point() != proof.sumcheck.challenges.as_slice() {
         return Err(R1csPiopError::InvalidProof);
     }
@@ -1099,6 +1177,7 @@ fn verify_inner_linearization<T: Transcript>(
         pcs_params,
         transcript,
     )?;
+    trace_r1cs_phase(trace, "verify/inner_witness_opening", phase.elapsed());
     Ok(())
 }
 
@@ -1602,6 +1681,54 @@ pub fn proof_communication_bytes(proof: &R1csPiopProof) -> usize {
             .sum::<usize>()
 }
 
+pub fn proof_size_breakdown(proof: &R1csPiopProof) -> R1csProofSizeBreakdown {
+    let total_bytes = proof_size_bytes(proof);
+    let pcs_bytes = r1cs_pcs_proof_size_bytes(proof);
+    let sumcheck_bytes = r1cs_sumcheck_proof_size_bytes(proof);
+    let other_bytes = total_bytes.saturating_sub(pcs_bytes + sumcheck_bytes);
+    R1csProofSizeBreakdown {
+        total_bytes,
+        pcs_bytes,
+        sumcheck_bytes,
+        other_bytes,
+    }
+}
+
+fn r1cs_pcs_proof_size_bytes(proof: &R1csPiopProof) -> usize {
+    commitment_size_bytes(&proof.oracle_commitments.witness)
+        + commitment_size_bytes(&proof.oracle_commitments.az)
+        + commitment_size_bytes(&proof.oracle_commitments.bz)
+        + commitment_size_bytes(&proof.oracle_commitments.cz)
+        + distributed_commitment_size_bytes(&proof.outer_commitments.az)
+        + distributed_commitment_size_bytes(&proof.outer_commitments.bz)
+        + distributed_commitment_size_bytes(&proof.outer_commitments.cz)
+        + proof.outer_openings.az.proof_size_bytes()
+        + proof.outer_openings.bz.proof_size_bytes()
+        + proof.outer_openings.cz.proof_size_bytes()
+        + distributed_commitment_size_bytes(&proof.inner.witness_commitment)
+        + proof.inner.witness_opening.proof_size_bytes()
+        + proof
+            .witness_consistency_queries
+            .iter()
+            .map(witness_consistency_query_pcs_size_bytes)
+            .sum::<usize>()
+        + distributed_commitment_size_bytes(&proof.residual_commitment)
+        + proof.residual_opening.proof_size_bytes()
+        + proof
+            .row_queries
+            .iter()
+            .map(row_query_pcs_size_bytes)
+            .sum::<usize>()
+        + spark_pcs_size_bytes(&proof.spark)
+}
+
+fn r1cs_sumcheck_proof_size_bytes(proof: &R1csPiopProof) -> usize {
+    cubic_zerocheck_proof_size_bytes(&proof.outer_sumcheck)
+        + product_sumcheck_proof_size_bytes(&proof.inner.sumcheck)
+        + zerocheck_proof_size_bytes(&proof.sumcheck)
+        + spark_sumcheck_size_bytes(&proof.spark)
+}
+
 fn row_query_size_bytes(query: &R1csRowConsistencyQuery) -> usize {
     8 + vec_len_prefix()
         + query
@@ -1609,6 +1736,18 @@ fn row_query_size_bytes(query: &R1csRowConsistencyQuery) -> usize {
             .iter()
             .map(opening_proof_size_bytes)
             .sum::<usize>()
+        + opening_proof_size_bytes(&query.az_opening)
+        + opening_proof_size_bytes(&query.bz_opening)
+        + opening_proof_size_bytes(&query.cz_opening)
+        + distributed_index_opening_size_bytes(&query.residual_opening)
+}
+
+fn row_query_pcs_size_bytes(query: &R1csRowConsistencyQuery) -> usize {
+    query
+        .witness_openings
+        .iter()
+        .map(opening_proof_size_bytes)
+        .sum::<usize>()
         + opening_proof_size_bytes(&query.az_opening)
         + opening_proof_size_bytes(&query.bz_opening)
         + opening_proof_size_bytes(&query.cz_opening)
@@ -1700,6 +1839,44 @@ fn spark_memory_check_size_bytes(proof: &SparkMemoryCheckProof) -> usize {
         + product_multiset_equality_proof_size_bytes(&proof.multiset)
 }
 
+fn spark_pcs_size_bytes(proof: &DistributedSparkProof) -> usize {
+    proof
+        .matrix_evaluations
+        .iter()
+        .map(|matrix| {
+            spark_memory_check_pcs_size_bytes(&matrix.row_memory)
+                + spark_memory_check_pcs_size_bytes(&matrix.col_memory)
+                + spark_memory_check_pcs_size_bytes(&matrix.value_memory)
+        })
+        .sum()
+}
+
+fn spark_sumcheck_size_bytes(proof: &DistributedSparkProof) -> usize {
+    proof
+        .matrix_evaluations
+        .iter()
+        .map(|matrix| {
+            product_multiset_equality_proof_size_bytes(&matrix.row_memory.multiset)
+                + product_multiset_equality_proof_size_bytes(&matrix.col_memory.multiset)
+                + product_multiset_equality_proof_size_bytes(&matrix.value_memory.multiset)
+        })
+        .sum()
+}
+
+fn spark_memory_check_pcs_size_bytes(proof: &SparkMemoryCheckProof) -> usize {
+    spark_memory_trace_commitments_size_bytes(&proof.trace_commitments)
+        + proof
+            .domain_queries
+            .iter()
+            .map(spark_memory_domain_query_pcs_size_bytes)
+            .sum::<usize>()
+        + proof
+            .access_queries
+            .iter()
+            .map(spark_memory_access_query_pcs_size_bytes)
+            .sum::<usize>()
+}
+
 fn spark_memory_trace_commitments_size_bytes(commitments: &SparkMemoryTraceCommitments) -> usize {
     commitment_size_bytes(&commitments.init)
         + commitment_size_bytes(&commitments.writes)
@@ -1711,6 +1888,10 @@ fn spark_memory_domain_query_size_bytes(query: &SparkMemoryDomainQuery) -> usize
     8 + opening_proof_size_bytes(&query.init) + opening_proof_size_bytes(&query.audit)
 }
 
+fn spark_memory_domain_query_pcs_size_bytes(query: &SparkMemoryDomainQuery) -> usize {
+    opening_proof_size_bytes(&query.init) + opening_proof_size_bytes(&query.audit)
+}
+
 fn spark_memory_access_query_size_bytes(query: &SparkMemoryAccessQuery) -> usize {
     8 + opening_proof_size_bytes(&query.read)
         + opening_proof_size_bytes(&query.write)
@@ -1720,8 +1901,17 @@ fn spark_memory_access_query_size_bytes(query: &SparkMemoryAccessQuery) -> usize
         + 8
 }
 
+fn spark_memory_access_query_pcs_size_bytes(query: &SparkMemoryAccessQuery) -> usize {
+    opening_proof_size_bytes(&query.read) + opening_proof_size_bytes(&query.write)
+}
+
 fn witness_consistency_query_size_bytes(query: &R1csWitnessConsistencyQuery) -> usize {
     8 + opening_proof_size_bytes(&query.oracle_opening)
+        + distributed_index_opening_size_bytes(&query.distributed_opening)
+}
+
+fn witness_consistency_query_pcs_size_bytes(query: &R1csWitnessConsistencyQuery) -> usize {
+    opening_proof_size_bytes(&query.oracle_opening)
         + distributed_index_opening_size_bytes(&query.distributed_opening)
 }
 
@@ -1989,35 +2179,14 @@ fn compute_spark_worker_fingerprints(
     plan: &PartitionPlan,
     challenges: SparkChallenges,
 ) -> R1csPiopResult<Vec<SparkWorkerFingerprint>> {
-    let mut workers = Vec::with_capacity(plan.len());
-    for partition in plan.partitions() {
-        let mut entry_count = 0_usize;
-        let mut linear_fingerprint = FieldElement::ZERO;
-        let mut product_fingerprint = FieldElement::ONE;
-        for (matrix_id, matrix) in [instance.a(), instance.b(), instance.c()]
-            .iter()
-            .enumerate()
-        {
-            for entry in matrix
-                .entries()
-                .iter()
-                .filter(|entry| partition.contains(entry.row))
-            {
-                let encoded = spark_entry_encoding(matrix_id, entry, challenges);
-                entry_count += 1;
-                linear_fingerprint += encoded;
-                product_fingerprint *= challenges.tuple + encoded;
-            }
-        }
-        workers.push(SparkWorkerFingerprint {
-            worker_id: partition.id,
-            range: (partition.start, partition.end),
-            entry_count,
-            linear_fingerprint,
-            product_fingerprint,
-        });
-    }
-    Ok(workers)
+    Ok(plan
+        .partitions()
+        .par_iter()
+        .copied()
+        .map(|partition| {
+            compute_spark_worker_fingerprint_for_partition(instance, partition, challenges)
+        })
+        .collect())
 }
 
 pub fn compute_spark_worker_shard_claim(
@@ -2030,7 +2199,7 @@ pub fn compute_spark_worker_shard_claim(
     let fingerprint =
         compute_spark_worker_fingerprint_for_partition(instance, partition, challenges);
     let matrix_evaluations = instance_matrices(instance)
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(matrix_id, matrix)| {
             compute_spark_worker_evaluation_for_partition(
@@ -2049,24 +2218,27 @@ fn compute_spark_worker_fingerprint_for_partition(
     partition: Partition,
     challenges: SparkChallenges,
 ) -> SparkWorkerFingerprint {
-    let mut entry_count = 0_usize;
-    let mut linear_fingerprint = FieldElement::ZERO;
-    let mut product_fingerprint = FieldElement::ONE;
-    for (matrix_id, matrix) in [instance.a(), instance.b(), instance.c()]
-        .iter()
+    let (entry_count, linear_fingerprint, product_fingerprint) = instance_matrices(instance)
+        .par_iter()
         .enumerate()
-    {
-        for entry in matrix
-            .entries()
-            .iter()
-            .filter(|entry| partition.contains(entry.row))
-        {
-            let encoded = spark_entry_encoding(matrix_id, entry, challenges);
-            entry_count += 1;
-            linear_fingerprint += encoded;
-            product_fingerprint *= challenges.tuple + encoded;
-        }
-    }
+        .map(|(matrix_id, matrix)| {
+            matrix
+                .entries()
+                .par_iter()
+                .filter(|entry| partition.contains(entry.row))
+                .map(|entry| {
+                    let encoded = spark_entry_encoding(matrix_id, entry, challenges);
+                    (1_usize, encoded, challenges.tuple + encoded)
+                })
+                .reduce(
+                    || (0_usize, FieldElement::ZERO, FieldElement::ONE),
+                    |left, right| (left.0 + right.0, left.1 + right.1, left.2 * right.2),
+                )
+        })
+        .reduce(
+            || (0_usize, FieldElement::ZERO, FieldElement::ONE),
+            |left, right| (left.0 + right.0, left.1 + right.1, left.2 * right.2),
+        );
     SparkWorkerFingerprint {
         worker_id: partition.id,
         range: (partition.start, partition.end),
@@ -2317,13 +2489,15 @@ fn compute_spark_worker_evaluations(
     {
         return Err(R1csPiopError::InvalidProof);
     }
-    let mut workers = Vec::with_capacity(plan.len());
-    for partition in plan.partitions() {
-        workers.push(compute_spark_worker_evaluation_for_partition(
-            matrix_id, matrix, *partition, row_point, col_point,
-        )?);
-    }
-    Ok(workers)
+    plan.partitions()
+        .par_iter()
+        .copied()
+        .map(|partition| {
+            compute_spark_worker_evaluation_for_partition(
+                matrix_id, matrix, partition, row_point, col_point,
+            )
+        })
+        .collect()
 }
 
 fn compute_spark_worker_evaluation_for_partition(
@@ -2334,16 +2508,15 @@ fn compute_spark_worker_evaluation_for_partition(
     col_point: &[FieldElement],
 ) -> R1csPiopResult<SparkWorkerEvaluation> {
     validate_spark_evaluation_points(matrix, row_point, col_point)?;
-    let mut entry_count = 0_usize;
-    let mut evaluation = FieldElement::ZERO;
-    for entry in matrix
+    let (entry_count, evaluation) = matrix
         .entries()
-        .iter()
+        .par_iter()
         .filter(|entry| partition.contains(entry.row))
-    {
-        entry_count += 1;
-        evaluation += sparse_entry_mle_term(entry, row_point, col_point)?;
-    }
+        .map(|entry| sparse_entry_mle_term(entry, row_point, col_point).map(|term| (1_usize, term)))
+        .try_reduce(
+            || (0_usize, FieldElement::ZERO),
+            |left, right| Ok((left.0 + right.0, left.1 + right.1)),
+        )?;
     Ok(SparkWorkerEvaluation {
         matrix_id,
         worker_id: partition.id,
@@ -2901,6 +3074,7 @@ fn spark_memory_trace(
     let gamma_sq = hash_challenge * hash_challenge;
     let mut timestamps = vec![FieldElement::ZERO; domain_len];
     let init = (0..domain_len)
+        .into_par_iter()
         .map(|index| {
             spark_memory_hash(
                 index,
@@ -2946,6 +3120,7 @@ fn spark_memory_trace(
         write_timestamps.push(global_timestamp);
     }
     let audit = (0..domain_len)
+        .into_par_iter()
         .map(|index| {
             spark_memory_hash(
                 index,
@@ -2986,27 +3161,26 @@ fn compute_spark_memory_worker_digests(
         return Err(R1csPiopError::InvalidShape);
     }
     plan.partitions()
-        .iter()
+        .par_iter()
         .zip(domain_plan.partitions())
         .map(|(entry_partition, memory_partition)| {
-            let mut access_count = 0_usize;
-            let mut read_product = FieldElement::ONE;
-            let mut write_product = FieldElement::ONE;
-            for (index, entry) in entries.iter().enumerate() {
-                if entry_partition.contains(entry.row) {
-                    access_count += 1;
-                    read_product *= trace.reads[index];
-                    write_product *= trace.writes[index];
-                }
-            }
+            let (access_count, read_product, write_product) = entries
+                .par_iter()
+                .enumerate()
+                .filter(|(_, entry)| entry_partition.contains(entry.row))
+                .map(|(index, _)| (1_usize, trace.reads[index], trace.writes[index]))
+                .reduce(
+                    || (0_usize, FieldElement::ONE, FieldElement::ONE),
+                    |left, right| (left.0 + right.0, left.1 * right.1, left.2 * right.2),
+                );
             let init_product = trace.init[memory_partition.start..memory_partition.end]
-                .iter()
+                .par_iter()
                 .copied()
-                .product();
+                .reduce(|| FieldElement::ONE, |left, right| left * right);
             let audit_product = trace.audit[memory_partition.start..memory_partition.end]
-                .iter()
+                .par_iter()
                 .copied()
-                .product();
+                .reduce(|| FieldElement::ONE, |left, right| left * right);
             Ok(SparkMemoryWorkerDigest {
                 worker_id: entry_partition.id,
                 entry_range: (entry_partition.start, entry_partition.end),
@@ -3031,9 +3205,11 @@ fn spark_eq_memory_values(
     {
         return Err(R1csPiopError::InvalidShape);
     }
-    (0..domain_len)
-        .map(|index| eq_basis(point, index).map_err(|_| R1csPiopError::InvalidProof))
-        .collect()
+    let values = eq_evaluations(point).map_err(|_| R1csPiopError::InvalidProof)?;
+    if values.len() != domain_len {
+        return Err(R1csPiopError::InvalidShape);
+    }
+    Ok(values)
 }
 
 fn spark_value_memory_values(
@@ -3044,9 +3220,10 @@ fn spark_value_memory_values(
         return Err(R1csPiopError::InvalidShape);
     }
     let mut values = vec![FieldElement::ZERO; domain_len];
-    for (index, entry) in entries.iter().enumerate() {
-        values[index] = entry.value;
-    }
+    values
+        .par_iter_mut()
+        .zip(entries.par_iter().map(|entry| entry.value))
+        .for_each(|(slot, value)| *slot = value);
     Ok(values)
 }
 
@@ -3108,15 +3285,8 @@ fn absorb_spark_matrix_evaluation_statement<T: Transcript>(
         b"spark-matrix-nnz",
         &(matrix.entries().len() as u64).to_le_bytes(),
     );
-    for (entry_index, entry) in matrix.entries().iter().enumerate() {
-        transcript.absorb_public(
-            b"spark-matrix-entry-index",
-            &(entry_index as u64).to_le_bytes(),
-        );
-        transcript.absorb_public(b"spark-matrix-entry-row", &(entry.row as u64).to_le_bytes());
-        transcript.absorb_public(b"spark-matrix-entry-col", &(entry.col as u64).to_le_bytes());
-        transcript.absorb_field(b"spark-matrix-entry-value", entry.value);
-    }
+    let digest = sparse_matrix_digest(b"r1cs-spark-matrix-eval-statement", matrix_id, matrix);
+    transcript.absorb_commitment(b"spark-matrix-entry-digest", &digest);
     for coordinate in row_point {
         transcript.absorb_field(b"spark-row-point", *coordinate);
     }
@@ -3311,14 +3481,84 @@ fn absorb_instance_shape<T: Transcript>(
     transcript.absorb_public(b"workers", &(workers as u64).to_le_bytes());
     transcript.absorb_public(b"rows", &(instance.a().rows() as u64).to_le_bytes());
     transcript.absorb_public(b"cols", &(instance.a().cols() as u64).to_le_bytes());
-    for matrix in [instance.a(), instance.b(), instance.c()] {
+    for (matrix_id, matrix) in [instance.a(), instance.b(), instance.c()]
+        .into_iter()
+        .enumerate()
+    {
         transcript.absorb_public(b"entries", &(matrix.entries().len() as u64).to_le_bytes());
-        for entry in matrix.entries() {
-            transcript.absorb_public(b"row", &(entry.row as u64).to_le_bytes());
-            transcript.absorb_public(b"col", &(entry.col as u64).to_le_bytes());
-            transcript.absorb_field(b"value", entry.value);
-        }
+        let digest = sparse_matrix_digest(b"r1cs-instance-shape", matrix_id, matrix);
+        transcript.absorb_commitment(b"matrix-entry-digest", &digest);
     }
+}
+
+fn sparse_matrix_digest(domain: &[u8], matrix_id: usize, matrix: &SparseMatrix) -> [u8; 32] {
+    const DIGEST_CHUNK_ITEMS: usize = 1024;
+    let chunk_hashes = if matrix.entries().len() < DIGEST_CHUNK_ITEMS {
+        vec![sparse_matrix_chunk_digest(
+            domain,
+            matrix_id,
+            matrix,
+            0,
+            matrix.entries(),
+        )]
+    } else {
+        matrix
+            .entries()
+            .par_chunks(DIGEST_CHUNK_ITEMS)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                sparse_matrix_chunk_digest(
+                    domain,
+                    matrix_id,
+                    matrix,
+                    chunk_index * DIGEST_CHUNK_ITEMS,
+                    chunk,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut input = Vec::with_capacity(96 + chunk_hashes.len() * 40);
+    append_digest_len_prefixed(&mut input, b"pq-r1cs-sparse-matrix-digest-v1");
+    append_digest_len_prefixed(&mut input, domain);
+    input.extend_from_slice(&(matrix_id as u64).to_le_bytes());
+    input.extend_from_slice(&(matrix.rows() as u64).to_le_bytes());
+    input.extend_from_slice(&(matrix.cols() as u64).to_le_bytes());
+    input.extend_from_slice(&(matrix.entries().len() as u64).to_le_bytes());
+    input.extend_from_slice(&(chunk_hashes.len() as u64).to_le_bytes());
+    for (chunk_index, digest) in chunk_hashes.iter().enumerate() {
+        input.extend_from_slice(&(chunk_index as u64).to_le_bytes());
+        input.extend_from_slice(digest);
+    }
+    sha256(&input)
+}
+
+fn sparse_matrix_chunk_digest(
+    domain: &[u8],
+    matrix_id: usize,
+    matrix: &SparseMatrix,
+    start_index: usize,
+    entries: &[SparseEntry],
+) -> [u8; 32] {
+    let mut input = Vec::with_capacity(96 + entries.len() * 32);
+    append_digest_len_prefixed(&mut input, b"pq-r1cs-sparse-matrix-chunk-v1");
+    append_digest_len_prefixed(&mut input, domain);
+    input.extend_from_slice(&(matrix_id as u64).to_le_bytes());
+    input.extend_from_slice(&(matrix.rows() as u64).to_le_bytes());
+    input.extend_from_slice(&(matrix.cols() as u64).to_le_bytes());
+    input.extend_from_slice(&(start_index as u64).to_le_bytes());
+    input.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for (offset, entry) in entries.iter().enumerate() {
+        input.extend_from_slice(&((start_index + offset) as u64).to_le_bytes());
+        input.extend_from_slice(&(entry.row as u64).to_le_bytes());
+        input.extend_from_slice(&(entry.col as u64).to_le_bytes());
+        input.extend_from_slice(&entry.value.to_le_bytes());
+    }
+    sha256(&input)
+}
+
+fn append_digest_len_prefixed(dst: &mut Vec<u8>, value: &[u8]) {
+    dst.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    dst.extend_from_slice(value);
 }
 
 pub fn sample_proof(workers: usize) -> R1csPiopResult<R1csPiopProof> {

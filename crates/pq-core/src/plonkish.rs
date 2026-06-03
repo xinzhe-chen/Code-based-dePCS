@@ -1,5 +1,8 @@
 use crate::{CoreError, FieldElement, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+
+const DEFAULT_PARALLEL_MIN_ROWS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Gate {
@@ -300,14 +303,22 @@ impl PlonkishCircuit {
     }
 
     pub fn row_evaluations(&self) -> Vec<FieldElement> {
-        self.rows.iter().map(PlonkishRow::evaluate).collect()
+        if self.rows.len() >= parallel_min_rows() {
+            self.rows.par_iter().map(PlonkishRow::evaluate).collect()
+        } else {
+            self.rows.iter().map(PlonkishRow::evaluate).collect()
+        }
     }
 
     pub fn is_satisfied(&self) -> bool {
         if !self.gates.is_empty() || !self.permutation.is_empty() {
             return false;
         }
-        self.rows.iter().all(PlonkishRow::is_satisfied)
+        if self.rows.len() >= parallel_min_rows() {
+            self.rows.par_iter().all(PlonkishRow::is_satisfied)
+        } else {
+            self.rows.iter().all(PlonkishRow::is_satisfied)
+        }
     }
 
     pub fn is_satisfied_with_witness(&self, witness: &[FieldElement]) -> Result<bool> {
@@ -317,22 +328,32 @@ impl PlonkishCircuit {
                 actual: witness.len(),
             });
         }
-        for gate in &self.gates {
-            let ok = match *gate {
-                Gate::Add { left, right, out } => witness[left] + witness[right] == witness[out],
-                Gate::Mul { left, right, out } => witness[left] * witness[right] == witness[out],
-                Gate::Const { wire, value } => witness[wire] == value,
-            };
-            if !ok {
-                return Ok(false);
-            }
+        let gates_ok = if self.gates.len() >= parallel_min_rows() {
+            self.gates
+                .par_iter()
+                .all(|gate| gate_is_satisfied(gate, witness))
+        } else {
+            self.gates
+                .iter()
+                .all(|gate| gate_is_satisfied(gate, witness))
+        };
+        if !gates_ok {
+            return Ok(false);
         }
-        for (idx, target) in self.permutation.iter().copied().enumerate() {
-            if witness[idx] != witness[target] {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        let permutation_ok = if self.permutation.len() >= parallel_min_rows() {
+            self.permutation
+                .par_iter()
+                .copied()
+                .enumerate()
+                .all(|(idx, target)| witness[idx] == witness[target])
+        } else {
+            self.permutation
+                .iter()
+                .copied()
+                .enumerate()
+                .all(|(idx, target)| witness[idx] == witness[target])
+        };
+        Ok(permutation_ok)
     }
 
     pub fn sample_gate_permutation() -> (Self, Vec<FieldElement>) {
@@ -370,6 +391,22 @@ impl PlonkishCircuit {
         ];
         (circuit, witness)
     }
+}
+
+fn gate_is_satisfied(gate: &Gate, witness: &[FieldElement]) -> bool {
+    match *gate {
+        Gate::Add { left, right, out } => witness[left] + witness[right] == witness[out],
+        Gate::Mul { left, right, out } => witness[left] * witness[right] == witness[out],
+        Gate::Const { wire, value } => witness[wire] == value,
+    }
+}
+
+fn parallel_min_rows() -> usize {
+    std::env::var("PQ_CORE_PARALLEL_MIN_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PARALLEL_MIN_ROWS)
 }
 
 fn validate_gate_indices(num_wires: usize, gate: &Gate) -> Result<()> {

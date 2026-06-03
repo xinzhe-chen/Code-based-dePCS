@@ -20,6 +20,8 @@ use pq_sumcheck::{
 };
 use pq_transcript::Transcript;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlonkishPiopError {
@@ -30,6 +32,57 @@ pub enum PlonkishPiopError {
 }
 
 pub type PlonkishPiopResult<T> = Result<T, PlonkishPiopError>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlonkishPhaseTiming {
+    pub label: String,
+    pub elapsed: Duration,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlonkishProofSizeBreakdown {
+    pub total_bytes: usize,
+    pub pcs_bytes: usize,
+    pub sumcheck_bytes: usize,
+    pub other_bytes: usize,
+}
+
+thread_local! {
+    static PLONKISH_PHASE_TIMINGS: RefCell<Option<Vec<PlonkishPhaseTiming>>> = const { RefCell::new(None) };
+}
+
+pub fn collect_plonkish_phase_timings<F, T>(f: F) -> (T, Vec<PlonkishPhaseTiming>)
+where
+    F: FnOnce() -> T,
+{
+    PLONKISH_PHASE_TIMINGS.with(|timings| {
+        *timings.borrow_mut() = Some(Vec::new());
+    });
+    let result = f();
+    let timings = PLONKISH_PHASE_TIMINGS.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+    (result, timings)
+}
+
+fn trace_plonkish_enabled() -> bool {
+    std::env::var_os("PQ_DSNARK_TRACE_PLONKISH").is_some()
+}
+
+fn trace_plonkish_phase(enabled: bool, label: &str, elapsed: Duration) {
+    PLONKISH_PHASE_TIMINGS.with(|timings| {
+        if let Some(records) = timings.borrow_mut().as_mut() {
+            records.push(PlonkishPhaseTiming {
+                label: label.to_owned(),
+                elapsed,
+            });
+        }
+    });
+    if enabled {
+        eprintln!(
+            "[plonkish trace] {label}: {:.3} ms",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlonkishWitnessRow {
@@ -773,18 +826,26 @@ where
         &mut T,
     ) -> PlonkishPiopResult<PlonkishPcsOpening>,
 {
+    let trace = trace_plonkish_enabled();
+    let phase = Instant::now();
     if workers == 0 {
         return Err(PlonkishPiopError::InvalidShape);
     }
     if !instance.is_satisfied()? {
         return Err(PlonkishPiopError::Unsatisfied);
     }
+    trace_plonkish_phase(trace, "prove/is_satisfied", phase.elapsed());
 
+    let phase = Instant::now();
     transcript.absorb_domain(b"plonkish-piop-v1");
     absorb_circuit_statement(instance, workers, transcript);
     let oracles = PlonkishOracles::from_instance(instance)?;
+    trace_plonkish_phase(trace, "prove/oracles", phase.elapsed());
+    let phase = Instant::now();
     let oracle_commitments = commit_oracles(&oracles)?;
     absorb_oracle_commitments(&oracle_commitments, transcript);
+    trace_plonkish_phase(trace, "prove/oracle_commitments", phase.elapsed());
+    let phase = Instant::now();
     let gate_subclaim = prove_gate_subclaim(
         instance,
         &oracles,
@@ -792,6 +853,8 @@ where
         pcs_params,
         transcript,
     )?;
+    trace_plonkish_phase(trace, "prove/gate_subclaim", phase.elapsed());
+    let phase = Instant::now();
     let gate_cubic = prove_gate_cubic(
         instance,
         &oracles,
@@ -799,6 +862,8 @@ where
         pcs_params,
         transcript,
     )?;
+    trace_plonkish_phase(trace, "prove/gate_cubic", phase.elapsed());
+    let phase = Instant::now();
     let permutation_accumulator = prove_permutation_accumulator(
         instance,
         &oracles,
@@ -806,14 +871,20 @@ where
         pcs_params,
         transcript,
     )?;
+    trace_plonkish_phase(trace, "prove/permutation_accumulator", phase.elapsed());
 
+    let phase = Instant::now();
     let constraint_commitment = commit_constraint(&oracles.constraint_residuals, workers)?;
     DistributedBrakedown::absorb_distributed_commitment(&constraint_commitment, transcript);
+    trace_plonkish_phase(trace, "prove/constraint_commitment", phase.elapsed());
+    let phase = Instant::now();
     let zerocheck_poly =
         pq_core::MultilinearExtension::from_evaluations(oracles.constraint_residuals.clone())
             .map_err(|_| PlonkishPiopError::InvalidShape)?;
     let sumcheck = prove_zerocheck_proof(&zerocheck_poly, transcript)
         .map_err(|_| PlonkishPiopError::InvalidProof)?;
+    trace_plonkish_phase(trace, "prove/constraint_sumcheck", phase.elapsed());
+    let phase = Instant::now();
     let constraint_opening = open_constraint(
         &oracles.constraint_residuals,
         &constraint_commitment,
@@ -821,6 +892,8 @@ where
         pcs_params,
         transcript,
     )?;
+    trace_plonkish_phase(trace, "prove/constraint_opening", phase.elapsed());
+    let phase = Instant::now();
     let gate_indices = challenge_gate_indices(instance, pcs_params, transcript)?;
     let permutation_indices = challenge_permutation_indices(instance, pcs_params, transcript)?;
     let gate_queries = gate_indices
@@ -842,6 +915,7 @@ where
         })
         .collect::<PlonkishPiopResult<Vec<_>>>()?;
     absorb_consistency_queries(transcript, &gate_queries, &permutation_queries);
+    trace_plonkish_phase(trace, "prove/consistency_queries", phase.elapsed());
 
     Ok(PlonkishPiopProof {
         oracle_commitments,
@@ -871,14 +945,20 @@ pub fn verify_plonkish_with_pcs_params<T: Transcript>(
     pcs_params: DistributedPcsParams,
     transcript: &mut T,
 ) -> PlonkishPiopResult<PlonkishMetrics> {
+    let trace = trace_plonkish_enabled();
+    let phase = Instant::now();
     if proof.workers == 0 || proof.workers != proof.constraint_commitment.workers.len() {
         return Err(PlonkishPiopError::InvalidShape);
     }
     validate_commitment_shape(instance, proof)?;
+    trace_plonkish_phase(trace, "verify/shape", phase.elapsed());
 
+    let phase = Instant::now();
     transcript.absorb_domain(b"plonkish-piop-v1");
     absorb_circuit_statement(instance, proof.workers, transcript);
     absorb_oracle_commitments(&proof.oracle_commitments, transcript);
+    trace_plonkish_phase(trace, "verify/commitment_absorb", phase.elapsed());
+    let phase = Instant::now();
     verify_gate_subclaim(
         instance,
         &proof.oracle_commitments,
@@ -886,6 +966,8 @@ pub fn verify_plonkish_with_pcs_params<T: Transcript>(
         pcs_params,
         transcript,
     )?;
+    trace_plonkish_phase(trace, "verify/gate_subclaim", phase.elapsed());
+    let phase = Instant::now();
     verify_gate_cubic(
         instance,
         &proof.oracle_commitments,
@@ -893,6 +975,8 @@ pub fn verify_plonkish_with_pcs_params<T: Transcript>(
         pcs_params,
         transcript,
     )?;
+    trace_plonkish_phase(trace, "verify/gate_cubic", phase.elapsed());
+    let phase = Instant::now();
     verify_permutation_accumulator(
         instance,
         &proof.oracle_commitments,
@@ -900,11 +984,15 @@ pub fn verify_plonkish_with_pcs_params<T: Transcript>(
         pcs_params,
         transcript,
     )?;
+    trace_plonkish_phase(trace, "verify/permutation_accumulator", phase.elapsed());
+    let phase = Instant::now();
     DistributedBrakedown::absorb_distributed_commitment(&proof.constraint_commitment, transcript);
     let num_vars = log2_power_of_two(proof.constraint_commitment.original_len)
         .map_err(|_| PlonkishPiopError::InvalidShape)?;
     verify_zerocheck_rounds(num_vars, &proof.sumcheck, transcript)
         .map_err(|_| PlonkishPiopError::InvalidProof)?;
+    trace_plonkish_phase(trace, "verify/constraint_sumcheck", phase.elapsed());
+    let phase = Instant::now();
     if proof.constraint_opening.point() != proof.sumcheck.challenges.as_slice() {
         return Err(PlonkishPiopError::InvalidProof);
     }
@@ -919,6 +1007,8 @@ pub fn verify_plonkish_with_pcs_params<T: Transcript>(
         pcs_params,
         transcript,
     )?;
+    trace_plonkish_phase(trace, "verify/constraint_opening", phase.elapsed());
+    let phase = Instant::now();
     let gate_indices = challenge_gate_indices(instance, pcs_params, transcript)?;
     let permutation_indices = challenge_permutation_indices(instance, pcs_params, transcript)?;
     if gate_indices.len() != proof.gate_queries.len()
@@ -949,6 +1039,7 @@ pub fn verify_plonkish_with_pcs_params<T: Transcript>(
         )?;
     }
     absorb_consistency_queries(transcript, &proof.gate_queries, &proof.permutation_queries);
+    trace_plonkish_phase(trace, "verify/consistency_queries", phase.elapsed());
 
     Ok(PlonkishMetrics {
         proof_bytes: proof_size_bytes(proof),
@@ -1188,6 +1279,7 @@ fn prove_gate_cubic<T: Transcript>(
     pcs_params: DistributedPcsParams,
     transcript: &mut T,
 ) -> PlonkishPiopResult<PlonkishGateCubicProof> {
+    let trace = trace_plonkish_enabled();
     absorb_gate_cubic_statement(transcript, commitments);
     let left = MultilinearPolynomial::new(oracles.gate_product_left.clone())
         .map_err(|_| PlonkishPiopError::InvalidShape)?;
@@ -1195,8 +1287,11 @@ fn prove_gate_cubic<T: Transcript>(
         .map_err(|_| PlonkishPiopError::InvalidShape)?;
     let output = MultilinearPolynomial::new(oracles.gate_linear_output.clone())
         .map_err(|_| PlonkishPiopError::InvalidShape)?;
+    let phase = Instant::now();
     let sumcheck = prove_cubic_zerocheck(&left, &right, &output, transcript)
         .map_err(|_| PlonkishPiopError::InvalidProof)?;
+    trace_plonkish_phase(trace, "prove/gate_cubic_sumcheck", phase.elapsed());
+    let phase = Instant::now();
     let point = sumcheck.challenges.clone();
     let query_count = gate_subclaim_query_count(instance, pcs_params)?;
     let proof = PlonkishGateCubicProof {
@@ -1223,6 +1318,7 @@ fn prove_gate_cubic<T: Transcript>(
             transcript,
         )?,
     };
+    trace_plonkish_phase(trace, "prove/gate_cubic_openings", phase.elapsed());
     ensure_gate_cubic_proof_commitments(&proof, commitments)?;
     let expected_final = cubic_zerocheck_final_evaluation(
         &proof.sumcheck,
@@ -1245,12 +1341,16 @@ fn verify_gate_cubic<T: Transcript>(
     pcs_params: DistributedPcsParams,
     transcript: &mut T,
 ) -> PlonkishPiopResult<()> {
+    let trace = trace_plonkish_enabled();
     ensure_gate_cubic_proof_commitments(proof, commitments)?;
     absorb_gate_cubic_statement(transcript, commitments);
     let row_len = instance.row_count().max(1).next_power_of_two();
     let num_vars = log2_power_of_two(row_len).map_err(|_| PlonkishPiopError::InvalidShape)?;
+    let phase = Instant::now();
     verify_cubic_zerocheck_rounds(num_vars, &proof.sumcheck, transcript)
         .map_err(|_| PlonkishPiopError::InvalidProof)?;
+    trace_plonkish_phase(trace, "verify/gate_cubic_sumcheck", phase.elapsed());
+    let phase = Instant::now();
     let point = &proof.sumcheck.challenges;
     let query_count = gate_subclaim_query_count(instance, pcs_params)?;
     let product_left = verify_sampled_gate_column_subclaim(
@@ -1283,6 +1383,7 @@ fn verify_gate_cubic<T: Transcript>(
     if expected_final != proof.sumcheck.final_evaluation {
         return Err(PlonkishPiopError::InvalidProof);
     }
+    trace_plonkish_phase(trace, "verify/gate_cubic_openings", phase.elapsed());
     absorb_gate_cubic_proof(transcript, proof);
     Ok(())
 }
@@ -1584,6 +1685,7 @@ fn prove_permutation_accumulator<T: Transcript>(
     pcs_params: DistributedPcsParams,
     transcript: &mut T,
 ) -> PlonkishPiopResult<PlonkishPermutationAccumulatorProof> {
+    let trace = trace_plonkish_enabled();
     transcript.absorb_domain(b"plonkish-permutation-accumulator-v1");
     absorb_usize(
         transcript,
@@ -1594,6 +1696,7 @@ fn prove_permutation_accumulator<T: Transcript>(
     let gamma = challenge_field(transcript, b"permutation-gamma");
     let (numerator_trace, denominator_trace) =
         build_permutation_accumulator_traces(instance, beta, gamma)?;
+    let phase = Instant::now();
     let numerator_commitment =
         MerklePcs::commit(&numerator_trace).map_err(|_| PlonkishPiopError::InvalidProof)?;
     let denominator_commitment =
@@ -1604,7 +1707,13 @@ fn prove_permutation_accumulator<T: Transcript>(
         b"permutation-denominator",
         &denominator_commitment,
     );
+    trace_plonkish_phase(
+        trace,
+        "prove/permutation_accumulator_commitments",
+        phase.elapsed(),
+    );
 
+    let phase = Instant::now();
     let terminal_index = instance.permutation_check_count();
     let numerator_first =
         MerklePcs::open(&numerator_trace, 0).map_err(|_| PlonkishPiopError::InvalidProof)?;
@@ -1621,7 +1730,13 @@ fn prove_permutation_accumulator<T: Transcript>(
         &denominator_first,
         &denominator_last,
     );
+    trace_plonkish_phase(
+        trace,
+        "prove/permutation_accumulator_boundary_openings",
+        phase.elapsed(),
+    );
 
+    let phase = Instant::now();
     let random_subclaim = prove_permutation_accumulator_subclaim(
         instance,
         commitments,
@@ -1634,7 +1749,13 @@ fn prove_permutation_accumulator<T: Transcript>(
         gamma,
         transcript,
     )?;
+    trace_plonkish_phase(
+        trace,
+        "prove/permutation_accumulator_subclaim",
+        phase.elapsed(),
+    );
 
+    let phase = Instant::now();
     let recurrence_indices = challenge_accumulator_indices(instance, pcs_params, transcript)?;
     let recurrence_queries = recurrence_indices
         .iter()
@@ -1653,6 +1774,11 @@ fn prove_permutation_accumulator<T: Transcript>(
     for query in &recurrence_queries {
         absorb_accumulator_query(transcript, query);
     }
+    trace_plonkish_phase(
+        trace,
+        "prove/permutation_accumulator_recurrence_queries",
+        phase.elapsed(),
+    );
 
     Ok(PlonkishPermutationAccumulatorProof {
         beta,
@@ -1675,6 +1801,7 @@ fn verify_permutation_accumulator<T: Transcript>(
     pcs_params: DistributedPcsParams,
     transcript: &mut T,
 ) -> PlonkishPiopResult<()> {
+    let trace = trace_plonkish_enabled();
     transcript.absorb_domain(b"plonkish-permutation-accumulator-v1");
     absorb_usize(
         transcript,
@@ -1706,6 +1833,7 @@ fn verify_permutation_accumulator<T: Transcript>(
         &proof.denominator_commitment,
     );
 
+    let phase = Instant::now();
     let terminal_index = instance.permutation_check_count();
     verify_accumulator_boundary_opening(
         &proof.numerator_commitment,
@@ -1739,6 +1867,12 @@ fn verify_permutation_accumulator<T: Transcript>(
         &proof.denominator_first,
         &proof.denominator_last,
     );
+    trace_plonkish_phase(
+        trace,
+        "verify/permutation_accumulator_boundary_openings",
+        phase.elapsed(),
+    );
+    let phase = Instant::now();
     verify_permutation_accumulator_subclaim(
         instance,
         &proof.numerator_commitment,
@@ -1749,7 +1883,13 @@ fn verify_permutation_accumulator<T: Transcript>(
         &proof.random_subclaim,
         transcript,
     )?;
+    trace_plonkish_phase(
+        trace,
+        "verify/permutation_accumulator_subclaim",
+        phase.elapsed(),
+    );
 
+    let phase = Instant::now();
     let recurrence_indices = challenge_accumulator_indices(instance, pcs_params, transcript)?;
     if recurrence_indices.len() != proof.recurrence_queries.len() {
         return Err(PlonkishPiopError::InvalidProof);
@@ -1776,6 +1916,11 @@ fn verify_permutation_accumulator<T: Transcript>(
         )?;
         absorb_accumulator_query(transcript, query);
     }
+    trace_plonkish_phase(
+        trace,
+        "verify/permutation_accumulator_recurrence_queries",
+        phase.elapsed(),
+    );
 
     Ok(())
 }
@@ -1835,7 +1980,9 @@ fn prove_permutation_accumulator_subclaim<T: Transcript>(
     gamma: FieldElement,
     transcript: &mut T,
 ) -> PlonkishPiopResult<PlonkishPermutationAccumulatorSubclaimProof> {
+    let trace = trace_plonkish_enabled();
     let vectors = permutation_accumulator_vectors(instance, numerator_trace, denominator_trace)?;
+    let phase = Instant::now();
     let public_commitments = accumulator_public_commitments_from_vectors(&vectors)?;
     let numerator_next_commitment =
         MerklePcs::commit(&vectors.numerator_next).map_err(|_| PlonkishPiopError::InvalidProof)?;
@@ -1866,8 +2013,14 @@ fn prove_permutation_accumulator_subclaim<T: Transcript>(
         &numerator_residual_commitment,
         &denominator_residual_commitment,
     );
+    trace_plonkish_phase(
+        trace,
+        "prove/accumulator_subclaim_commitments",
+        phase.elapsed(),
+    );
     let point = challenge_accumulator_subclaim_point(instance, transcript)?;
     let query_count = accumulator_subclaim_query_count(instance, pcs_params)?;
+    let phase = Instant::now();
     let value = prove_sampled_gate_column_subclaim(
         b"accumulator-value",
         &vectors.value,
@@ -1936,6 +2089,11 @@ fn prove_permutation_accumulator_subclaim<T: Transcript>(
     {
         return Err(PlonkishPiopError::InvalidProof);
     }
+    trace_plonkish_phase(
+        trace,
+        "prove/accumulator_subclaim_openings",
+        phase.elapsed(),
+    );
     let numerator_recurrence = prove_accumulator_recurrence_sumcheck(
         ACCUMULATOR_NUMERATOR_RECURRENCE_LABELS,
         AccumulatorRecurrenceWitness {
@@ -1982,6 +2140,7 @@ fn prove_permutation_accumulator_subclaim<T: Transcript>(
         query_count,
         transcript,
     )?;
+    let phase = Instant::now();
     let residual_indices =
         challenge_accumulator_residual_indices(instance, pcs_params, transcript)?;
     let residual_queries = prove_accumulator_residual_queries(
@@ -2004,6 +2163,8 @@ fn prove_permutation_accumulator_subclaim<T: Transcript>(
         &residual_queries,
         transcript,
     )?;
+    trace_plonkish_phase(trace, "prove/accumulator_residual_queries", phase.elapsed());
+    let phase = Instant::now();
     let shift_indices = challenge_accumulator_shift_indices(instance, pcs_params, transcript)?;
     let numerator_shift_queries =
         prove_accumulator_shift_queries(numerator_trace, &vectors.numerator_next, &shift_indices)?;
@@ -2028,6 +2189,7 @@ fn prove_permutation_accumulator_subclaim<T: Transcript>(
         transcript,
         b"denominator",
     )?;
+    trace_plonkish_phase(trace, "prove/accumulator_shift_queries", phase.elapsed());
     let proof = PlonkishPermutationAccumulatorSubclaimProof {
         point: point.clone(),
         public_commitments: public_commitments.clone(),
@@ -2080,6 +2242,7 @@ fn verify_permutation_accumulator_subclaim<T: Transcript>(
     proof: &PlonkishPermutationAccumulatorSubclaimProof,
     transcript: &mut T,
 ) -> PlonkishPiopResult<()> {
+    let trace = trace_plonkish_enabled();
     let numerator_residual_commitment = proof.numerator_residual.folding.input_commitment.clone();
     let denominator_residual_commitment =
         proof.denominator_residual.folding.input_commitment.clone();
@@ -2102,6 +2265,7 @@ fn verify_permutation_accumulator_subclaim<T: Transcript>(
         accumulator_trace_len(instance),
         public_commitments,
     )?;
+    let phase = Instant::now();
     for (label, commitment, column) in [
         (
             b"accumulator-value".as_ref(),
@@ -2167,6 +2331,11 @@ fn verify_permutation_accumulator_subclaim<T: Transcript>(
     if !numerator_residual.is_zero() || !denominator_residual.is_zero() {
         return Err(PlonkishPiopError::InvalidProof);
     }
+    trace_plonkish_phase(
+        trace,
+        "verify/accumulator_subclaim_openings",
+        phase.elapsed(),
+    );
     verify_accumulator_recurrence_sumcheck(
         ACCUMULATOR_NUMERATOR_RECURRENCE_LABELS,
         AccumulatorRecurrenceCommitments {
@@ -2199,6 +2368,7 @@ fn verify_permutation_accumulator_subclaim<T: Transcript>(
         &proof.denominator_recurrence,
         transcript,
     )?;
+    let phase = Instant::now();
     let residual_indices =
         challenge_accumulator_residual_indices(instance, pcs_params, transcript)?;
     verify_accumulator_residual_queries(
@@ -2215,6 +2385,12 @@ fn verify_permutation_accumulator_subclaim<T: Transcript>(
         &proof.residual_queries,
         transcript,
     )?;
+    trace_plonkish_phase(
+        trace,
+        "verify/accumulator_residual_queries",
+        phase.elapsed(),
+    );
+    let phase = Instant::now();
     let shift_indices = challenge_accumulator_shift_indices(instance, pcs_params, transcript)?;
     verify_accumulator_shift_queries(
         numerator_commitment,
@@ -2232,6 +2408,7 @@ fn verify_permutation_accumulator_subclaim<T: Transcript>(
         transcript,
         b"denominator",
     )?;
+    trace_plonkish_phase(trace, "verify/accumulator_shift_queries", phase.elapsed());
     absorb_accumulator_subclaim_proof(transcript, proof);
     Ok(())
 }
@@ -2521,6 +2698,7 @@ fn prove_accumulator_recurrence_sumcheck<T: Transcript>(
     query_count: usize,
     transcript: &mut T,
 ) -> PlonkishPiopResult<PlonkishAccumulatorRecurrenceProof> {
+    let trace = trace_plonkish_enabled();
     validate_accumulator_recurrence_shape(witness)?;
     ensure_accumulator_recurrence_commitments(witness, commitments)?;
     let factor = accumulator_recurrence_factor(witness, beta, gamma);
@@ -2542,8 +2720,15 @@ fn prove_accumulator_recurrence_sumcheck<T: Transcript>(
         MultilinearPolynomial::new(factor).map_err(|_| PlonkishPiopError::InvalidShape)?;
     let output_poly =
         MultilinearPolynomial::new(output).map_err(|_| PlonkishPiopError::InvalidShape)?;
+    let phase = Instant::now();
     let sumcheck = prove_cubic_zerocheck(&current_poly, &factor_poly, &output_poly, transcript)
         .map_err(|_| PlonkishPiopError::InvalidProof)?;
+    trace_plonkish_phase(
+        trace,
+        "prove/accumulator_recurrence_sumcheck",
+        phase.elapsed(),
+    );
+    let phase = Instant::now();
     let point = sumcheck.challenges.clone();
     let proof = PlonkishAccumulatorRecurrenceProof {
         sumcheck,
@@ -2590,6 +2775,11 @@ fn prove_accumulator_recurrence_sumcheck<T: Transcript>(
             transcript,
         )?,
     };
+    trace_plonkish_phase(
+        trace,
+        "prove/accumulator_recurrence_openings",
+        phase.elapsed(),
+    );
     ensure_accumulator_recurrence_proof_commitments(&proof, commitments)?;
     Ok(proof)
 }
@@ -2603,11 +2793,19 @@ fn verify_accumulator_recurrence_sumcheck<T: Transcript>(
     proof: &PlonkishAccumulatorRecurrenceProof,
     transcript: &mut T,
 ) -> PlonkishPiopResult<()> {
+    let trace = trace_plonkish_enabled();
     let len = validate_accumulator_recurrence_commitment_shape(commitments)?;
     let num_vars = log2_power_of_two(len).map_err(|_| PlonkishPiopError::InvalidShape)?;
     absorb_accumulator_recurrence_statement(transcript, labels, commitments, beta, gamma);
+    let phase = Instant::now();
     verify_cubic_zerocheck_rounds(num_vars, &proof.sumcheck, transcript)
         .map_err(|_| PlonkishPiopError::InvalidProof)?;
+    trace_plonkish_phase(
+        trace,
+        "verify/accumulator_recurrence_sumcheck",
+        phase.elapsed(),
+    );
+    let phase = Instant::now();
     let point = &proof.sumcheck.challenges;
     let current = verify_sampled_gate_column_subclaim(
         labels.current,
@@ -2664,6 +2862,11 @@ fn verify_accumulator_recurrence_sumcheck<T: Transcript>(
     if expected_final != proof.sumcheck.final_evaluation {
         return Err(PlonkishPiopError::InvalidProof);
     }
+    trace_plonkish_phase(
+        trace,
+        "verify/accumulator_recurrence_openings",
+        phase.elapsed(),
+    );
     Ok(())
 }
 
@@ -3695,8 +3898,72 @@ pub fn proof_communication_bytes(proof: &PlonkishPiopProof) -> usize {
             .sum::<usize>()
 }
 
+pub fn proof_size_breakdown(proof: &PlonkishPiopProof) -> PlonkishProofSizeBreakdown {
+    let total_bytes = proof_size_bytes(proof);
+    let pcs_bytes = plonkish_pcs_proof_size_bytes(proof);
+    let sumcheck_bytes = plonkish_sumcheck_proof_size_bytes(proof);
+    let other_bytes = total_bytes.saturating_sub(pcs_bytes + sumcheck_bytes);
+    PlonkishProofSizeBreakdown {
+        total_bytes,
+        pcs_bytes,
+        sumcheck_bytes,
+        other_bytes,
+    }
+}
+
+fn plonkish_pcs_proof_size_bytes(proof: &PlonkishPiopProof) -> usize {
+    commitment_size_bytes(&proof.oracle_commitments.a)
+        + commitment_size_bytes(&proof.oracle_commitments.b)
+        + commitment_size_bytes(&proof.oracle_commitments.c)
+        + commitment_size_bytes(&proof.oracle_commitments.q_l)
+        + commitment_size_bytes(&proof.oracle_commitments.q_r)
+        + commitment_size_bytes(&proof.oracle_commitments.q_o)
+        + commitment_size_bytes(&proof.oracle_commitments.q_m)
+        + commitment_size_bytes(&proof.oracle_commitments.q_c)
+        + commitment_size_bytes(&proof.oracle_commitments.gate_product_left)
+        + commitment_size_bytes(&proof.oracle_commitments.gate_linear_output)
+        + commitment_size_bytes(&proof.oracle_commitments.gate_residual)
+        + commitment_size_bytes(&proof.oracle_commitments.permutation_residual)
+        + gate_subclaim_pcs_size(&proof.gate_subclaim)
+        + gate_cubic_pcs_size(&proof.gate_cubic)
+        + permutation_accumulator_pcs_size(&proof.permutation_accumulator)
+        + distributed_commitment_size_bytes(&proof.constraint_commitment)
+        + proof.constraint_opening.proof_size_bytes()
+        + proof
+            .gate_queries
+            .iter()
+            .map(gate_query_pcs_size)
+            .sum::<usize>()
+        + proof
+            .permutation_queries
+            .iter()
+            .map(permutation_query_pcs_size)
+            .sum::<usize>()
+}
+
+fn plonkish_sumcheck_proof_size_bytes(proof: &PlonkishPiopProof) -> usize {
+    gate_cubic_sumcheck_size(&proof.gate_cubic)
+        + permutation_accumulator_sumcheck_size(&proof.permutation_accumulator)
+        + zerocheck_proof_size_bytes(&proof.sumcheck)
+}
+
 fn gate_query_size(query: &PlonkishGateQuery) -> usize {
     8 + opening_proof_size_bytes(&query.a)
+        + opening_proof_size_bytes(&query.b)
+        + opening_proof_size_bytes(&query.c)
+        + opening_proof_size_bytes(&query.q_l)
+        + opening_proof_size_bytes(&query.q_r)
+        + opening_proof_size_bytes(&query.q_o)
+        + opening_proof_size_bytes(&query.q_m)
+        + opening_proof_size_bytes(&query.q_c)
+        + opening_proof_size_bytes(&query.gate_product_left)
+        + opening_proof_size_bytes(&query.gate_linear_output)
+        + opening_proof_size_bytes(&query.gate_residual)
+        + distributed_index_opening_size_bytes(&query.constraint_residual)
+}
+
+fn gate_query_pcs_size(query: &PlonkishGateQuery) -> usize {
+    opening_proof_size_bytes(&query.a)
         + opening_proof_size_bytes(&query.b)
         + opening_proof_size_bytes(&query.c)
         + opening_proof_size_bytes(&query.q_l)
@@ -3716,6 +3983,13 @@ fn gate_query_communication_bytes(query: &PlonkishGateQuery) -> usize {
 
 fn permutation_query_size(query: &PlonkishPermutationQuery) -> usize {
     16 + opening_proof_size_bytes(&query.source_value)
+        + opening_proof_size_bytes(&query.target_value)
+        + opening_proof_size_bytes(&query.permutation_residual)
+        + distributed_index_opening_size_bytes(&query.constraint_residual)
+}
+
+fn permutation_query_pcs_size(query: &PlonkishPermutationQuery) -> usize {
+    opening_proof_size_bytes(&query.source_value)
         + opening_proof_size_bytes(&query.target_value)
         + opening_proof_size_bytes(&query.permutation_residual)
         + distributed_index_opening_size_bytes(&query.constraint_residual)
@@ -3742,8 +4016,38 @@ fn permutation_accumulator_size(proof: &PlonkishPermutationAccumulatorProof) -> 
             .sum::<usize>()
 }
 
+fn permutation_accumulator_pcs_size(proof: &PlonkishPermutationAccumulatorProof) -> usize {
+    commitment_size_bytes(&proof.numerator_commitment)
+        + commitment_size_bytes(&proof.denominator_commitment)
+        + opening_proof_size_bytes(&proof.numerator_first)
+        + opening_proof_size_bytes(&proof.numerator_last)
+        + opening_proof_size_bytes(&proof.denominator_first)
+        + opening_proof_size_bytes(&proof.denominator_last)
+        + accumulator_subclaim_pcs_size(&proof.random_subclaim)
+        + proof
+            .recurrence_queries
+            .iter()
+            .map(accumulator_query_pcs_size)
+            .sum::<usize>()
+}
+
+fn permutation_accumulator_sumcheck_size(proof: &PlonkishPermutationAccumulatorProof) -> usize {
+    accumulator_subclaim_sumcheck_size(&proof.random_subclaim)
+}
+
 fn accumulator_query_size(query: &PlonkishPermutationAccumulatorQuery) -> usize {
     8 + opening_proof_size_bytes(&query.value)
+        + opening_proof_size_bytes(&query.public_value)
+        + opening_proof_size_bytes(&query.source_id)
+        + opening_proof_size_bytes(&query.target_id)
+        + opening_proof_size_bytes(&query.numerator_current)
+        + opening_proof_size_bytes(&query.numerator_next)
+        + opening_proof_size_bytes(&query.denominator_current)
+        + opening_proof_size_bytes(&query.denominator_next)
+}
+
+fn accumulator_query_pcs_size(query: &PlonkishPermutationAccumulatorQuery) -> usize {
+    opening_proof_size_bytes(&query.value)
         + opening_proof_size_bytes(&query.public_value)
         + opening_proof_size_bytes(&query.source_id)
         + opening_proof_size_bytes(&query.target_id)
@@ -3784,6 +4088,40 @@ fn accumulator_subclaim_size(proof: &PlonkishPermutationAccumulatorSubclaimProof
             .sum::<usize>()
 }
 
+fn accumulator_subclaim_pcs_size(proof: &PlonkishPermutationAccumulatorSubclaimProof) -> usize {
+    accumulator_public_commitments_size(&proof.public_commitments)
+        + commitment_size_bytes(&proof.numerator_next_commitment)
+        + commitment_size_bytes(&proof.denominator_next_commitment)
+        + accumulator_subclaim_columns(proof)
+            .iter()
+            .map(|(_, column)| sampled_gate_column_subclaim_size(column))
+            .sum::<usize>()
+        + accumulator_recurrence_pcs_size(&proof.numerator_recurrence)
+        + accumulator_recurrence_pcs_size(&proof.denominator_recurrence)
+        + proof
+            .residual_queries
+            .iter()
+            .map(accumulator_residual_query_pcs_size)
+            .sum::<usize>()
+        + proof
+            .numerator_shift_queries
+            .iter()
+            .map(accumulator_shift_query_pcs_size)
+            .sum::<usize>()
+        + proof
+            .denominator_shift_queries
+            .iter()
+            .map(accumulator_shift_query_pcs_size)
+            .sum::<usize>()
+}
+
+fn accumulator_subclaim_sumcheck_size(
+    proof: &PlonkishPermutationAccumulatorSubclaimProof,
+) -> usize {
+    accumulator_recurrence_sumcheck_size(&proof.numerator_recurrence)
+        + accumulator_recurrence_sumcheck_size(&proof.denominator_recurrence)
+}
+
 fn accumulator_public_commitments_size(
     commitments: &PlonkishPermutationAccumulatorPublicCommitments,
 ) -> usize {
@@ -3802,11 +4140,28 @@ fn gate_subclaim_size(proof: &PlonkishGateSubclaimProof) -> usize {
             .sum::<usize>()
 }
 
+fn gate_subclaim_pcs_size(proof: &PlonkishGateSubclaimProof) -> usize {
+    gate_subclaim_columns(proof)
+        .iter()
+        .map(|(_, column)| sampled_gate_column_subclaim_size(column))
+        .sum()
+}
+
 fn gate_cubic_size(proof: &PlonkishGateCubicProof) -> usize {
     cubic_zerocheck_proof_size_bytes(&proof.sumcheck)
         + sampled_gate_column_subclaim_size(&proof.product_left)
         + sampled_gate_column_subclaim_size(&proof.b)
         + sampled_gate_column_subclaim_size(&proof.linear_output)
+}
+
+fn gate_cubic_pcs_size(proof: &PlonkishGateCubicProof) -> usize {
+    sampled_gate_column_subclaim_size(&proof.product_left)
+        + sampled_gate_column_subclaim_size(&proof.b)
+        + sampled_gate_column_subclaim_size(&proof.linear_output)
+}
+
+fn gate_cubic_sumcheck_size(proof: &PlonkishGateCubicProof) -> usize {
+    cubic_zerocheck_proof_size_bytes(&proof.sumcheck)
 }
 
 fn sampled_gate_column_subclaim_size(column: &PlonkishSampledGateColumnSubclaim) -> usize {
@@ -3823,13 +4178,43 @@ fn accumulator_recurrence_proof_size(proof: &PlonkishAccumulatorRecurrenceProof)
         + sampled_gate_column_subclaim_size(&proof.residual)
 }
 
+fn accumulator_recurrence_pcs_size(proof: &PlonkishAccumulatorRecurrenceProof) -> usize {
+    sampled_gate_column_subclaim_size(&proof.current)
+        + sampled_gate_column_subclaim_size(&proof.value)
+        + sampled_gate_column_subclaim_size(&proof.id)
+        + sampled_gate_column_subclaim_size(&proof.active)
+        + sampled_gate_column_subclaim_size(&proof.next)
+        + sampled_gate_column_subclaim_size(&proof.residual)
+}
+
+fn accumulator_recurrence_sumcheck_size(proof: &PlonkishAccumulatorRecurrenceProof) -> usize {
+    cubic_zerocheck_proof_size_bytes(&proof.sumcheck)
+}
+
 fn accumulator_shift_query_size(query: &PlonkishAccumulatorShiftQuery) -> usize {
     8 + opening_proof_size_bytes(&query.current_at_next)
         + opening_proof_size_bytes(&query.shifted_at_index)
 }
 
+fn accumulator_shift_query_pcs_size(query: &PlonkishAccumulatorShiftQuery) -> usize {
+    opening_proof_size_bytes(&query.current_at_next)
+        + opening_proof_size_bytes(&query.shifted_at_index)
+}
+
 fn accumulator_residual_query_size(query: &PlonkishAccumulatorResidualQuery) -> usize {
     8 + opening_proof_size_bytes(&query.value)
+        + opening_proof_size_bytes(&query.source_id)
+        + opening_proof_size_bytes(&query.target_id)
+        + opening_proof_size_bytes(&query.numerator_current)
+        + opening_proof_size_bytes(&query.numerator_next)
+        + opening_proof_size_bytes(&query.denominator_current)
+        + opening_proof_size_bytes(&query.denominator_next)
+        + opening_proof_size_bytes(&query.numerator_residual)
+        + opening_proof_size_bytes(&query.denominator_residual)
+}
+
+fn accumulator_residual_query_pcs_size(query: &PlonkishAccumulatorResidualQuery) -> usize {
+    opening_proof_size_bytes(&query.value)
         + opening_proof_size_bytes(&query.source_id)
         + opening_proof_size_bytes(&query.target_id)
         + opening_proof_size_bytes(&query.numerator_current)

@@ -38,7 +38,16 @@ Use the menu in this order on a new machine:
 3. Use verify experiments to reverify the stored proof and generate a report
    under `verifications/`.
 4. Run performance benchmark wizard for a small grid. This is the final menu
-   action and also stores proof bundles.
+   action and also stores proof bundles. The wizard always asks for a custom
+   grid, not a paper preset, and it does not display square-bracket
+   recommendations. Blank benchmark inputs use hidden defaults: `n=8..10` and
+   worker exponent `0..min(floor(log2(logical_cores)), n_min, 3)`. For a quick
+   PC smoke run, type a lower `n` range such as `2..3`; for a performance run,
+   leave the hidden defaults or type a larger server grid intentionally.
+   Network worker processes also receive `RAYON_NUM_THREADS=cores_per_worker`,
+   and the benchmark runner configures a Rayon thread pool before the first
+   local job, so core affinity and algorithmic parallelism are controlled
+   together.
 5. Use verify experiments again if you want to reverify a benchmark's stored
    proofs. Copy selected release-worthy results into `results/release_results/`
    manually.
@@ -195,11 +204,12 @@ Interpretation:
 For a medium PC run, use the interactive benchmark wizard or:
 
 ```bash
-cargo run -p pq-experiments --release -- benchmark --runner both --n-range 2..5 --worker-power-range 0..2 --pcs-queries 1
+cargo run -p pq-experiments --release -- benchmark --runner both --n-range 8..10 --worker-power-range 0..3 --pcs-queries 1
 ```
 
-For a paper-quality server run, use release mode, the paper preset, both
-runners, and compiled figures:
+The interactive benchmark wizard always fixes `pcs_queries=1` and compiles
+figures after the run. For a paper-quality server run from the Rust CLI, use
+release mode, the paper preset, both runners, and compiled figures:
 
 ```bash
 cargo run -p pq-experiments --release -- benchmark --paper-preset --runner both --compile-figures

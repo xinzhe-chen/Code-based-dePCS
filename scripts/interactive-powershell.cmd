@@ -4,7 +4,6 @@ setlocal
 set "SCRIPT_DIR=%~dp0"
 set "REPO_ROOT=%SCRIPT_DIR%.."
 set "POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
-set "GENERATED_PS=%REPO_ROOT%\target\windows\interactive-powershell.generated.ps1"
 set "NO_PAUSE="
 
 for %%A in (%*) do (
@@ -14,6 +13,12 @@ for %%A in (%*) do (
 if not exist "%POWERSHELL_EXE%" (
     set "POWERSHELL_EXE=powershell.exe"
 )
+
+set "PAYLOAD_GUID="
+for /f "skip=2 delims=" %%G in ('%POWERSHELL_EXE% -NoProfile -ExecutionPolicy Bypass -Command New-Guid') do if not defined PAYLOAD_GUID set "PAYLOAD_GUID=%%G"
+set "PAYLOAD_GUID=%PAYLOAD_GUID: =%"
+if not defined PAYLOAD_GUID set "PAYLOAD_GUID=%RANDOM%-%RANDOM%-%RANDOM%-%RANDOM%"
+set "GENERATED_PS=%REPO_ROOT%\target\windows\interactive-powershell-%PAYLOAD_GUID%.generated.ps1"
 
 set "PQ_DSNARK_CMD_SELF=%~f0"
 set "PQ_DSNARK_GENERATED_PS=%GENERATED_PS%"
@@ -73,6 +78,33 @@ function Read-Text {
     } else {
         try {
             $line = Read-Host $hostPrompt
+        } catch {
+            $line = [Console]::In.ReadLine()
+        }
+    }
+    if ($null -eq $line) {
+        throw "no interactive console input is available; rerun from a PowerShell terminal or use the documented bypass command"
+    }
+    $line = $line.Trim()
+    if ($line.Length -eq 0) {
+        return $Default
+    }
+    return $line
+}
+
+function Read-TextWithHiddenDefault {
+    param(
+        [string]$Prompt,
+        [string]$Default
+    )
+
+    if ($Script:QueuedInput.Count -gt 0) {
+        Write-Host -NoNewline "${Prompt}: "
+        $line = $Script:QueuedInput.Dequeue()
+        Write-Host $line
+    } else {
+        try {
+            $line = Read-Host $Prompt
         } catch {
             $line = [Console]::In.ReadLine()
         }
@@ -187,7 +219,6 @@ function Confirm-BenchmarkGrid {
     $runnerCount = Get-BenchmarkRunnerVariantCount -Runner $Runner
     $totalJobs = [Int64]$SizeCount * [Int64]$workerCount * 2 * [Int64]$runnerCount
     Write-Step "benchmark grid: sizes=$SizeLabel size_count=$SizeCount workers=$Workers total_jobs=$totalJobs"
-    return Confirm-RequiredChoice -Prompt "Run this benchmark grid"
 }
 
 function Test-Command {
@@ -438,7 +469,8 @@ function Invoke-ProofWizard {
     $runner = Read-RequiredChoice -Prompt "runner local|network" -Allowed @("local", "network")
     $nPower = Read-RequiredText -Prompt "circuit size exponent n for nv=2^n"
     $workers = Read-RequiredText -Prompt "worker count"
-    $pcsQueries = Read-RequiredText -Prompt "PCS query count"
+    $pcsQueries = "1"
+    Write-Step "PCS queries fixed at 1 for fastest interactive runs"
     Write-Step "building release pq-experiments"
     Build-ExperimentBinary -Release:$true
     $bin = Get-ExperimentBinary -Release:$true
@@ -455,6 +487,20 @@ function Invoke-ProofWizard {
 function Split-CsvIntegers {
     param([string]$Value)
     return @($Value.Split(",") | ForEach-Object { [int]($_.Trim()) })
+}
+
+function Get-MaxPowerOfTwoExponent {
+    param([int]$Value)
+    if ($Value -lt 1) {
+        return 0
+    }
+    $exponent = 0
+    $power = 1
+    while (($power * 2) -le $Value) {
+        $power *= 2
+        $exponent += 1
+    }
+    return $exponent
 }
 
 function Show-BenchmarkCorePlan {
@@ -483,48 +529,39 @@ function Invoke-BenchmarkWizard {
     Write-Section "Performance Benchmark Wizard"
     Write-Host "Each benchmark job runs one real end-to-end prove+verify path. Correctness tests are not included."
     Write-Host "During execution, pq-experiments prints an exact completed-jobs progress bar before and after each real job."
+    $hostCores = [Environment]::ProcessorCount
+    $hostWorkerMax = Get-MaxPowerOfTwoExponent -Value $hostCores
+    Write-Step "detected host logical cores: $hostCores; host can support worker exponent up to $hostWorkerMax before circuit-size limits"
 
-    $paperPreset = Confirm-RequiredChoice -Prompt "Use the full paper-quality benchmark grid"
     $runner = Read-RequiredChoice -Prompt "runner local|network|both" -Allowed @("local", "network", "both")
     $args = @("benchmark", "--runner", $runner, "--repeats", "1")
 
-    $sizeCount = [Int64]5
-    $sizeLabel = "2^2..2^6"
-    $workers = "1,2,4"
-
-    if ($paperPreset) {
-        $args += "--paper-preset"
-    } else {
-        $nMin = [int](Read-RequiredText -Prompt "minimum circuit size exponent n for nv=2^n")
-        $nMax = [int](Read-RequiredText -Prompt "maximum circuit size exponent n for nv=2^n")
-        if ($nMin -gt $nMax) {
-            throw "minimum circuit size exponent must be <= maximum circuit size exponent"
-        }
-        $nRange = "$nMin..$nMax"
-        $sizeCount = [Int64]($nMax - $nMin + 1)
-        $sizeLabel = "2^$nMin..2^$nMax"
-        $workerMin = [int](Read-RequiredText -Prompt "minimum worker exponent for workers=2^w")
-        $workerMax = [int](Read-RequiredText -Prompt "maximum worker exponent for workers=2^w")
-        if ($workerMin -gt $workerMax) {
-            throw "minimum worker exponent must be <= maximum worker exponent"
-        }
-        $workerRange = "$workerMin..$workerMax"
-        $workers = Convert-PowerRangeToCsv -Range $workerRange
-        $pcsQueries = Read-RequiredText -Prompt "PCS query count"
-        Show-BenchmarkCorePlan -Runner $runner -Workers $workers
-        $args += @("--n-range", $nRange, "--worker-power-range", $workerRange, "--pcs-queries", $pcsQueries)
+    $nMin = [int](Read-TextWithHiddenDefault -Prompt "minimum circuit size exponent n for nv=2^n" -Default "8")
+    $nMax = [int](Read-TextWithHiddenDefault -Prompt "maximum circuit size exponent n for nv=2^n" -Default "10")
+    if ($nMin -gt $nMax) {
+        throw "minimum circuit size exponent must be <= maximum circuit size exponent"
     }
-
-    if (-not (Confirm-BenchmarkGrid -Runner $runner -SizeCount $sizeCount -SizeLabel $sizeLabel -Workers $workers)) {
-        Write-Step "benchmark cancelled"
-        return
+    $nRange = "$nMin..$nMax"
+    $sizeCount = [Int64]($nMax - $nMin + 1)
+    $sizeLabel = "2^$nMin..2^$nMax"
+    $defaultWorkerMax = [Math]::Min([Math]::Min($hostWorkerMax, $nMin), 3)
+    $workerMin = [int](Read-TextWithHiddenDefault -Prompt "minimum worker exponent for workers=2^w" -Default "0")
+    $workerMax = [int](Read-TextWithHiddenDefault -Prompt "maximum worker exponent for workers=2^w" -Default ([string]$defaultWorkerMax))
+    if ($workerMin -gt $workerMax) {
+        throw "minimum worker exponent must be <= maximum worker exponent"
     }
+    $workerRange = "$workerMin..$workerMax"
+    $workers = Convert-PowerRangeToCsv -Range $workerRange
+    $pcsQueries = "1"
+    Write-Step "PCS queries fixed at 1 for fastest interactive runs"
+    Show-BenchmarkCorePlan -Runner $runner -Workers $workers
+    $args += @("--n-range", $nRange, "--worker-power-range", $workerRange, "--pcs-queries", $pcsQueries)
 
-    $compileFigures = Confirm-RequiredChoice -Prompt "Compile paper figures after the run"
-    if ($compileFigures) {
-        Ensure-ToolchainForAction -NeedFigureCompiler:$true
-        $args += @("--compile-figures", "--figure-compiler", "auto")
-    }
+    Confirm-BenchmarkGrid -Runner $runner -SizeCount $sizeCount -SizeLabel $sizeLabel -Workers $workers
+
+    Write-Step "figure compilation is enabled by default"
+    Ensure-ToolchainForAction -NeedFigureCompiler:$true
+    $args += @("--compile-figures", "--figure-compiler", "auto")
     Write-Step "building release pq-experiments"
     Build-ExperimentBinary -Release:$true
     $bin = Get-ExperimentBinary -Release:$true

@@ -3351,6 +3351,23 @@ Automation should use the Rust CLI directly, especially `proof-experiment`,
   - `cargo test -p pq-experiments scripts_directory_has_only_interactive_entrypoints`
   - `cargo test -p pq-experiments windows_cmd_embeds_powershell_payload_without_tools_directory`
   - `cargo test -p pq-experiments interactive_scripts_offer_dependency_install_from_actions`
+- Removed the interactive benchmark paper-preset prompt, PCS query prompt, and
+  figure-compilation prompt. The benchmark wizard now always asks for a custom
+  `n` range and worker exponent range, fixes `pcs_queries=1`, and compiles
+  figures by default. The benchmark prompts no longer display square-bracket
+  recommendations; blank values use hidden defaults of `n=8..10` and
+  `worker exponent=0..min(floor(log2(logical_cores)), n_min, 3)`. The actual core
+  allocation rule remains `cores_per_worker = floor(host_logical_cores /
+  max(workers))`; parser tests now cover the clarified 20-core examples:
+  `workers=1,4` gives `cores_per_worker=5`, while `workers=1,2,4,8` gives
+  `cores_per_worker=2`.
+- Validation:
+  - `@('4','network','10','8') | .\scripts\interactive-powershell.cmd -NoPause`
+  - `& 'C:\Program Files\Git\bin\bash.exe' -n scripts/interactive-linux.sh`
+  - `& 'C:\Program Files\Git\bin\bash.exe' -n scripts/interactive-macos.sh`
+  - `cargo test -p pq-experiments interactive_scripts_offer_dependency_install_from_actions`
+  - `cargo test -p pq-experiments windows_cmd_embeds_powershell_payload_without_tools_directory`
+  - `cargo test -p pq-experiments scripts_directory_has_only_interactive_entrypoints`
 
 ## Current Limitations
 
@@ -3420,3 +3437,127 @@ Automation should use the Rust CLI directly, especially `proof-experiment`,
   been ported into the current accumulator path, but the complete HyperPlonk
   permutation-check protocol remains a next milestone alongside Spartan2 inner
   sumcheck, `eval_W`, and full Spark memory-check ports.
+
+## 2026-06-02 CPU Utilization Follow-Up
+
+- Low CPU utilization diagnosis:
+  - `n=2..5` is a toy/correctness-size grid. It is useful for fast smoke tests
+    and should finish quickly, but it is too small for meaningful scaling
+    curves because transcript work, orchestration, TCP request/response, process
+    startup, result writing, and figure generation can dominate the arithmetic.
+  - The fixed core allocation was assigning stable core sets correctly, but a
+    worker process still used mostly one execution thread in the actual
+    arithmetic path. `cores_per_worker` controls where a worker may run; it does
+    not by itself make serial MLE, sparse-matrix, sumcheck, or PCS loops consume
+    every assigned core.
+- Implemented real internal parallelism using Rayon, following the same broad
+  strategy used by the sibling `sumfold_dSNARK` benchmark runner:
+  - `pq-core` now parallelizes large MLE evaluation/fixing, dynamic-programming
+    eq-polynomial evaluation, sparse-matrix row products, Plonkish row
+    evaluation, and Plonkish gate/permutation checks;
+  - `pq-sumcheck` now parallelizes linear round sums, product/cubic round
+    polynomial accumulation, distributed aggregate construction, inner products,
+    and log-derivative denominator maps/sums;
+  - `pq-pcs` now uses the global Rayon pool for worker commitments,
+    local-worker openings, systematic encoding, Merkle leaf/internal hashing,
+    and MLE folding, replacing per-call scoped thread spawning;
+  - default parallel thresholds are `64` items/rows and can be overridden with
+    `PQ_CORE_PARALLEL_MIN_ITEMS`, `PQ_CORE_PARALLEL_MIN_ROWS`,
+    `PQ_SUMCHECK_PARALLEL_MIN_ITEMS`, and `PQ_PCS_PARALLEL_MIN_ITEMS`;
+  - output order remains deterministic, and commitments, openings, and proof
+    values are preserved by the parallel reductions.
+- Second-pass CPU root cause and fix:
+  - the first Rayon pass did not fully address the observed Task Manager
+    symptom because several large proof inputs were still being bound to
+    Fiat-Shamir one field or sparse entry at a time. At `n=16`, the R1CS/Spark
+    path was doing hundreds of thousands of small serial SHA-256 transcript
+    updates for matrices and polynomial vectors, so the arithmetic phases could
+    spike across cores while transcript/Spark phases fell back to roughly one
+    core;
+  - `pq-sumcheck` and `pq-pcs` now bind large field vectors by absorbing their
+    length plus a deterministic domain-separated digest. The digest is built
+    from indexed chunks and chunk hashes are computed in parallel, so the
+    transcript still commits to every value and position without performing one
+    serial transcript update per element;
+  - `pq-piop-r1cs` now binds Spark/R1CS sparse matrices through
+    domain-separated sparse-matrix digests instead of per-entry transcript
+    records, parallelizes Spark worker fingerprints/evaluations/memory digest
+    products, and reuses `eq_evaluations(point)` for Spark equality-memory
+    vectors instead of recomputing `eq_basis(point, index)` for every index.
+- Benchmark thread configuration:
+  - `pq-experiments benchmark` now configures Rayon before the first benchmark
+    job and prints the configured thread count. On the current Windows PC,
+    local release smoke printed
+    `[pq_dSNARK] rayon worker threads configured: 20`;
+  - network benchmark worker processes set `RAYON_NUM_THREADS` to the exact
+    number of cores assigned by the benchmark core plan. For example, on a
+    20-logical-core host with workers `1,4`, every worker process receives
+    `5` Rayon threads; with workers `1,2,4,8`, every worker process receives
+    `2` Rayon threads.
+- Adjusted interactive benchmark defaults:
+  - blank benchmark inputs now use hidden defaults instead of showing
+    square-bracket recommendations;
+  - hidden circuit range is now `n=8..10` instead of `n=2..5`;
+  - hidden worker exponent is capped at `3`, so a 20-logical-core PC defaults
+    to workers `1,2,4,8` and `cores_per_worker=2`;
+  - the benchmark grid confirmation prompt was removed; after the grid summary,
+    the run proceeds directly;
+  - users can still manually enter smaller smoke grids or larger server grids.
+- Validation:
+  - `cargo check --workspace`
+  - `cargo test --workspace`
+  - `cargo run -p pq-experiments --release -- benchmark --runner local --n-range 8..8 --workers 1 --pcs-queries 1 --out target\cpu-smoke`
+  - release smoke output included `rayon worker threads configured: 20` and
+    completed both R1CS and Plonkish end-to-end prove+verify jobs.
+  - `cargo test -p pq-core parallel_eq_evaluations_match_basis_order`
+  - `cargo test -p pq-core parallel_mle_evaluation_matches_naive_at_medium_size`
+  - `cargo test -p pq-pcs parallel_pcs_primitives_preserve_outputs`
+  - `cargo test -p pq-sumcheck product_sumcheck_accepts_and_rejects_tampering`
+  - `cargo test -p pq-experiments interactive_scripts_offer_dependency_install_from_actions`
+  - `cargo test -p pq-sumcheck sumcheck_accepts_and_rejects_tampering`
+  - `cargo test -p pq-piop-r1cs spark_matrix_statement_absorbs_sparse_entries`
+  - `cargo test -p pq-piop-r1cs spark_memory_and_matrix_evaluation_tampering_fails`
+  - `cargo test -p pq-pcs distributed_opening_binds_combined_column_and_queries`
+  - `target\release\pq-experiments.exe benchmark --runner local --n-range 14..14 --workers 1 --pcs-queries 1 --out target\cpu-profile`: wall `3.638s`, process CPU `45.219s`, effective cores `12.43`; phase timing: R1CS job `1040.326ms`, Plonkish job `2247.986ms`, final artifacts `294.935ms`.
+  - `target\release\pq-experiments.exe benchmark --runner local --n-range 16..16 --workers 1 --pcs-queries 1 --out target\cpu-profile`: wall `10.748s`, process CPU `144.141s`, effective cores `13.41`; phase timing: R1CS job `3234.788ms`, Plonkish job `7198.251ms`, final artifacts `249.824ms`.
+
+## 2026-06-02 - Protocol-stage timing and PCS report analysis
+
+- Added protocol-internal phase collection for both PIOP routes:
+  - R1CS records prover phases for PCS commitments, outer/inner/residual
+    sumchecks, openings/queries, Spark checks, and matching verifier phases;
+  - Plonkish records prover phases for oracle commitments, gate/permutation
+    subclaims, accumulator checks, zerochecks, openings/queries, and matching
+    verifier phases.
+- Added proof-size breakdown helpers for both proof formats:
+  - `pcs_bytes` covers PCS commitments, PCS openings, distributed index
+    openings, folding proofs, and Spark memory commitments/openings;
+  - `sumcheck_bytes` covers ordinary, cubic, rational, and multiset sumcheck
+    proof material;
+  - `other_bytes` is the remaining canonical proof accounting.
+- Extended benchmark/proof reports:
+  - `source.csv`, `source.json`, proof bundles, and `summary_stats.csv` now
+    include `prove_pcs_commit_ms`, `prove_sumcheck_ms`,
+    `prove_batch_open_ms`, `verify_pcs_open_ms`, `verify_sumcheck_ms`,
+    proof-size splits, and unclassified `other` buckets;
+  - `summary.txt`, `overview.html`, and proof-experiment reports include a
+    dedicated PCS commitment-cost and PCS proof-share analysis;
+  - `verify-results` now rejects rows where stage times are negative, stage
+    sums disagree with total prove/verify time, or proof-size splits do not add
+    back to `proof_bytes`.
+- Validation:
+  - `cargo fmt --check`
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - `cargo test --workspace`
+  - `target\release\pq-experiments.exe verify-results --dir target\stage-smoke\bench-20260602-134606-performance --format json`: checked 25 files, 2 source rows, 6 phase rows, and 2 summary rows.
+  - `cargo run -p pq-experiments --release -- benchmark --runner local --n-range 4..4 --workers 1 --pcs-queries 1 --out target\stage-smoke`
+  - `cargo run -p pq-experiments --release -- proof-experiment --protocol both --runner local --n 4 --workers 1 --pcs-queries 1 --out target\stage-proof-smoke --format json`
+- Smoke observations:
+  - R1CS n=4 local proof row: `prove_ms=21.211`, `verify_ms=12.292`,
+    `prove_pcs_commit_ms=1.239`, `prove_sumcheck_ms=1.694`,
+    `prove_batch_open_ms=13.708`, `verify_pcs_open_ms=5.388`,
+    `proof_bytes=66656`, `proof_pcs_bytes=60208`.
+  - Plonkish n=4 local proof row: `prove_ms=31.222`, `verify_ms=12.343`,
+    `prove_pcs_commit_ms=1.573`, `prove_sumcheck_ms=0.315`,
+    `prove_batch_open_ms=27.385`, `verify_pcs_open_ms=11.154`,
+    `proof_bytes=104020`, `proof_pcs_bytes=102620`.

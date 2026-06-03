@@ -145,6 +145,11 @@ Current source evidence:
     directly, extracts it to ignored `target/windows/`, and runs it with
     `-ExecutionPolicy Bypass`. `cmd /c "echo 0| scripts\interactive-powershell.cmd -NoPause"`
     rendered the menu and exited cleanly.
+  - Interactive benchmark cleanup removed the paper-preset, PCS query, and
+    figure-compilation prompts. The wizard now asks for a custom grid without
+    square-bracket recommendations, uses hidden defaults for blank inputs,
+    fixes `pcs_queries=1`, compiles figures by default, and runs directly after
+    printing the grid summary.
   - Historical scratch `results/bench-*` directories and `results/logs` were
     removed; `results/README.md` and `results/release_results/` remain.
 
@@ -174,7 +179,7 @@ Current source evidence:
 | `results/release_results` publication split | Proven | `.gitignore`, `results/README.md`, `results/release_results/README.md` | Scratch results ignored; curated release copying is now intentionally manual per user direction. |
 | n selectable and n-range selectable | Proven | `README.md`, `pq-experiments` parser tests | Supports `--n-range`, `--nv-range`, `--n-values`, `--nv-powers`. |
 | Performance benchmark excludes correctness tests/repeats | Proven | Benchmark command uses positive rows and `--repeats 1`; parser rejects repeats | Negative tests remain in unit/integration paths. |
-| Worker scaling core fairness | Proven for the current Windows release smoke | `pq-experiments` core-plan parser/tests, network runner affinity code, verified run `target\network-smoke\bench-20260601-120350-performance` | The run recorded `host_logical_cores=20`, `max_workers=2`, `cores_per_worker=10`, and `windows-powershell-processor-affinity`. |
+| Worker scaling core fairness and core use | Proven for the current Windows script/runtime path | `pq-experiments` core-plan parser/tests, network runner affinity code, Rayon thread-pool configuration, verified run `target\network-smoke\bench-20260601-120350-performance`, PowerShell benchmark wizard smoke | The prior run recorded `host_logical_cores=20`, `max_workers=2`, `cores_per_worker=10`, and `windows-powershell-processor-affinity`; parser tests cover the clarified 20-core rule: `workers=1,4` gives `cores_per_worker=5`, while `workers=1,2,4,8` gives `cores_per_worker=2`. Current runtime code also sets Rayon threads from that plan, so affinity and algorithmic worker count are aligned. |
 | Lightweight benchmark and theory comparison | Proven as sanity evidence | `Doc/reproducibility_runbook.md`, verified local and release network smokes under `target/` | The release network run is a tiny smoke, not paper-quality evidence. |
 | GitHub-quality repo hygiene | Proven for repository handoff readiness | README, CI, licenses, `.gitignore`, third-party pins, runbook, `quick-smoke`, `ci_guards_fresh_clone_quick_smoke`, final workspace validation | One-command local fresh-clone smoke is implemented, passed in this checkout, and is wired into macOS CI. Physical validation on separate fresh machines remains outside current worktree evidence, but the repo contains the intended detection/install and quick-smoke paths. |
 

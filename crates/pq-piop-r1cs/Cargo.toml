@@ -10,6 +10,7 @@ pq-pcs = { path = "../pq-pcs" }
 pq-piop = { path = "../pq-piop" }
 pq-sumcheck = { path = "../pq-sumcheck" }
 pq-transcript = { path = "../pq-transcript" }
+rayon = { workspace = true }
 serde = { workspace = true }
 
 [lib]
