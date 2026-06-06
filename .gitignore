@@ -5,6 +5,7 @@
 # but do not version local scratch runs. Curated publishable runs can be copied
 # manually into results/release_results/, which is intentionally not ignored.
 /results/bench-*/
+/results/pcs-bench-*/
 !/results/README.md
 !/results/release_results/
 !/results/release_results/**
@@ -14,6 +15,7 @@
 *.tmp
 *.bak
 /results/bench-*/*.png
+/results/pcs-bench-*/*.png
 
 # Vendored HyperPlonk reference source excludes. Keep source files, but do not
 # publish upstream benchmark plotting scratch files or KZG SRS binaries as part

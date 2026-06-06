@@ -1,0 +1,151 @@
+phase,detail,elapsed_ms,recorded_prove_ms,recorded_verify_ms,inferred_overhead_ms
+setup,"parse PCS benchmark arguments, derive core plan, create output directory",1.635,0.000,0.000,1.635
+pcs_warmup,runner=local opening=compact n=4 N=16 workers=1,20.491,0.000,0.000,20.491
+pcs_job,runner=local opening=compact n=4 N=16 workers=1 trial=1,20.220,12.519,7.682,0.019
+pcs_warmup,runner=local opening=compact n=4 N=16 workers=2,16.349,0.000,0.000,16.349
+pcs_job,runner=local opening=compact n=4 N=16 workers=2 trial=1,16.437,9.092,7.328,0.017
+pcs_warmup,runner=local opening=compact n=4 N=16 workers=4,15.086,0.000,0.000,15.086
+pcs_job,runner=local opening=compact n=4 N=16 workers=4 trial=1,15.242,8.204,7.019,0.018
+pcs_warmup,runner=local opening=compact n=4 N=16 workers=8,16.544,0.000,0.000,16.544
+pcs_job,runner=local opening=compact n=4 N=16 workers=8 trial=1,16.648,8.672,7.948,0.028
+pcs_warmup,runner=local opening=compact n=4 N=16 workers=16,20.728,0.000,0.000,20.728
+pcs_job,runner=local opening=compact n=4 N=16 workers=16 trial=1,21.297,10.817,10.452,0.028
+pcs_job,runner=local opening=compact n=5 N=32 workers=1 trial=1,30.235,19.453,10.753,0.029
+pcs_job,runner=local opening=compact n=5 N=32 workers=2 trial=1,22.078,13.321,8.731,0.025
+pcs_job,runner=local opening=compact n=5 N=32 workers=4 trial=1,19.809,11.063,8.727,0.019
+pcs_job,runner=local opening=compact n=5 N=32 workers=8 trial=1,21.022,10.994,10.005,0.023
+pcs_job,runner=local opening=compact n=5 N=32 workers=16 trial=1,26.546,13.648,12.874,0.024
+pcs_job,runner=local opening=compact n=6 N=64 workers=1 trial=1,36.076,24.378,11.675,0.023
+pcs_job,runner=local opening=compact n=6 N=64 workers=2 trial=1,29.554,18.953,10.577,0.024
+pcs_job,runner=local opening=compact n=6 N=64 workers=4 trial=1,27.843,16.566,11.248,0.029
+pcs_job,runner=local opening=compact n=6 N=64 workers=8 trial=1,26.965,14.655,12.282,0.028
+pcs_job,runner=local opening=compact n=6 N=64 workers=16 trial=1,33.096,17.061,16.005,0.030
+pcs_job,runner=local opening=compact n=7 N=128 workers=1 trial=1,47.551,34.204,13.317,0.031
+pcs_job,runner=local opening=compact n=7 N=128 workers=2 trial=1,38.103,25.506,12.556,0.041
+pcs_job,runner=local opening=compact n=7 N=128 workers=4 trial=1,34.447,21.436,12.982,0.029
+pcs_job,runner=local opening=compact n=7 N=128 workers=8 trial=1,35.671,20.784,14.856,0.031
+pcs_job,runner=local opening=compact n=7 N=128 workers=16 trial=1,40.920,21.542,19.342,0.035
+pcs_job,runner=local opening=compact n=8 N=256 workers=1 trial=1,61.429,45.858,15.541,0.030
+pcs_job,runner=local opening=compact n=8 N=256 workers=2 trial=1,49.546,35.053,14.462,0.031
+pcs_job,runner=local opening=compact n=8 N=256 workers=4 trial=1,44.751,29.631,15.085,0.035
+pcs_job,runner=local opening=compact n=8 N=256 workers=8 trial=1,44.253,26.727,17.494,0.032
+pcs_job,runner=local opening=compact n=8 N=256 workers=16 trial=1,51.584,28.778,22.772,0.034
+pcs_job,runner=local opening=compact n=9 N=512 workers=1 trial=1,77.520,59.802,17.691,0.027
+pcs_job,runner=local opening=compact n=9 N=512 workers=2 trial=1,64.466,47.486,16.949,0.030
+pcs_job,runner=local opening=compact n=9 N=512 workers=4 trial=1,57.886,40.636,17.220,0.030
+pcs_job,runner=local opening=compact n=9 N=512 workers=8 trial=1,56.408,36.419,19.954,0.035
+pcs_job,runner=local opening=compact n=9 N=512 workers=16 trial=1,65.460,38.704,26.704,0.052
+pcs_job,runner=local opening=compact n=10 N=1024 workers=1 trial=1,112.240,92.534,19.670,0.036
+pcs_job,runner=local opening=compact n=10 N=1024 workers=2 trial=1,86.496,67.348,19.105,0.043
+pcs_job,runner=local opening=compact n=10 N=1024 workers=4 trial=1,73.159,53.232,19.866,0.061
+pcs_job,runner=local opening=compact n=10 N=1024 workers=8 trial=1,73.868,50.907,22.923,0.037
+pcs_job,runner=local opening=compact n=10 N=1024 workers=16 trial=1,81.738,51.513,30.182,0.043
+pcs_job,runner=local opening=compact n=11 N=2048 workers=1 trial=1,164.471,142.073,22.343,0.054
+pcs_job,runner=local opening=compact n=11 N=2048 workers=2 trial=1,125.830,103.692,22.087,0.051
+pcs_job,runner=local opening=compact n=11 N=2048 workers=4 trial=1,104.408,81.460,22.898,0.050
+pcs_job,runner=local opening=compact n=11 N=2048 workers=8 trial=1,97.301,71.451,25.798,0.052
+pcs_job,runner=local opening=compact n=11 N=2048 workers=16 trial=1,104.777,70.705,34.018,0.054
+pcs_job,runner=local opening=compact n=12 N=4096 workers=1 trial=1,256.413,230.391,25.945,0.076
+pcs_job,runner=local opening=compact n=12 N=4096 workers=2 trial=1,209.543,183.894,25.530,0.120
+pcs_job,runner=local opening=compact n=12 N=4096 workers=4 trial=1,148.634,123.263,25.290,0.081
+pcs_job,runner=local opening=compact n=12 N=4096 workers=8 trial=1,134.766,105.318,29.377,0.071
+pcs_job,runner=local opening=compact n=12 N=4096 workers=16 trial=1,140.464,101.835,38.546,0.082
+pcs_job,runner=local opening=compact n=13 N=8192 workers=1 trial=1,444.091,414.629,29.345,0.117
+pcs_job,runner=local opening=compact n=13 N=8192 workers=2 trial=1,308.484,280.643,27.732,0.109
+pcs_job,runner=local opening=compact n=13 N=8192 workers=4 trial=1,223.089,193.898,29.064,0.126
+pcs_job,runner=local opening=compact n=13 N=8192 workers=8 trial=1,207.084,173.404,33.554,0.126
+pcs_job,runner=local opening=compact n=13 N=8192 workers=16 trial=1,218.941,174.402,44.401,0.138
+pcs_job,runner=local opening=compact n=14 N=16384 workers=1 trial=1,822.473,788.271,33.976,0.227
+pcs_job,runner=local opening=compact n=14 N=16384 workers=2 trial=1,542.416,511.158,31.051,0.207
+pcs_job,runner=local opening=compact n=14 N=16384 workers=4 trial=1,386.226,353.692,32.298,0.235
+pcs_job,runner=local opening=compact n=14 N=16384 workers=8 trial=1,337.623,300.212,37.203,0.208
+pcs_job,runner=local opening=compact n=14 N=16384 workers=16 trial=1,326.820,277.934,48.642,0.244
+pcs_job,runner=local opening=compact n=15 N=32768 workers=1 trial=1,1478.007,1442.573,35.066,0.368
+pcs_job,runner=local opening=compact n=15 N=32768 workers=2 trial=1,934.276,898.248,35.684,0.344
+pcs_job,runner=local opening=compact n=15 N=32768 workers=4 trial=1,705.087,669.312,35.377,0.399
+pcs_job,runner=local opening=compact n=15 N=32768 workers=8 trial=1,562.710,519.133,43.192,0.386
+pcs_job,runner=local opening=compact n=15 N=32768 workers=16 trial=1,517.799,464.611,52.791,0.397
+pcs_job,runner=local opening=compact n=16 N=65536 workers=1 trial=1,2865.357,2825.679,38.906,0.771
+pcs_job,runner=local opening=compact n=16 N=65536 workers=2 trial=1,1807.138,1767.893,38.514,0.730
+pcs_job,runner=local opening=compact n=16 N=65536 workers=4 trial=1,1290.297,1249.979,39.552,0.766
+pcs_job,runner=local opening=compact n=16 N=65536 workers=8 trial=1,1043.146,997.965,44.423,0.758
+pcs_job,runner=local opening=compact n=16 N=65536 workers=16 trial=1,919.137,859.671,58.636,0.830
+network_worker_pool_start,spawn and register 1 reusable loopback workers,514.854,0.000,0.000,514.854
+pcs_warmup,runner=network opening=compact n=4 N=16 workers=1,21.765,0.000,0.000,21.765
+pcs_job,runner=network opening=compact n=4 N=16 workers=1 trial=1,20.882,13.179,7.675,0.028
+network_worker_pool_start,spawn and register 2 reusable loopback workers,1056.045,0.000,0.000,1056.045
+pcs_warmup,runner=network opening=compact n=4 N=16 workers=2,21.723,0.000,0.000,21.723
+pcs_job,runner=network opening=compact n=4 N=16 workers=2 trial=1,17.403,10.327,7.052,0.024
+network_worker_pool_start,spawn and register 4 reusable loopback workers,2093.573,0.000,0.000,2093.573
+pcs_warmup,runner=network opening=compact n=4 N=16 workers=4,19.846,0.000,0.000,19.846
+pcs_job,runner=network opening=compact n=4 N=16 workers=4 trial=1,16.369,9.082,7.261,0.027
+network_worker_pool_start,spawn and register 8 reusable loopback workers,4157.645,0.000,0.000,4157.645
+pcs_warmup,runner=network opening=compact n=4 N=16 workers=8,20.296,0.000,0.000,20.296
+pcs_job,runner=network opening=compact n=4 N=16 workers=8 trial=1,17.248,9.406,7.813,0.028
+network_worker_pool_start,spawn and register 16 reusable loopback workers,8283.654,0.000,0.000,8283.654
+pcs_warmup,runner=network opening=compact n=4 N=16 workers=16,23.123,0.000,0.000,23.123
+pcs_job,runner=network opening=compact n=4 N=16 workers=16 trial=1,23.352,12.676,10.644,0.033
+pcs_job,runner=network opening=compact n=5 N=32 workers=1 trial=1,28.833,19.349,9.454,0.031
+pcs_job,runner=network opening=compact n=5 N=32 workers=2 trial=1,23.938,15.153,8.753,0.032
+pcs_job,runner=network opening=compact n=5 N=32 workers=4 trial=1,20.857,11.967,8.854,0.035
+pcs_job,runner=network opening=compact n=5 N=32 workers=8 trial=1,23.080,13.043,10.005,0.032
+pcs_job,runner=network opening=compact n=5 N=32 workers=16 trial=1,29.593,16.456,13.100,0.036
+pcs_job,runner=network opening=compact n=6 N=64 workers=1 trial=1,38.748,27.037,11.677,0.035
+pcs_job,runner=network opening=compact n=6 N=64 workers=2 trial=1,32.158,21.698,10.429,0.031
+pcs_job,runner=network opening=compact n=6 N=64 workers=4 trial=1,28.215,17.451,10.735,0.030
+pcs_job,runner=network opening=compact n=6 N=64 workers=8 trial=1,28.602,16.219,12.351,0.032
+pcs_job,runner=network opening=compact n=6 N=64 workers=16 trial=1,35.574,19.493,16.042,0.039
+pcs_job,runner=network opening=compact n=7 N=128 workers=1 trial=1,51.763,38.353,13.380,0.030
+pcs_job,runner=network opening=compact n=7 N=128 workers=2 trial=1,43.722,30.956,12.730,0.037
+pcs_job,runner=network opening=compact n=7 N=128 workers=4 trial=1,36.969,23.591,13.338,0.040
+pcs_job,runner=network opening=compact n=7 N=128 workers=8 trial=1,36.625,21.639,14.942,0.044
+pcs_job,runner=network opening=compact n=7 N=128 workers=16 trial=1,42.825,23.497,19.287,0.042
+pcs_job,runner=network opening=compact n=8 N=256 workers=1 trial=1,70.989,55.658,15.291,0.040
+pcs_job,runner=network opening=compact n=8 N=256 workers=2 trial=1,59.680,45.183,14.460,0.037
+pcs_job,runner=network opening=compact n=8 N=256 workers=4 trial=1,48.706,33.712,14.953,0.041
+pcs_job,runner=network opening=compact n=8 N=256 workers=8 trial=1,51.122,32.239,18.840,0.043
+pcs_job,runner=network opening=compact n=8 N=256 workers=16 trial=1,55.933,32.975,22.914,0.044
+pcs_job,runner=network opening=compact n=9 N=512 workers=1 trial=1,103.801,86.467,17.296,0.038
+pcs_job,runner=network opening=compact n=9 N=512 workers=2 trial=1,85.696,69.051,16.611,0.035
+pcs_job,runner=network opening=compact n=9 N=512 workers=4 trial=1,64.555,47.261,17.251,0.043
+pcs_job,runner=network opening=compact n=9 N=512 workers=8 trial=1,58.345,38.099,20.200,0.047
+pcs_job,runner=network opening=compact n=9 N=512 workers=16 trial=1,65.990,39.486,26.461,0.044
+pcs_job,runner=network opening=compact n=10 N=1024 workers=1 trial=1,154.733,134.537,20.145,0.050
+pcs_job,runner=network opening=compact n=10 N=1024 workers=2 trial=1,135.972,117.011,18.917,0.044
+pcs_job,runner=network opening=compact n=10 N=1024 workers=4 trial=1,92.368,72.570,19.756,0.041
+pcs_job,runner=network opening=compact n=10 N=1024 workers=8 trial=1,77.341,52.869,24.363,0.108
+pcs_job,runner=network opening=compact n=10 N=1024 workers=16 trial=1,82.904,52.679,30.152,0.073
+pcs_job,runner=network opening=compact n=11 N=2048 workers=1 trial=1,255.404,233.107,22.242,0.056
+pcs_job,runner=network opening=compact n=11 N=2048 workers=2 trial=1,222.832,201.030,21.733,0.069
+pcs_job,runner=network opening=compact n=11 N=2048 workers=4 trial=1,136.860,114.099,22.617,0.144
+pcs_job,runner=network opening=compact n=11 N=2048 workers=8 trial=1,104.562,78.841,25.652,0.069
+pcs_job,runner=network opening=compact n=11 N=2048 workers=16 trial=1,99.587,64.890,34.626,0.070
+pcs_job,runner=network opening=compact n=12 N=4096 workers=1 trial=1,434.165,408.951,25.132,0.082
+pcs_job,runner=network opening=compact n=12 N=4096 workers=2 trial=1,361.404,336.788,24.536,0.080
+pcs_job,runner=network opening=compact n=12 N=4096 workers=4 trial=1,226.363,201.038,25.234,0.091
+pcs_job,runner=network opening=compact n=12 N=4096 workers=8 trial=1,155.841,125.962,29.793,0.086
+pcs_job,runner=network opening=compact n=12 N=4096 workers=16 trial=1,130.785,91.620,39.075,0.091
+pcs_job,runner=network opening=compact n=13 N=8192 workers=1 trial=1,794.421,766.168,28.068,0.185
+pcs_job,runner=network opening=compact n=13 N=8192 workers=2 trial=1,661.113,633.696,27.277,0.140
+pcs_job,runner=network opening=compact n=13 N=8192 workers=4 trial=1,382.934,354.668,28.133,0.134
+pcs_job,runner=network opening=compact n=13 N=8192 workers=8 trial=1,248.723,215.713,32.869,0.142
+pcs_job,runner=network opening=compact n=13 N=8192 workers=16 trial=1,182.681,138.855,43.696,0.130
+pcs_job,runner=network opening=compact n=14 N=16384 workers=1 trial=1,1514.267,1482.889,31.164,0.213
+pcs_job,runner=network opening=compact n=14 N=16384 workers=2 trial=1,1332.121,1289.804,42.101,0.216
+pcs_job,runner=network opening=compact n=14 N=16384 workers=4 trial=1,847.671,808.426,38.964,0.280
+pcs_job,runner=network opening=compact n=14 N=16384 workers=8 trial=1,518.479,478.889,39.280,0.310
+pcs_job,runner=network opening=compact n=14 N=16384 workers=16 trial=1,312.893,264.446,48.164,0.283
+pcs_job,runner=network opening=compact n=15 N=32768 workers=1 trial=1,3071.609,3036.784,34.442,0.382
+pcs_job,runner=network opening=compact n=15 N=32768 workers=2 trial=1,2452.280,2418.901,33.029,0.349
+pcs_job,runner=network opening=compact n=15 N=32768 workers=4 trial=1,1277.482,1242.904,34.234,0.344
+pcs_job,runner=network opening=compact n=15 N=32768 workers=8 trial=1,731.969,690.829,40.755,0.385
+pcs_job,runner=network opening=compact n=15 N=32768 workers=16 trial=1,450.023,390.264,59.197,0.562
+pcs_job,runner=network opening=compact n=16 N=65536 workers=1 trial=1,6070.686,6031.841,37.803,1.042
+pcs_job,runner=network opening=compact n=16 N=65536 workers=2 trial=1,4913.655,4867.376,45.483,0.796
+pcs_job,runner=network opening=compact n=16 N=65536 workers=4 trial=1,2638.628,2592.141,45.782,0.705
+pcs_job,runner=network opening=compact n=16 N=65536 workers=8 trial=1,1388.919,1343.913,44.259,0.747
+pcs_job,runner=network opening=compact n=16 N=65536 workers=16 trial=1,786.452,727.086,58.467,0.898
+network_worker_pool_shutdown,shutdown 5 reusable loopback worker pools,257.813,0.000,0.000,257.813
+source_and_chart_artifacts,"write PCS source data, aggregate CSV, SVG charts, and PGFPlots/TikZ figures",34.545,0.000,0.000,34.545
+final_result_artifacts,write PCS HTML summary and result manifest inputs,1.491,0.000,0.000,1.491
+total,PCS benchmark total wall-clock time,70501.881,50327.178,3150.163,17024.540

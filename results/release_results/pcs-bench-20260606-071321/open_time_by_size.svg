@@ -1,0 +1,203 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="526" viewBox="0 0 980 526">
+<title>PCS open time by size</title>
+<!-- PCS chart uses stroke-dasharray for series distinction. -->
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="490" y="32" text-anchor="middle" font-family="Arial" font-size="20">PCS open time by size</text>
+<text x="18" y="210" transform="rotate(-90 18 210)" text-anchor="middle" font-family="Arial" font-size="13">Open time (ms)</text>
+<text x="520" y="402" text-anchor="middle" font-family="Arial" font-size="13">PCS polynomial exponent n in N=2^n</text>
+<line x1="86" y1="350" x2="940" y2="350" stroke="#444"/>
+<line x1="86" y1="70" x2="86" y2="350" stroke="#444"/>
+<line x1="86" y1="350.0" x2="940" y2="350.0" stroke="#e5e7eb"/>
+<text x="76" y="351.0" text-anchor="end" dominant-baseline="middle" font-family="Arial" font-size="12">10^0</text>
+<line x1="86" y1="280.0" x2="940" y2="280.0" stroke="#e5e7eb"/>
+<text x="76" y="281.0" text-anchor="end" dominant-baseline="middle" font-family="Arial" font-size="12">10^1</text>
+<line x1="86" y1="210.0" x2="940" y2="210.0" stroke="#e5e7eb"/>
+<text x="76" y="211.0" text-anchor="end" dominant-baseline="middle" font-family="Arial" font-size="12">10^2</text>
+<line x1="86" y1="140.0" x2="940" y2="140.0" stroke="#e5e7eb"/>
+<text x="76" y="141.0" text-anchor="end" dominant-baseline="middle" font-family="Arial" font-size="12">10^3</text>
+<line x1="86" y1="70.0" x2="940" y2="70.0" stroke="#e5e7eb"/>
+<text x="76" y="71.0" text-anchor="end" dominant-baseline="middle" font-family="Arial" font-size="12">10^4</text>
+<text x="86.0" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=4</text>
+<text x="157.2" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=5</text>
+<text x="228.3" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=6</text>
+<text x="299.5" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=7</text>
+<text x="370.7" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=8</text>
+<text x="441.8" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=9</text>
+<text x="513.0" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=10</text>
+<text x="584.2" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=11</text>
+<text x="655.3" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=12</text>
+<text x="726.5" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=13</text>
+<text x="797.7" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=14</text>
+<text x="868.8" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=15</text>
+<text x="940.0" y="374" text-anchor="middle" font-family="Arial" font-size="12">n=16</text>
+<polyline fill="none" stroke="#0072B2" stroke-width="2" stroke-dasharray="none" points="86.0,274.9 157.2,261.3 228.3,254.3 299.5,244.1 370.7,234.9 441.8,227.1 513.0,213.9 584.2,201.1 655.3,186.5 726.5,168.9 797.7,149.2 868.8,131.0 940.0,110.8"/>
+<circle cx="86.0" cy="274.9" r="4" fill="#0072B2"><title>local compact w1 n=4: 11.826</title></circle>
+<circle cx="157.2" cy="261.3" r="4" fill="#0072B2"><title>local compact w1 n=5: 18.526</title></circle>
+<circle cx="228.3" cy="254.3" r="4" fill="#0072B2"><title>local compact w1 n=6: 23.300</title></circle>
+<circle cx="299.5" cy="244.1" r="4" fill="#0072B2"><title>local compact w1 n=7: 32.612</title></circle>
+<circle cx="370.7" cy="234.9" r="4" fill="#0072B2"><title>local compact w1 n=8: 44.059</title></circle>
+<circle cx="441.8" cy="227.1" r="4" fill="#0072B2"><title>local compact w1 n=9: 56.971</title></circle>
+<circle cx="513.0" cy="213.9" r="4" fill="#0072B2"><title>local compact w1 n=10: 88.035</title></circle>
+<circle cx="584.2" cy="201.1" r="4" fill="#0072B2"><title>local compact w1 n=11: 133.942</title></circle>
+<circle cx="655.3" cy="186.5" r="4" fill="#0072B2"><title>local compact w1 n=12: 216.964</title></circle>
+<circle cx="726.5" cy="168.9" r="4" fill="#0072B2"><title>local compact w1 n=13: 386.916</title></circle>
+<circle cx="797.7" cy="149.2" r="4" fill="#0072B2"><title>local compact w1 n=14: 738.817</title></circle>
+<circle cx="868.8" cy="131.0" r="4" fill="#0072B2"><title>local compact w1 n=15: 1343.271</title></circle>
+<circle cx="940.0" cy="110.8" r="4" fill="#0072B2"><title>local compact w1 n=16: 2610.302</title></circle>
+<line x1="90.0" y1="430.0" x2="118.0" y2="430.0" stroke="#0072B2" stroke-width="2" stroke-dasharray="none"/>
+<circle cx="104.0" cy="430.0" r="3" fill="#0072B2"/>
+<text x="126.0" y="430.0" font-family="Arial" font-size="12" dominant-baseline="middle" fill="#111827">local compact w1</text>
+<polyline fill="none" stroke="#D55E00" stroke-width="2" stroke-dasharray="6 4" points="86.0,284.5 157.2,273.0 228.3,261.9 299.5,253.4 370.7,243.4 441.8,234.6 513.0,224.0 584.2,211.3 655.3,194.3 726.5,181.9 797.7,164.1 868.8,146.9 940.0,126.5"/>
+<circle cx="86.0" cy="284.5" r="4" fill="#D55E00"><title>local compact w2 n=4: 8.629</title></circle>
+<circle cx="157.2" cy="273.0" r="4" fill="#D55E00"><title>local compact w2 n=5: 12.593</title></circle>
+<circle cx="228.3" cy="261.9" r="4" fill="#D55E00"><title>local compact w2 n=6: 18.109</title></circle>
+<circle cx="299.5" cy="253.4" r="4" fill="#D55E00"><title>local compact w2 n=7: 23.988</title></circle>
+<circle cx="370.7" cy="243.4" r="4" fill="#D55E00"><title>local compact w2 n=8: 33.365</title></circle>
+<circle cx="441.8" cy="234.6" r="4" fill="#D55E00"><title>local compact w2 n=9: 44.576</title></circle>
+<circle cx="513.0" cy="224.0" r="4" fill="#D55E00"><title>local compact w2 n=10: 63.059</title></circle>
+<circle cx="584.2" cy="211.3" r="4" fill="#D55E00"><title>local compact w2 n=11: 95.729</title></circle>
+<circle cx="655.3" cy="194.3" r="4" fill="#D55E00"><title>local compact w2 n=12: 167.690</title></circle>
+<circle cx="726.5" cy="181.9" r="4" fill="#D55E00"><title>local compact w2 n=13: 251.640</title></circle>
+<circle cx="797.7" cy="164.1" r="4" fill="#D55E00"><title>local compact w2 n=14: 453.179</title></circle>
+<circle cx="868.8" cy="146.9" r="4" fill="#D55E00"><title>local compact w2 n=15: 798.209</title></circle>
+<circle cx="940.0" cy="126.5" r="4" fill="#D55E00"><title>local compact w2 n=16: 1557.355</title></circle>
+<line x1="310.0" y1="430.0" x2="338.0" y2="430.0" stroke="#D55E00" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="324.0" cy="430.0" r="3" fill="#D55E00"/>
+<text x="346.0" y="430.0" font-family="Arial" font-size="12" dominant-baseline="middle" fill="#111827">local compact w2</text>
+<polyline fill="none" stroke="#009E73" stroke-width="2" stroke-dasharray="2 4" points="86.0,289.4 157.2,278.6 228.3,266.8 299.5,258.7 370.7,248.9 441.8,239.7 513.0,231.9 584.2,219.5 655.3,207.9 726.5,194.5 797.7,176.5 868.8,157.4 940.0,138.8"/>
+<circle cx="86.0" cy="289.4" r="4" fill="#009E73"><title>local compact w4 n=4: 7.341</title></circle>
+<circle cx="157.2" cy="278.6" r="4" fill="#009E73"><title>local compact w4 n=5: 10.479</title></circle>
+<circle cx="228.3" cy="266.8" r="4" fill="#009E73"><title>local compact w4 n=6: 15.441</title></circle>
+<circle cx="299.5" cy="258.7" r="4" fill="#009E73"><title>local compact w4 n=7: 20.137</title></circle>
+<circle cx="370.7" cy="248.9" r="4" fill="#009E73"><title>local compact w4 n=8: 27.829</title></circle>
+<circle cx="441.8" cy="239.7" r="4" fill="#009E73"><title>local compact w4 n=9: 37.687</title></circle>
+<circle cx="513.0" cy="231.9" r="4" fill="#009E73"><title>local compact w4 n=10: 48.605</title></circle>
+<circle cx="584.2" cy="219.5" r="4" fill="#009E73"><title>local compact w4 n=11: 73.185</title></circle>
+<circle cx="655.3" cy="207.9" r="4" fill="#009E73"><title>local compact w4 n=12: 107.307</title></circle>
+<circle cx="726.5" cy="194.5" r="4" fill="#009E73"><title>local compact w4 n=13: 166.688</title></circle>
+<circle cx="797.7" cy="176.5" r="4" fill="#009E73"><title>local compact w4 n=14: 300.921</title></circle>
+<circle cx="868.8" cy="157.4" r="4" fill="#009E73"><title>local compact w4 n=15: 563.739</title></circle>
+<circle cx="940.0" cy="138.8" r="4" fill="#009E73"><title>local compact w4 n=16: 1040.018</title></circle>
+<line x1="530.0" y1="430.0" x2="558.0" y2="430.0" stroke="#009E73" stroke-width="2" stroke-dasharray="2 4"/>
+<circle cx="544.0" cy="430.0" r="3" fill="#009E73"/>
+<text x="566.0" y="430.0" font-family="Arial" font-size="12" dominant-baseline="middle" fill="#111827">local compact w4</text>
+<polyline fill="none" stroke="#CC79A7" stroke-width="2" stroke-dasharray="12 4" points="86.0,286.9 157.2,279.4 228.3,270.6 299.5,259.9 370.7,252.3 441.8,243.6 513.0,233.8 584.2,224.0 655.3,213.3 726.5,198.8 797.7,182.7 868.8,166.8 940.0,147.1"/>
+<circle cx="86.0" cy="286.9" r="4" fill="#CC79A7"><title>local compact w8 n=4: 7.979</title></circle>
+<circle cx="157.2" cy="279.4" r="4" fill="#CC79A7"><title>local compact w8 n=5: 10.211</title></circle>
+<circle cx="228.3" cy="270.6" r="4" fill="#CC79A7"><title>local compact w8 n=6: 13.629</title></circle>
+<circle cx="299.5" cy="259.9" r="4" fill="#CC79A7"><title>local compact w8 n=7: 19.401</title></circle>
+<circle cx="370.7" cy="252.3" r="4" fill="#CC79A7"><title>local compact w8 n=8: 24.837</title></circle>
+<circle cx="441.8" cy="243.6" r="4" fill="#CC79A7"><title>local compact w8 n=9: 33.085</title></circle>
+<circle cx="513.0" cy="233.8" r="4" fill="#CC79A7"><title>local compact w8 n=10: 45.777</title></circle>
+<circle cx="584.2" cy="224.0" r="4" fill="#CC79A7"><title>local compact w8 n=11: 63.103</title></circle>
+<circle cx="655.3" cy="213.3" r="4" fill="#CC79A7"><title>local compact w8 n=12: 89.765</title></circle>
+<circle cx="726.5" cy="198.8" r="4" fill="#CC79A7"><title>local compact w8 n=13: 144.418</title></circle>
+<circle cx="797.7" cy="182.7" r="4" fill="#CC79A7"><title>local compact w8 n=14: 245.756</title></circle>
+<circle cx="868.8" cy="166.8" r="4" fill="#CC79A7"><title>local compact w8 n=15: 414.334</title></circle>
+<circle cx="940.0" cy="147.1" r="4" fill="#CC79A7"><title>local compact w8 n=16: 791.545</title></circle>
+<line x1="750.0" y1="430.0" x2="778.0" y2="430.0" stroke="#CC79A7" stroke-width="2" stroke-dasharray="12 4"/>
+<circle cx="764.0" cy="430.0" r="3" fill="#CC79A7"/>
+<text x="786.0" y="430.0" font-family="Arial" font-size="12" dominant-baseline="middle" fill="#111827">local compact w8</text>
+<polyline fill="none" stroke="#E69F00" stroke-width="2" stroke-dasharray="4 3" points="86.0,281.5 157.2,274.0 228.3,266.7 299.5,259.2 370.7,250.3 441.8,241.6 513.0,233.7 584.2,224.9 655.3,214.6 726.5,199.8 797.7,186.5 868.8,171.9 940.0,153.4"/>
+<circle cx="86.0" cy="281.5" r="4" fill="#E69F00"><title>local compact w16 n=4: 9.509</title></circle>
+<circle cx="157.2" cy="274.0" r="4" fill="#E69F00"><title>local compact w16 n=5: 12.186</title></circle>
+<circle cx="228.3" cy="266.7" r="4" fill="#E69F00"><title>local compact w16 n=6: 15.494</title></circle>
+<circle cx="299.5" cy="259.2" r="4" fill="#E69F00"><title>local compact w16 n=7: 19.796</title></circle>
+<circle cx="370.7" cy="250.3" r="4" fill="#E69F00"><title>local compact w16 n=8: 26.526</title></circle>
+<circle cx="441.8" cy="241.6" r="4" fill="#E69F00"><title>local compact w16 n=9: 35.361</title></circle>
+<circle cx="513.0" cy="233.7" r="4" fill="#E69F00"><title>local compact w16 n=10: 45.838</title></circle>
+<circle cx="584.2" cy="224.9" r="4" fill="#E69F00"><title>local compact w16 n=11: 61.270</title></circle>
+<circle cx="655.3" cy="214.6" r="4" fill="#E69F00"><title>local compact w16 n=12: 85.940</title></circle>
+<circle cx="726.5" cy="199.8" r="4" fill="#E69F00"><title>local compact w16 n=13: 139.982</title></circle>
+<circle cx="797.7" cy="186.5" r="4" fill="#E69F00"><title>local compact w16 n=14: 216.459</title></circle>
+<circle cx="868.8" cy="171.9" r="4" fill="#E69F00"><title>local compact w16 n=15: 349.728</title></circle>
+<circle cx="940.0" cy="153.4" r="4" fill="#E69F00"><title>local compact w16 n=16: 643.645</title></circle>
+<line x1="90.0" y1="454.0" x2="118.0" y2="454.0" stroke="#E69F00" stroke-width="2" stroke-dasharray="4 3"/>
+<circle cx="104.0" cy="454.0" r="3" fill="#E69F00"/>
+<text x="126.0" y="454.0" font-family="Arial" font-size="12" dominant-baseline="middle" fill="#111827">local compact w16</text>
+<polyline fill="none" stroke="#56B4E9" stroke-width="2" stroke-dasharray="none" points="86.0,273.7 157.2,262.9 228.3,252.8 299.5,242.9 370.7,232.3 441.8,220.3 513.0,208.0 584.2,192.5 655.3,176.6 726.5,158.5 797.7,139.2 868.8,116.9 940.0,96.3"/>
+<circle cx="86.0" cy="273.7" r="4" fill="#56B4E9"><title>network compact w1 n=4: 12.301</title></circle>
+<circle cx="157.2" cy="262.9" r="4" fill="#56B4E9"><title>network compact w1 n=5: 17.526</title></circle>
+<circle cx="228.3" cy="252.8" r="4" fill="#56B4E9"><title>network compact w1 n=6: 24.460</title></circle>
+<circle cx="299.5" cy="242.9" r="4" fill="#56B4E9"><title>network compact w1 n=7: 33.933</title></circle>
+<circle cx="370.7" cy="232.3" r="4" fill="#56B4E9"><title>network compact w1 n=8: 48.018</title></circle>
+<circle cx="441.8" cy="220.3" r="4" fill="#56B4E9"><title>network compact w1 n=9: 71.230</title></circle>
+<circle cx="513.0" cy="208.0" r="4" fill="#56B4E9"><title>network compact w1 n=10: 106.726</title></circle>
+<circle cx="584.2" cy="192.5" r="4" fill="#56B4E9"><title>network compact w1 n=11: 177.960</title></circle>
+<circle cx="655.3" cy="176.6" r="4" fill="#56B4E9"><title>network compact w1 n=12: 299.981</title></circle>
+<circle cx="726.5" cy="158.5" r="4" fill="#56B4E9"><title>network compact w1 n=13: 543.806</title></circle>
+<circle cx="797.7" cy="139.2" r="4" fill="#56B4E9"><title>network compact w1 n=14: 1027.311</title></circle>
+<circle cx="868.8" cy="116.9" r="4" fill="#56B4E9"><title>network compact w1 n=15: 2135.150</title></circle>
+<circle cx="940.0" cy="96.3" r="4" fill="#56B4E9"><title>network compact w1 n=16: 4209.173</title></circle>
+<line x1="310.0" y1="454.0" x2="338.0" y2="454.0" stroke="#56B4E9" stroke-width="2" stroke-dasharray="none"/>
+<circle cx="324.0" cy="454.0" r="3" fill="#56B4E9"/>
+<text x="346.0" y="454.0" font-family="Arial" font-size="12" dominant-baseline="middle" fill="#111827">network compact w1</text>
+<polyline fill="none" stroke="#6B7280" stroke-width="2" stroke-dasharray="6 4" points="86.0,282.0 157.2,271.0 228.3,260.1 299.5,250.0 370.7,239.9 441.8,228.7 513.0,213.6 584.2,199.7 655.3,185.1 726.5,166.6 797.7,145.0 868.8,127.5 940.0,105.8"/>
+<circle cx="86.0" cy="282.0" r="4" fill="#6B7280"><title>network compact w2 n=4: 9.364</title></circle>
+<circle cx="157.2" cy="271.0" r="4" fill="#6B7280"><title>network compact w2 n=5: 13.457</title></circle>
+<circle cx="228.3" cy="260.1" r="4" fill="#6B7280"><title>network compact w2 n=6: 19.213</title></circle>
+<circle cx="299.5" cy="250.0" r="4" fill="#6B7280"><title>network compact w2 n=7: 26.795</title></circle>
+<circle cx="370.7" cy="239.9" r="4" fill="#6B7280"><title>network compact w2 n=8: 37.389</title></circle>
+<circle cx="441.8" cy="228.7" r="4" fill="#6B7280"><title>network compact w2 n=9: 54.084</title></circle>
+<circle cx="513.0" cy="213.6" r="4" fill="#6B7280"><title>network compact w2 n=10: 88.706</title></circle>
+<circle cx="584.2" cy="199.7" r="4" fill="#6B7280"><title>network compact w2 n=11: 140.533</title></circle>
+<circle cx="655.3" cy="185.1" r="4" fill="#6B7280"><title>network compact w2 n=12: 226.990</title></circle>
+<circle cx="726.5" cy="166.6" r="4" fill="#6B7280"><title>network compact w2 n=13: 416.308</title></circle>
+<circle cx="797.7" cy="145.0" r="4" fill="#6B7280"><title>network compact w2 n=14: 847.795</title></circle>
+<circle cx="868.8" cy="127.5" r="4" fill="#6B7280"><title>network compact w2 n=15: 1507.109</title></circle>
+<circle cx="940.0" cy="105.8" r="4" fill="#6B7280"><title>network compact w2 n=16: 3077.971</title></circle>
+<line x1="530.0" y1="454.0" x2="558.0" y2="454.0" stroke="#6B7280" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="544.0" cy="454.0" r="3" fill="#6B7280"/>
+<text x="566.0" y="454.0" font-family="Arial" font-size="12" dominant-baseline="middle" fill="#111827">network compact w2</text>
+<polyline fill="none" stroke="#0072B2" stroke-width="2" stroke-dasharray="2 4" points="86.0,285.7 157.2,277.4 228.3,266.7 299.5,257.4 370.7,247.5 441.8,238.2 513.0,226.4 584.2,214.6 655.3,198.8 726.5,183.0 797.7,158.0 868.8,146.8 940.0,124.8"/>
+<circle cx="86.0" cy="285.7" r="4" fill="#0072B2"><title>network compact w4 n=4: 8.289</title></circle>
+<circle cx="157.2" cy="277.4" r="4" fill="#0072B2"><title>network compact w4 n=5: 10.896</title></circle>
+<circle cx="228.3" cy="266.7" r="4" fill="#0072B2"><title>network compact w4 n=6: 15.478</title></circle>
+<circle cx="299.5" cy="257.4" r="4" fill="#0072B2"><title>network compact w4 n=7: 21.015</title></circle>
+<circle cx="370.7" cy="247.5" r="4" fill="#0072B2"><title>network compact w4 n=8: 29.144</title></circle>
+<circle cx="441.8" cy="238.2" r="4" fill="#0072B2"><title>network compact w4 n=9: 39.572</title></circle>
+<circle cx="513.0" cy="226.4" r="4" fill="#0072B2"><title>network compact w4 n=10: 58.259</title></circle>
+<circle cx="584.2" cy="214.6" r="4" fill="#0072B2"><title>network compact w4 n=11: 86.033</title></circle>
+<circle cx="655.3" cy="198.8" r="4" fill="#0072B2"><title>network compact w4 n=12: 144.577</title></circle>
+<circle cx="726.5" cy="183.0" r="4" fill="#0072B2"><title>network compact w4 n=13: 243.392</title></circle>
+<circle cx="797.7" cy="158.0" r="4" fill="#0072B2"><title>network compact w4 n=14: 553.723</title></circle>
+<circle cx="868.8" cy="146.8" r="4" fill="#0072B2"><title>network compact w4 n=15: 798.683</title></circle>
+<circle cx="940.0" cy="124.8" r="4" fill="#0072B2"><title>network compact w4 n=16: 1646.828</title></circle>
+<line x1="750.0" y1="454.0" x2="778.0" y2="454.0" stroke="#0072B2" stroke-width="2" stroke-dasharray="2 4"/>
+<circle cx="764.0" cy="454.0" r="3" fill="#0072B2"/>
+<text x="786.0" y="454.0" font-family="Arial" font-size="12" dominant-baseline="middle" fill="#111827">network compact w4</text>
+<polyline fill="none" stroke="#D55E00" stroke-width="2" stroke-dasharray="12 4" points="86.0,285.0 157.2,276.2 228.3,268.2 299.5,259.4 370.7,247.0 441.8,243.1 513.0,234.3 584.2,223.7 655.3,210.9 726.5,196.8 797.7,177.1 868.8,163.5 940.0,145.0"/>
+<circle cx="86.0" cy="285.0" r="4" fill="#D55E00"><title>network compact w8 n=4: 8.478</title></circle>
+<circle cx="157.2" cy="276.2" r="4" fill="#D55E00"><title>network compact w8 n=5: 11.347</title></circle>
+<circle cx="228.3" cy="268.2" r="4" fill="#D55E00"><title>network compact w8 n=6: 14.719</title></circle>
+<circle cx="299.5" cy="259.4" r="4" fill="#D55E00"><title>network compact w8 n=7: 19.720</title></circle>
+<circle cx="370.7" cy="247.0" r="4" fill="#D55E00"><title>network compact w8 n=8: 29.631</title></circle>
+<circle cx="441.8" cy="243.1" r="4" fill="#D55E00"><title>network compact w8 n=9: 33.708</title></circle>
+<circle cx="513.0" cy="234.3" r="4" fill="#D55E00"><title>network compact w8 n=10: 45.016</title></circle>
+<circle cx="584.2" cy="223.7" r="4" fill="#D55E00"><title>network compact w8 n=11: 63.754</title></circle>
+<circle cx="655.3" cy="210.9" r="4" fill="#D55E00"><title>network compact w8 n=12: 97.109</title></circle>
+<circle cx="726.5" cy="196.8" r="4" fill="#D55E00"><title>network compact w8 n=13: 154.621</title></circle>
+<circle cx="797.7" cy="177.1" r="4" fill="#D55E00"><title>network compact w8 n=14: 294.853</title></circle>
+<circle cx="868.8" cy="163.5" r="4" fill="#D55E00"><title>network compact w8 n=15: 462.378</title></circle>
+<circle cx="940.0" cy="145.0" r="4" fill="#D55E00"><title>network compact w8 n=16: 849.328</title></circle>
+<line x1="90.0" y1="478.0" x2="118.0" y2="478.0" stroke="#D55E00" stroke-width="2" stroke-dasharray="12 4"/>
+<circle cx="104.0" cy="478.0" r="3" fill="#D55E00"/>
+<text x="126.0" y="478.0" font-family="Arial" font-size="12" dominant-baseline="middle" fill="#111827">network compact w8</text>
+<polyline fill="none" stroke="#009E73" stroke-width="2" stroke-dasharray="4 3" points="86.0,276.9 157.2,268.2 228.3,262.8 299.5,256.7 370.7,246.5 441.8,241.6 513.0,234.1 584.2,227.8 655.3,218.4 726.5,207.7 797.7,192.1 868.8,179.7 940.0,162.7"/>
+<circle cx="86.0" cy="276.9" r="4" fill="#009E73"><title>network compact w16 n=4: 11.058</title></circle>
+<circle cx="157.2" cy="268.2" r="4" fill="#009E73"><title>network compact w16 n=5: 14.744</title></circle>
+<circle cx="228.3" cy="262.8" r="4" fill="#009E73"><title>network compact w16 n=6: 17.595</title></circle>
+<circle cx="299.5" cy="256.7" r="4" fill="#009E73"><title>network compact w16 n=7: 21.548</title></circle>
+<circle cx="370.7" cy="246.5" r="4" fill="#009E73"><title>network compact w16 n=8: 30.052</title></circle>
+<circle cx="441.8" cy="241.6" r="4" fill="#009E73"><title>network compact w16 n=9: 35.405</title></circle>
+<circle cx="513.0" cy="234.1" r="4" fill="#009E73"><title>network compact w16 n=10: 45.197</title></circle>
+<circle cx="584.2" cy="227.8" r="4" fill="#009E73"><title>network compact w16 n=11: 55.773</title></circle>
+<circle cx="655.3" cy="218.4" r="4" fill="#009E73"><title>network compact w16 n=12: 75.919</title></circle>
+<circle cx="726.5" cy="207.7" r="4" fill="#009E73"><title>network compact w16 n=13: 107.683</title></circle>
+<circle cx="797.7" cy="192.1" r="4" fill="#009E73"><title>network compact w16 n=14: 179.900</title></circle>
+<circle cx="868.8" cy="179.7" r="4" fill="#009E73"><title>network compact w16 n=15: 270.562</title></circle>
+<circle cx="940.0" cy="162.7" r="4" fill="#009E73"><title>network compact w16 n=16: 474.134</title></circle>
+<line x1="310.0" y1="478.0" x2="338.0" y2="478.0" stroke="#009E73" stroke-width="2" stroke-dasharray="4 3"/>
+<circle cx="324.0" cy="478.0" r="3" fill="#009E73"/>
+<text x="346.0" y="478.0" font-family="Arial" font-size="12" dominant-baseline="middle" fill="#111827">network compact w16</text>
+</svg>

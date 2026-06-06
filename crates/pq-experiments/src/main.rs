@@ -18,8 +18,12 @@ use pq_net::{
     response_wire_bytes, run_worker, spawn_loopback_worker,
 };
 use pq_pcs::{
-    CompactDistributedOpening, DistributedBrakedown, DistributedCommitment, DistributedPcs,
-    DistributedPcsParams, PcsError, WorkerOpening, WorkerOpeningRequest,
+    CompactDistributedOpening, DistributedBrakedown, DistributedCommitment, DistributedOpening,
+    DistributedPcs, DistributedPcsParams, PcsError, WorkerOpening, WorkerOpeningRequest,
+    communication_bytes as pcs_communication_bytes,
+    compact_communication_bytes as compact_pcs_communication_bytes,
+    compact_proof_size_bytes as compact_pcs_proof_size_bytes, distributed_commitment_size_bytes,
+    proof_size_bytes as pcs_proof_size_bytes,
 };
 use pq_piop_plonkish::{
     PlonkishInstance, PlonkishPcsOpening, PlonkishPhaseTiming, PlonkishPiopError,
@@ -126,6 +130,61 @@ struct BenchmarkCommand {
     host_logical_cores: Option<usize>,
     worker_cores: Option<usize>,
     worker_core_plan: Option<WorkerCorePlan>,
+}
+
+#[derive(Clone, Debug)]
+struct PcsBenchmarkCommand {
+    sizes: Vec<usize>,
+    workers: Vec<usize>,
+    pcs_queries: usize,
+    repeats: usize,
+    runner: BenchmarkRunner,
+    opening: PcsOpeningSelection,
+    out_dir: PathBuf,
+    host_logical_cores: Option<usize>,
+    worker_cores: Option<usize>,
+    worker_core_plan: Option<WorkerCorePlan>,
+    warmup_enabled: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PcsOpeningSelection {
+    Compact,
+    Full,
+    Both,
+}
+
+impl PcsOpeningSelection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Full => "full",
+            Self::Both => "both",
+        }
+    }
+
+    fn variants(self) -> Vec<PcsOpeningVariant> {
+        match self {
+            Self::Compact => vec![PcsOpeningVariant::Compact],
+            Self::Full => vec![PcsOpeningVariant::Full],
+            Self::Both => vec![PcsOpeningVariant::Compact, PcsOpeningVariant::Full],
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PcsOpeningVariant {
+    Compact,
+    Full,
+}
+
+impl PcsOpeningVariant {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Full => "full",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -406,13 +465,63 @@ const BASE_BENCHMARK_ARTIFACTS: &[&str] = &[
     "paper_figures_standalone.tex",
 ];
 
+const PCS_BENCHMARK_ARTIFACTS: &[&str] = &[
+    "metadata.json",
+    RESULT_MANIFEST,
+    OVERVIEW_HTML,
+    "phase_timing.csv",
+    "phase_timing.json",
+    "source.csv",
+    "source.json",
+    "summary_stats.csv",
+    "summary.txt",
+    "commit_time_by_size.svg",
+    "commit_time_by_size.tex",
+    "open_time_by_size.svg",
+    "open_time_by_size.tex",
+    "verify_time_by_size.svg",
+    "verify_time_by_size.tex",
+    "opening_bytes_by_size.svg",
+    "opening_bytes_by_size.tex",
+    "network_bytes_by_size.svg",
+    "network_bytes_by_size.tex",
+    "worker_scaling_max_size.svg",
+    "worker_scaling_max_size.tex",
+    "local_commit_time_by_size.svg",
+    "local_commit_time_by_size.tex",
+    "local_open_time_by_size.svg",
+    "local_open_time_by_size.tex",
+    "local_verify_time_by_size.svg",
+    "local_verify_time_by_size.tex",
+    "local_opening_bytes_by_size.svg",
+    "local_opening_bytes_by_size.tex",
+    "local_network_bytes_by_size.svg",
+    "local_network_bytes_by_size.tex",
+    "local_worker_scaling_max_size.svg",
+    "local_worker_scaling_max_size.tex",
+    "network_commit_time_by_size.svg",
+    "network_commit_time_by_size.tex",
+    "network_open_time_by_size.svg",
+    "network_open_time_by_size.tex",
+    "network_verify_time_by_size.svg",
+    "network_verify_time_by_size.tex",
+    "network_opening_bytes_by_size.svg",
+    "network_opening_bytes_by_size.tex",
+    "network_network_bytes_by_size.svg",
+    "network_network_bytes_by_size.tex",
+    "network_worker_scaling_max_size.svg",
+    "network_worker_scaling_max_size.tex",
+];
+
 const COMPILED_PAPER_FIGURE: &str = "paper_figures_standalone.pdf";
 const RESULT_MANIFEST: &str = "result_manifest.json";
 const OVERVIEW_HTML: &str = "overview.html";
 const SOURCE_CSV_HEADER: &str = "protocol,runner,case,trial,workers,nv_power,size,constraints,pcs_queries,prove_ms,verify_ms,prove_pcs_commit_ms,prove_sumcheck_ms,prove_batch_open_ms,prove_other_ms,verify_pcs_open_ms,verify_sumcheck_ms,verify_other_ms,proof_bytes,proof_pcs_bytes,proof_sumcheck_bytes,proof_other_bytes,communication_bytes,network_bytes,host_logical_cores,cores_per_worker,core_affinity,verified,failure_reason";
+const PCS_SOURCE_CSV_HEADER: &str = "runner,opening,trial,workers,nv_power,size,t_rows_per_worker,paper_b_target,shard_len,pcs_queries_requested,pcs_queries_effective,partition_ms,worker_commit_ms,master_commit_ms,commit_ms,open_ms,verify_ms,commitment_bytes,opening_proof_bytes,communication_bytes,network_commit_bytes,network_open_bytes,network_bytes,host_logical_cores,cores_per_worker,core_affinity,verified,failure_reason";
 const PHASE_TIMING_CSV_HEADER: &str =
     "phase,detail,elapsed_ms,recorded_prove_ms,recorded_verify_ms,inferred_overhead_ms";
 const SUMMARY_STATS_CSV_HEADER: &str = "protocol,runner,case,workers,nv_power,size,constraints,pcs_queries,samples,verified_count,rejected_count,prove_ms_mean,prove_ms_stddev,verify_ms_mean,verify_ms_stddev,prove_pcs_commit_ms_mean,prove_sumcheck_ms_mean,prove_batch_open_ms_mean,verify_pcs_open_ms_mean,verify_sumcheck_ms_mean,proof_bytes_mean,proof_bytes_stddev,proof_pcs_bytes_mean,proof_sumcheck_bytes_mean,proof_other_bytes_mean,communication_bytes_mean,communication_bytes_stddev,network_bytes_mean,network_bytes_stddev,failure_reasons";
+const PCS_SUMMARY_STATS_CSV_HEADER: &str = "runner,opening,workers,nv_power,size,samples,verified_count,commit_ms_mean,commit_ms_stddev,open_ms_mean,open_ms_stddev,verify_ms_mean,verify_ms_stddev,opening_proof_bytes_mean,communication_bytes_mean,network_bytes_mean,failure_reasons";
 const PAPER_PRESET_NV_START: usize = 2;
 const PAPER_PRESET_NV_END: usize = 6;
 const PAPER_PRESET_WORKERS: &[usize] = &[1, 2, 4];
@@ -531,6 +640,54 @@ struct NetMetricRecord {
     ok: bool,
 }
 
+#[derive(Clone, Debug)]
+struct PcsMetricRecord {
+    runner: &'static str,
+    opening: &'static str,
+    trial: usize,
+    workers: usize,
+    size: usize,
+    t_rows_per_worker: f64,
+    paper_b_target: usize,
+    shard_len: usize,
+    pcs_queries_requested: usize,
+    pcs_queries_effective: usize,
+    partition_ms: f64,
+    worker_commit_ms: f64,
+    master_commit_ms: f64,
+    commit_ms: f64,
+    open_ms: f64,
+    verify_ms: f64,
+    commitment_bytes: usize,
+    opening_proof_bytes: usize,
+    communication_bytes: usize,
+    network_commit_bytes: usize,
+    network_open_bytes: usize,
+    network_bytes: usize,
+    host_logical_cores: Option<usize>,
+    cores_per_worker: Option<usize>,
+    core_affinity: Option<&'static str>,
+    verified: bool,
+    failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PcsStatsRecord {
+    runner: &'static str,
+    opening: &'static str,
+    workers: usize,
+    size: usize,
+    samples: usize,
+    verified_count: usize,
+    commit_ms: MeanStddev,
+    open_ms: MeanStddev,
+    verify_ms: MeanStddev,
+    opening_proof_bytes: MeanStddev,
+    communication_bytes: MeanStddev,
+    network_bytes: MeanStddev,
+    failure_reasons: Vec<String>,
+}
+
 #[derive(Debug)]
 struct CliError(String);
 
@@ -576,6 +733,9 @@ fn run() -> Result<(), CliError> {
     if args.first().map(String::as_str) == Some("benchmark") {
         return run_benchmark_command(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("pcs-benchmark") {
+        return run_pcs_benchmark_command(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("quick-smoke") {
         return run_quick_smoke_command(&args[1..]);
     }
@@ -590,6 +750,9 @@ fn run() -> Result<(), CliError> {
     }
     if args.first().map(String::as_str) == Some("verify-results") {
         return run_verify_results_command(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("verify-pcs-results") {
+        return run_verify_pcs_results_command(&args[1..]);
     }
 
     let config = parse_args(args)?;
@@ -897,6 +1060,101 @@ fn parse_benchmark_command(args: &[String]) -> Result<BenchmarkCommand, CliError
     Ok(command)
 }
 
+fn parse_pcs_benchmark_command(args: &[String]) -> Result<PcsBenchmarkCommand, CliError> {
+    let mut command = PcsBenchmarkCommand {
+        sizes: vec![256, 512, 1024],
+        workers: PAPER_PRESET_WORKERS.to_vec(),
+        pcs_queries: 1,
+        repeats: 1,
+        runner: BenchmarkRunner::Both,
+        opening: PcsOpeningSelection::Compact,
+        out_dir: PathBuf::from("results"),
+        host_logical_cores: None,
+        worker_cores: None,
+        worker_core_plan: None,
+        warmup_enabled: true,
+    };
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--sizes" => {
+                command.sizes =
+                    parse_csv_usizes(next_value(args, &mut index, "--sizes")?, "--sizes")?;
+            }
+            flag @ ("--nv-powers" | "--n-values") => {
+                command.sizes =
+                    parse_nv_powers_to_sizes(next_value(args, &mut index, flag)?, flag)?;
+            }
+            flag @ ("--nv-range" | "--n-range") => {
+                command.sizes = parse_nv_range_to_sizes(next_value(args, &mut index, flag)?, flag)?;
+            }
+            "--size-range" => {
+                command.sizes =
+                    parse_size_range_to_sizes(next_value(args, &mut index, "--size-range")?)?;
+            }
+            "--workers" => {
+                command.workers =
+                    parse_csv_usizes(next_value(args, &mut index, "--workers")?, "--workers")?;
+            }
+            "--worker-power-range" => {
+                command.workers = parse_worker_power_range_to_workers(next_value(
+                    args,
+                    &mut index,
+                    "--worker-power-range",
+                )?)?;
+            }
+            "--pcs-queries" => {
+                command.pcs_queries = parse_positive_usize(
+                    next_value(args, &mut index, "--pcs-queries")?,
+                    "--pcs-queries",
+                )?;
+            }
+            "--repeats" => {
+                command.repeats =
+                    parse_positive_usize(next_value(args, &mut index, "--repeats")?, "--repeats")?;
+            }
+            "--runner" => {
+                command.runner = parse_benchmark_runner(next_value(args, &mut index, "--runner")?)?;
+            }
+            "--opening" => {
+                command.opening =
+                    parse_pcs_opening_selection(next_value(args, &mut index, "--opening")?)?;
+            }
+            "--out" => {
+                command.out_dir = PathBuf::from(next_value(args, &mut index, "--out")?);
+            }
+            "--host-cores" => {
+                command.host_logical_cores = Some(parse_positive_usize(
+                    next_value(args, &mut index, "--host-cores")?,
+                    "--host-cores",
+                )?);
+            }
+            "--worker-cores" => {
+                command.worker_cores = Some(parse_positive_usize(
+                    next_value(args, &mut index, "--worker-cores")?,
+                    "--worker-cores",
+                )?);
+            }
+            "--no-pcs-warmup" => {
+                command.warmup_enabled = false;
+            }
+            "--help" | "-h" => return Err(CliError(usage())),
+            other => {
+                return Err(CliError(format!(
+                    "unknown pcs-benchmark argument '{other}'"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    normalize_unique(&mut command.sizes);
+    normalize_unique(&mut command.workers);
+    validate_pcs_benchmark_command(&command)?;
+    Ok(command)
+}
+
 fn configure_benchmark_core_plan(command: &mut BenchmarkCommand) -> Result<(), CliError> {
     let uses_network_runner = command
         .runner
@@ -944,8 +1202,81 @@ fn configure_benchmark_core_plan(command: &mut BenchmarkCommand) -> Result<(), C
     Ok(())
 }
 
+fn configure_pcs_benchmark_core_plan(command: &mut PcsBenchmarkCommand) -> Result<(), CliError> {
+    let uses_network_runner = command
+        .runner
+        .variants()
+        .contains(&BenchmarkRunner::Network);
+    if !uses_network_runner {
+        return Ok(());
+    }
+    let max_workers = command
+        .workers
+        .iter()
+        .copied()
+        .max()
+        .ok_or_else(|| CliError("pcs-benchmark --workers must not be empty".to_owned()))?;
+    if command.workers.len() <= 1 && command.worker_cores.is_none() {
+        return Ok(());
+    }
+    let host_logical_cores = match command.host_logical_cores {
+        Some(value) => value,
+        None => std::thread::available_parallelism()
+            .map_err(|error| {
+                CliError(format!(
+                    "failed to detect host logical cores for PCS network scaling: {error}"
+                ))
+            })?
+            .get(),
+    };
+    let auto_cores_per_worker = host_logical_cores / max_workers;
+    if auto_cores_per_worker == 0 {
+        return Err(CliError(format!(
+            "host has {host_logical_cores} logical cores but max workers is {max_workers}; cannot assign at least one core per PCS worker"
+        )));
+    }
+    let cores_per_worker = command.worker_cores.unwrap_or(auto_cores_per_worker);
+    if cores_per_worker == 0 {
+        return Err(CliError(
+            "--worker-cores must be greater than zero".to_owned(),
+        ));
+    }
+    let required = max_workers
+        .checked_mul(cores_per_worker)
+        .ok_or_else(|| CliError("PCS worker core plan overflows usize".to_owned()))?;
+    if required > host_logical_cores {
+        return Err(CliError(format!(
+            "PCS benchmark requires {required} logical cores for {max_workers} workers * {cores_per_worker} cores, but host has {host_logical_cores}"
+        )));
+    }
+    command.worker_core_plan = Some(WorkerCorePlan {
+        host_logical_cores,
+        max_workers,
+        cores_per_worker,
+    });
+    eprintln!(
+        "[pcs-benchmark] network worker core plan: host_logical_cores={host_logical_cores} max_workers={max_workers} cores_per_worker={cores_per_worker} mode={}",
+        worker_affinity_mode()
+    );
+    Ok(())
+}
+
 fn configure_benchmark_rayon_pool(command: &BenchmarkCommand) {
     let threads = benchmark_rayon_thread_count(command);
+    configure_rayon_pool(threads);
+}
+
+fn configure_pcs_benchmark_rayon_pool(command: &PcsBenchmarkCommand) {
+    let threads = if let Some(plan) = &command.worker_core_plan {
+        (plan.cores_per_worker * plan.max_workers)
+            .min(plan.host_logical_cores)
+            .max(1)
+    } else {
+        std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(1)
+            .max(1)
+    };
     configure_rayon_pool(threads);
 }
 
@@ -995,6 +1326,17 @@ fn parse_benchmark_runner(value: &str) -> Result<BenchmarkRunner, CliError> {
         "both" => Ok(BenchmarkRunner::Both),
         other => Err(CliError(format!(
             "unsupported --runner '{other}', expected local, network, or both"
+        ))),
+    }
+}
+
+fn parse_pcs_opening_selection(value: &str) -> Result<PcsOpeningSelection, CliError> {
+    match value {
+        "compact" => Ok(PcsOpeningSelection::Compact),
+        "full" => Ok(PcsOpeningSelection::Full),
+        "both" => Ok(PcsOpeningSelection::Both),
+        other => Err(CliError(format!(
+            "unsupported --opening '{other}', expected compact, full, or both"
         ))),
     }
 }
@@ -1200,6 +1542,50 @@ fn validate_benchmark_command(command: &BenchmarkCommand) -> Result<(), CliError
     Ok(())
 }
 
+fn validate_pcs_benchmark_command(command: &PcsBenchmarkCommand) -> Result<(), CliError> {
+    if command.sizes.is_empty() {
+        return Err(CliError(
+            "pcs-benchmark requires at least one size".to_owned(),
+        ));
+    }
+    if command.workers.is_empty() {
+        return Err(CliError(
+            "pcs-benchmark requires at least one worker count".to_owned(),
+        ));
+    }
+    for size in &command.sizes {
+        if *size == 0 || !size.is_power_of_two() {
+            return Err(CliError(format!(
+                "pcs-benchmark size {size} must be a positive power of two"
+            )));
+        }
+        for workers in &command.workers {
+            if *workers == 0 {
+                return Err(CliError("PCS worker count must be positive".to_owned()));
+            }
+            if !workers.is_power_of_two() {
+                return Err(CliError(
+                    "PCS worker count must be a positive power of two".to_owned(),
+                ));
+            }
+            if *workers > *size {
+                return Err(CliError(format!(
+                    "PCS worker count {workers} cannot exceed size {size} (worker exponent w={} exceeds n={} for this grid point; choose maximum worker exponent <= {} or increase minimum n)",
+                    nv_power(*workers),
+                    nv_power(*size),
+                    nv_power(*size),
+                )));
+            }
+        }
+    }
+    if command.pcs_queries == 0 || command.repeats == 0 {
+        return Err(CliError(
+            "pcs-benchmark --pcs-queries and --repeats must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_verify_results_command(args: &[String]) -> Result<VerifyResultsCommand, CliError> {
     let mut dir = None;
     let mut format = OutputFormat::Json;
@@ -1232,6 +1618,34 @@ fn parse_verify_results_command(args: &[String]) -> Result<VerifyResultsCommand,
         dir: dir.ok_or_else(|| CliError("verify-results requires --dir <bench-dir>".to_owned()))?,
         format,
         paper_quality,
+    })
+}
+
+fn parse_verify_pcs_results_command(args: &[String]) -> Result<VerifyResultsCommand, CliError> {
+    let mut dir = None;
+    let mut format = OutputFormat::Json;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dir" => {
+                dir = Some(PathBuf::from(next_value(args, &mut index, "--dir")?));
+            }
+            "--format" => {
+                format = parse_format(next_value(args, &mut index, "--format")?)?;
+            }
+            "--help" | "-h" => return Err(CliError(usage())),
+            other => {
+                return Err(CliError(format!(
+                    "unknown verify-pcs-results argument '{other}'"
+                )));
+            }
+        }
+        index += 1;
+    }
+    Ok(VerifyResultsCommand {
+        dir: dir.ok_or_else(|| CliError("verify-pcs-results requires --dir".to_owned()))?,
+        format,
+        paper_quality: false,
     })
 }
 
@@ -1558,6 +1972,201 @@ fn run_benchmark_command_inner(args: &[String]) -> Result<PathBuf, CliError> {
         report.files_checked, report.bytes_checked
     );
     eprintln!("[benchmark] complete");
+    Ok(run_dir)
+}
+
+fn run_pcs_benchmark_command(args: &[String]) -> Result<(), CliError> {
+    let run_dir = run_pcs_benchmark_command_inner(args)?;
+    println!("{}", run_dir.display());
+    Ok(())
+}
+
+fn run_pcs_benchmark_command_inner(args: &[String]) -> Result<PathBuf, CliError> {
+    let total_start = Instant::now();
+    let setup_start = Instant::now();
+    let mut command = parse_pcs_benchmark_command(args)?;
+    configure_pcs_benchmark_core_plan(&mut command)?;
+    configure_pcs_benchmark_rayon_pool(&command);
+    let (run_id, _run_label, run_dir) =
+        create_prefixed_result_run_dir(&command.out_dir, "pcs-bench")?;
+
+    let mut records = Vec::new();
+    let mut phase_timings = Vec::new();
+    let mut network_pools = BenchmarkNetworkPools::new();
+    push_phase_timing(
+        &mut phase_timings,
+        "setup",
+        "parse PCS benchmark arguments, derive core plan, create output directory",
+        setup_start.elapsed(),
+        0.0,
+        0.0,
+    );
+
+    let runner_variants = command.runner.variants();
+    let opening_variants = command.opening.variants();
+    let total_jobs = runner_variants.len()
+        * opening_variants.len()
+        * command.sizes.len()
+        * command.workers.len()
+        * command.repeats;
+    let mut job_index = 0_usize;
+    let first_size = command.sizes.first().copied();
+    for runner in &runner_variants {
+        for size in &command.sizes {
+            for workers in &command.workers {
+                for trial in 1..=command.repeats {
+                    let network_addrs = if *runner == BenchmarkRunner::Network {
+                        Some(network_pools.addrs_for(
+                            *workers,
+                            &command.worker_core_plan,
+                            &mut phase_timings,
+                        )?)
+                    } else {
+                        None
+                    };
+                    for opening in &opening_variants {
+                        if command.warmup_enabled && Some(*size) == first_size && trial == 1 {
+                            eprintln!(
+                                "[pcs-benchmark warmup] runner={} opening={} n={} N={} workers={} pcs_queries={}",
+                                runner.as_str(),
+                                opening.as_str(),
+                                nv_power(*size),
+                                size,
+                                workers,
+                                command.pcs_queries,
+                            );
+                            let warmup_start = Instant::now();
+                            let _ = run_single_pcs_job(
+                                &command,
+                                *runner,
+                                *opening,
+                                *size,
+                                *workers,
+                                0,
+                                network_addrs.as_deref(),
+                            )?;
+                            push_phase_timing(
+                                &mut phase_timings,
+                                "pcs_warmup",
+                                format!(
+                                    "runner={} opening={} n={} N={} workers={}",
+                                    runner.as_str(),
+                                    opening.as_str(),
+                                    nv_power(*size),
+                                    size,
+                                    workers,
+                                ),
+                                warmup_start.elapsed(),
+                                0.0,
+                                0.0,
+                            );
+                        }
+                        job_index += 1;
+                        eprintln!(
+                            "[pcs-benchmark job {job_index}/{total_jobs}] runner={} opening={} n={} N={} workers={} pcs_queries={} trial={}/{}",
+                            runner.as_str(),
+                            opening.as_str(),
+                            nv_power(*size),
+                            size,
+                            workers,
+                            command.pcs_queries,
+                            trial,
+                            command.repeats
+                        );
+                        let job_start = Instant::now();
+                        let record = run_single_pcs_job(
+                            &command,
+                            *runner,
+                            *opening,
+                            *size,
+                            *workers,
+                            trial,
+                            network_addrs.as_deref(),
+                        )?;
+                        push_phase_timing(
+                            &mut phase_timings,
+                            "pcs_job",
+                            format!(
+                                "runner={} opening={} n={} N={} workers={} trial={}",
+                                runner.as_str(),
+                                opening.as_str(),
+                                nv_power(*size),
+                                size,
+                                workers,
+                                trial
+                            ),
+                            job_start.elapsed(),
+                            record.commit_ms + record.open_ms,
+                            record.verify_ms,
+                        );
+                        records.push(record);
+                    }
+                }
+            }
+        }
+    }
+    network_pools.shutdown_all(&mut phase_timings)?;
+
+    let artifact_start = Instant::now();
+    write_text_file(&run_dir.join("source.csv"), &pcs_records_to_csv(&records))?;
+    write_text_file(&run_dir.join("source.json"), &pcs_records_to_json(&records))?;
+    write_text_file(
+        &run_dir.join("summary_stats.csv"),
+        &pcs_summary_stats_to_csv(&pcs_benchmark_stats(&records)),
+    )?;
+    write_pcs_benchmark_charts(&run_dir, &records)?;
+    push_phase_timing(
+        &mut phase_timings,
+        "source_and_chart_artifacts",
+        "write PCS source data, aggregate CSV, SVG charts, and PGFPlots/TikZ figures",
+        artifact_start.elapsed(),
+        0.0,
+        0.0,
+    );
+
+    let final_start = Instant::now();
+    write_text_file(
+        &run_dir.join("summary.txt"),
+        &pcs_benchmark_summary(&command, &records, &phase_timings),
+    )?;
+    write_text_file(
+        &run_dir.join(OVERVIEW_HTML),
+        &pcs_benchmark_overview_html(run_id, &command, &records),
+    )?;
+    push_phase_timing(
+        &mut phase_timings,
+        "final_result_artifacts",
+        "write PCS HTML summary and result manifest inputs",
+        final_start.elapsed(),
+        0.0,
+        0.0,
+    );
+    push_phase_timing(
+        &mut phase_timings,
+        "total",
+        "PCS benchmark total wall-clock time",
+        total_start.elapsed(),
+        records
+            .iter()
+            .map(|record| record.commit_ms + record.open_ms)
+            .sum(),
+        records.iter().map(|record| record.verify_ms).sum(),
+    );
+    write_text_file(
+        &run_dir.join("phase_timing.csv"),
+        &phase_timing_to_csv(&phase_timings),
+    )?;
+    write_text_file(
+        &run_dir.join("phase_timing.json"),
+        &phase_timing_to_json(&phase_timings),
+    )?;
+    write_text_file(
+        &run_dir.join("metadata.json"),
+        &pcs_benchmark_metadata_json(run_id, &command, &records),
+    )?;
+    let manifest = pcs_result_manifest_json(&run_dir, run_id)?;
+    write_text_file(&run_dir.join(RESULT_MANIFEST), &manifest)?;
+    verify_pcs_result_dir(&run_dir)?;
     Ok(run_dir)
 }
 
@@ -1982,6 +2591,39 @@ fn run_verify_results_command(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
+fn run_verify_pcs_results_command(args: &[String]) -> Result<(), CliError> {
+    let command = parse_verify_pcs_results_command(args)?;
+    let report = verify_pcs_result_dir(&command.dir)?;
+    match command.format {
+        OutputFormat::Json => println!(
+            "{{\"ok\":true,\"dir\":\"{}\",\"run_id\":{},\"files_checked\":{},\"bytes_checked\":{},\"source_rows_checked\":{},\"summary_rows_checked\":{},\"phase_rows_checked\":{}}}",
+            json_escape(&report.dir.display().to_string()),
+            report.run_id,
+            report.files_checked,
+            report.bytes_checked,
+            report.source_rows_checked,
+            report.summary_rows_checked,
+            report.phase_rows_checked
+        ),
+        OutputFormat::Csv => {
+            println!(
+                "ok,dir,run_id,files_checked,bytes_checked,source_rows_checked,summary_rows_checked,phase_rows_checked"
+            );
+            println!(
+                "true,{},{},{},{},{},{},{}",
+                csv_escape(&report.dir.display().to_string()),
+                report.run_id,
+                report.files_checked,
+                report.bytes_checked,
+                report.source_rows_checked,
+                report.summary_rows_checked,
+                report.phase_rows_checked
+            );
+        }
+    }
+    Ok(())
+}
+
 fn verify_benchmark_result_dir(dir: &Path) -> Result<ResultManifestReport, CliError> {
     let mut report = verify_benchmark_result_manifest(dir)?;
     let semantic_report = verify_benchmark_result_semantics(dir, report.run_id)?;
@@ -1989,6 +2631,254 @@ fn verify_benchmark_result_dir(dir: &Path) -> Result<ResultManifestReport, CliEr
     report.phase_rows_checked = semantic_report.phase_rows_checked;
     report.summary_rows_checked = semantic_report.summary_rows_checked;
     Ok(report)
+}
+
+fn verify_pcs_result_dir(dir: &Path) -> Result<ResultManifestReport, CliError> {
+    let mut report = verify_pcs_result_manifest(dir)?;
+    let (source_rows, summary_rows, phase_rows) = verify_pcs_result_semantics(dir)?;
+    report.source_rows_checked = source_rows;
+    report.summary_rows_checked = summary_rows;
+    report.phase_rows_checked = phase_rows;
+    Ok(report)
+}
+
+fn verify_pcs_result_manifest(dir: &Path) -> Result<ResultManifestReport, CliError> {
+    let manifest_path = dir.join(RESULT_MANIFEST);
+    let bytes = fs::read(&manifest_path)
+        .map_err(|error| CliError(format!("read {} failed: {error}", manifest_path.display())))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|error| CliError(format!("{} is not UTF-8: {error}", manifest_path.display())))?;
+    if !text.contains("\"generated_by\": \"pq-experiments pcs benchmark manifest\"") {
+        return Err(CliError(format!(
+            "{} is not a PCS benchmark manifest",
+            manifest_path.display()
+        )));
+    }
+    let run_id = manifest_run_id(&text)?;
+    let mut files_checked = 0_usize;
+    let mut bytes_checked = 0_usize;
+    for artifact in PCS_BENCHMARK_ARTIFACTS {
+        if *artifact == RESULT_MANIFEST {
+            continue;
+        }
+        let path = dir.join(artifact);
+        let bytes = fs::read(&path)
+            .map_err(|error| CliError(format!("read {} failed: {error}", path.display())))?;
+        let digest = hex_digest(sha256(&bytes));
+        let marker = format!(
+            "\"path\":\"{}\",\"bytes\":{},\"sha256\":\"{}\"",
+            artifact,
+            bytes.len(),
+            digest
+        );
+        if !text.contains(&marker) {
+            return Err(CliError(format!(
+                "PCS manifest mismatch for artifact {artifact}"
+            )));
+        }
+        files_checked += 1;
+        bytes_checked += bytes.len();
+    }
+    Ok(ResultManifestReport {
+        dir: dir.to_path_buf(),
+        run_id,
+        files_checked,
+        bytes_checked,
+        source_rows_checked: 0,
+        phase_rows_checked: 0,
+        summary_rows_checked: 0,
+    })
+}
+
+fn manifest_run_id(text: &str) -> Result<u64, CliError> {
+    let marker = "\"run_id\":";
+    let start = text
+        .find(marker)
+        .ok_or_else(|| CliError("manifest missing run_id".to_owned()))?
+        + marker.len();
+    let tail = &text[start..];
+    let digits = tail
+        .chars()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits
+        .parse::<u64>()
+        .map_err(|_| CliError("manifest run_id is invalid".to_owned()))
+}
+
+fn verify_pcs_result_semantics(dir: &Path) -> Result<(usize, usize, usize), CliError> {
+    let source = fs::read_to_string(dir.join("source.csv"))
+        .map_err(|error| CliError(format!("read PCS source.csv failed: {error}")))?;
+    let mut lines = source.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| CliError("PCS source.csv is empty".to_owned()))?;
+    if header != PCS_SOURCE_CSV_HEADER {
+        return Err(CliError("PCS source.csv has unexpected header".to_owned()));
+    }
+    let mut source_rows = 0_usize;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        source_rows += 1;
+        verify_pcs_source_row(line)?;
+    }
+    if source_rows == 0 {
+        return Err(CliError("PCS source.csv has no data rows".to_owned()));
+    }
+    let summary = fs::read_to_string(dir.join("summary_stats.csv"))
+        .map_err(|error| CliError(format!("read PCS summary_stats.csv failed: {error}")))?;
+    let mut summary_lines = summary.lines();
+    if summary_lines.next() != Some(PCS_SUMMARY_STATS_CSV_HEADER) {
+        return Err(CliError(
+            "PCS summary_stats.csv has unexpected header".to_owned(),
+        ));
+    }
+    let summary_rows = summary_lines.filter(|line| !line.trim().is_empty()).count();
+    if summary_rows == 0 {
+        return Err(CliError(
+            "PCS summary_stats.csv has no aggregate rows".to_owned(),
+        ));
+    }
+    let phase_rows = verify_phase_timing_csv_semantics(dir, source_rows)?;
+    for artifact in [
+        "overview.html",
+        "commit_time_by_size.svg",
+        "open_time_by_size.svg",
+        "verify_time_by_size.svg",
+        "opening_bytes_by_size.svg",
+        "network_bytes_by_size.svg",
+        "worker_scaling_max_size.svg",
+    ] {
+        verify_pcs_html_or_svg_artifact(dir, artifact)?;
+    }
+    for artifact in [
+        "commit_time_by_size.tex",
+        "open_time_by_size.tex",
+        "verify_time_by_size.tex",
+        "opening_bytes_by_size.tex",
+        "network_bytes_by_size.tex",
+        "worker_scaling_max_size.tex",
+    ] {
+        verify_pgfplots_artifact(dir, artifact, "PCS benchmark")?;
+    }
+    Ok((source_rows, summary_rows, phase_rows))
+}
+
+fn verify_pcs_source_row(line: &str) -> Result<(), CliError> {
+    let fields = parse_csv_line(line);
+    if fields.len() != PCS_SOURCE_CSV_HEADER.split(',').count() {
+        return Err(CliError(format!(
+            "PCS source row has {} fields, expected {}: {line}",
+            fields.len(),
+            PCS_SOURCE_CSV_HEADER.split(',').count()
+        )));
+    }
+    let runner = fields[0].as_str();
+    let opening = fields[1].as_str();
+    if !matches!(runner, "local" | "network") {
+        return Err(CliError(format!("invalid PCS runner '{runner}'")));
+    }
+    if !matches!(opening, "compact" | "full") {
+        return Err(CliError(format!("invalid PCS opening '{opening}'")));
+    }
+    let verified = fields[26].parse::<bool>().map_err(|_| {
+        CliError(format!(
+            "PCS source row has invalid verified value '{}'",
+            fields[26]
+        ))
+    })?;
+    if !verified {
+        return Err(CliError(format!(
+            "PCS benchmark row did not verify: {line}"
+        )));
+    }
+    for index in [11_usize, 12, 13, 14, 15, 16] {
+        let value = fields[index]
+            .parse::<f64>()
+            .map_err(|_| CliError(format!("PCS source row numeric field {} is invalid", index)))?;
+        if value < 0.0 || !value.is_finite() {
+            return Err(CliError(format!(
+                "PCS source row numeric field {index} is negative or non-finite"
+            )));
+        }
+    }
+    let network_bytes = fields[22]
+        .parse::<usize>()
+        .map_err(|_| CliError("PCS network_bytes field is invalid".to_owned()))?;
+    if runner == "local" && network_bytes != 0 {
+        return Err(CliError(
+            "local PCS row must have network_bytes=0".to_owned(),
+        ));
+    }
+    if runner == "network" && network_bytes == 0 {
+        return Err(CliError(
+            "network PCS row must have non-zero network_bytes".to_owned(),
+        ));
+    }
+    let opening_bytes = fields[18]
+        .parse::<usize>()
+        .map_err(|_| CliError("PCS opening_proof_bytes field is invalid".to_owned()))?;
+    let communication_bytes = fields[19]
+        .parse::<usize>()
+        .map_err(|_| CliError("PCS communication_bytes field is invalid".to_owned()))?;
+    if communication_bytes < opening_bytes {
+        return Err(CliError(
+            "PCS communication_bytes must be >= opening_proof_bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_pcs_html_or_svg_artifact(dir: &Path, artifact: &str) -> Result<(), CliError> {
+    let text = fs::read_to_string(dir.join(artifact))
+        .map_err(|error| CliError(format!("read {artifact} failed: {error}")))?;
+    let required: &[&str] = if artifact.ends_with(".html") {
+        &[
+            "<!doctype html>",
+            "Distributed Brakedown PCS Benchmark",
+            "Brief Charts",
+            "<img src=\"",
+            "source.csv",
+        ]
+    } else if artifact.contains("worker_scaling") {
+        &["<svg", "</svg>", "PCS", "Speedup", "Perfect upper bound"]
+    } else {
+        &["<svg", "</svg>", "PCS", "10^", "stroke-dasharray"]
+    };
+    for marker in required {
+        if !text.contains(marker) {
+            return Err(CliError(format!(
+                "PCS benchmark {artifact} missing required marker '{marker}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+    let mut quoted = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                current.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                fields.push(current);
+                current = String::new();
+            }
+            _ => current.push(ch),
+        }
+    }
+    fields.push(current);
+    fields
 }
 
 fn verify_benchmark_result_manifest(dir: &Path) -> Result<ResultManifestReport, CliError> {
@@ -2660,7 +3550,7 @@ fn verify_phase_timing_csv_semantics(dir: &Path, expected_jobs: usize) -> Result
             )));
         }
         match phase_name {
-            "job" => {
+            "job" | "pcs_job" => {
                 job_rows += 1;
                 if elapsed_ms <= 0.0 {
                     return Err(CliError(format!(
@@ -2673,6 +3563,14 @@ fn verify_phase_timing_csv_semantics(dir: &Path, expected_jobs: usize) -> Result
             "figure_compile" => {}
             "figure_compile_failed" => has_figure_compile_failed = true,
             "final_result_artifacts" => has_final_artifacts = true,
+            "pcs_warmup" => {
+                if elapsed_ms <= 0.0 {
+                    return Err(CliError(format!(
+                        "phase_timing.csv row {} PCS warm-up elapsed_ms must be positive",
+                        line_index + 2
+                    )));
+                }
+            }
             "total" => has_total = true,
             "total_before_error" => has_total_before_error = true,
             "network_worker_pool_start" | "network_worker_pool_shutdown" => {
@@ -3871,6 +4769,289 @@ fn run_net_demo(command: NetDemoCommand) -> Result<(), CliError> {
     Ok(())
 }
 
+struct PcsCommitBreakdown {
+    commitment: DistributedCommitment,
+    partition_ms: f64,
+    worker_commit_ms: f64,
+    master_commit_ms: f64,
+    commit_ms: f64,
+    network_commit_bytes: usize,
+}
+
+fn run_single_pcs_job(
+    command: &PcsBenchmarkCommand,
+    runner: BenchmarkRunner,
+    opening: PcsOpeningVariant,
+    size: usize,
+    workers: usize,
+    trial: usize,
+    network_addrs: Option<&[String]>,
+) -> Result<PcsMetricRecord, CliError> {
+    let evaluations = pcs_sample_evaluations(size);
+    let point = pcs_sample_point(size, trial);
+    let params = DistributedPcsParams::new(command.pcs_queries);
+    let effective_queries = params
+        .effective_query_count(size)
+        .map_err(|error| CliError(format!("PCS query count invalid: {error:?}")))?;
+
+    let mut network_client = network_addrs.map(|addrs| {
+        NetworkPcsClient::new(
+            addrs.to_vec(),
+            format!(
+                "pcs-bench-{}-n{}-w{}-trial{}",
+                opening.as_str(),
+                nv_power(size),
+                workers,
+                trial
+            ),
+        )
+    });
+    let before_commit_bytes = network_client
+        .as_ref()
+        .map(NetworkPcsClient::bytes)
+        .unwrap_or(0);
+    let commit = if let Some(client) = network_client.as_mut() {
+        let start = Instant::now();
+        let commitment = client.commit(&evaluations, workers)?;
+        let commit_ms = millis(start.elapsed());
+        PcsCommitBreakdown {
+            commitment,
+            partition_ms: 0.0,
+            worker_commit_ms: commit_ms,
+            master_commit_ms: 0.0,
+            commit_ms,
+            network_commit_bytes: client.bytes() - before_commit_bytes,
+        }
+    } else {
+        local_pcs_commit_breakdown(&evaluations, workers)?
+    };
+
+    let before_open_bytes = network_client
+        .as_ref()
+        .map(NetworkPcsClient::bytes)
+        .unwrap_or(before_commit_bytes + commit.network_commit_bytes);
+    let (open_ms, verify_ms, opening_proof_bytes, communication_bytes, verified, failure_reason) =
+        match opening {
+            PcsOpeningVariant::Compact => {
+                let open_start = Instant::now();
+                let mut open_tr = HashTranscript::new(b"pq-experiments-pcs-benchmark");
+                let opening_result = if let Some(client) = network_client.as_mut() {
+                    DistributedBrakedown::absorb_distributed_commitment(
+                        &commit.commitment,
+                        &mut open_tr,
+                    );
+                    client.open_compact(
+                        &evaluations,
+                        &commit.commitment,
+                        &point,
+                        params,
+                        &mut open_tr,
+                    )
+                } else {
+                    DistributedBrakedown::open_compact_at_with_params(
+                        &evaluations,
+                        &commit.commitment,
+                        &point,
+                        params,
+                        &mut open_tr,
+                    )
+                    .map_err(|error| CliError(format!("compact PCS open failed: {error:?}")))
+                };
+                let opening = opening_result?;
+                let open_ms = millis(open_start.elapsed());
+                let verify_start = Instant::now();
+                let mut verify_tr = HashTranscript::new(b"pq-experiments-pcs-benchmark");
+                let verification = DistributedBrakedown::verify_compact_with_params(
+                    &commit.commitment,
+                    &opening,
+                    params,
+                    &mut verify_tr,
+                );
+                let verify_ms = millis(verify_start.elapsed());
+                (
+                    open_ms,
+                    verify_ms,
+                    compact_pcs_proof_size_bytes(&opening),
+                    compact_pcs_communication_bytes(&opening),
+                    verification.is_ok(),
+                    verification.err().map(|error| format!("{error:?}")),
+                )
+            }
+            PcsOpeningVariant::Full => {
+                let open_start = Instant::now();
+                let mut open_tr = HashTranscript::new(b"pq-experiments-pcs-benchmark");
+                let opening_result: Result<DistributedOpening, CliError> =
+                    if let Some(client) = network_client.as_mut() {
+                        DistributedBrakedown::absorb_distributed_commitment(
+                            &commit.commitment,
+                            &mut open_tr,
+                        );
+                        client.open_full(
+                            &evaluations,
+                            &commit.commitment,
+                            &point,
+                            params,
+                            &mut open_tr,
+                        )
+                    } else {
+                        DistributedBrakedown::open_at_with_params(
+                            &evaluations,
+                            &commit.commitment,
+                            &point,
+                            params,
+                            &mut open_tr,
+                        )
+                        .map_err(|error| CliError(format!("full PCS open failed: {error:?}")))
+                    };
+                let opening = opening_result?;
+                let open_ms = millis(open_start.elapsed());
+                let verify_start = Instant::now();
+                let mut verify_tr = HashTranscript::new(b"pq-experiments-pcs-benchmark");
+                let verification = DistributedBrakedown::verify_opening_with_params(
+                    &commit.commitment,
+                    &opening,
+                    params,
+                    &mut verify_tr,
+                );
+                let verify_ms = millis(verify_start.elapsed());
+                (
+                    open_ms,
+                    verify_ms,
+                    pcs_proof_size_bytes(&opening),
+                    pcs_communication_bytes(&opening),
+                    verification.is_ok(),
+                    verification.err().map(|error| format!("{error:?}")),
+                )
+            }
+        };
+    let network_bytes = network_client
+        .as_ref()
+        .map(NetworkPcsClient::bytes)
+        .unwrap_or(0);
+    let network_open_bytes = network_bytes.saturating_sub(before_open_bytes);
+    let shard_len = commit
+        .commitment
+        .workers
+        .iter()
+        .map(|worker| worker.range.1.saturating_sub(worker.range.0))
+        .max()
+        .unwrap_or(0);
+    let paper_b_target = paper_b_target(size, workers);
+    Ok(PcsMetricRecord {
+        runner: runner.as_str(),
+        opening: opening.as_str(),
+        trial,
+        workers,
+        size,
+        t_rows_per_worker: size as f64 / workers as f64,
+        paper_b_target,
+        shard_len,
+        pcs_queries_requested: command.pcs_queries,
+        pcs_queries_effective: effective_queries,
+        partition_ms: commit.partition_ms,
+        worker_commit_ms: commit.worker_commit_ms,
+        master_commit_ms: commit.master_commit_ms,
+        commit_ms: commit.commit_ms,
+        open_ms,
+        verify_ms,
+        commitment_bytes: distributed_commitment_size_bytes(&commit.commitment),
+        opening_proof_bytes,
+        communication_bytes,
+        network_commit_bytes: commit.network_commit_bytes,
+        network_open_bytes,
+        network_bytes,
+        host_logical_cores: command
+            .worker_core_plan
+            .as_ref()
+            .map(|plan| plan.host_logical_cores),
+        cores_per_worker: command
+            .worker_core_plan
+            .as_ref()
+            .map(|plan| plan.cores_per_worker),
+        core_affinity: command
+            .worker_core_plan
+            .as_ref()
+            .map(|_| worker_affinity_mode()),
+        verified,
+        failure_reason,
+    })
+}
+
+fn local_pcs_commit_breakdown(
+    evaluations: &[FieldElement],
+    workers: usize,
+) -> Result<PcsCommitBreakdown, CliError> {
+    let commit_start = Instant::now();
+    let partition_start = Instant::now();
+    let plan = DistributedBrakedown::partition(evaluations, workers)
+        .map_err(|error| CliError(format!("PCS partition failed: {error:?}")))?;
+    let partition_ms = millis(partition_start.elapsed());
+    let worker_start = Instant::now();
+    let worker_commitments = thread::scope(|scope| {
+        let handles =
+            plan.partitions()
+                .iter()
+                .map(|partition| {
+                    let row = &evaluations[partition.start..partition.end];
+                    scope.spawn(move || {
+                        DistributedBrakedown::worker_commit(partition.id, partition.start, row)
+                            .map_err(|error| {
+                                CliError(format!(
+                                    "PCS worker {} commit failed: {error:?}",
+                                    partition.id
+                                ))
+                            })
+                    })
+                })
+                .collect::<Vec<_>>();
+        let mut commitments = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(result) => commitments.push(result?),
+                Err(_) => return Err(CliError("PCS worker commit thread panicked".to_owned())),
+            }
+        }
+        Ok(commitments)
+    })?;
+    let worker_commit_ms = millis(worker_start.elapsed());
+    let master_start = Instant::now();
+    let mut transcript = HashTranscript::new(b"pq-experiments-pcs-benchmark");
+    let commitment =
+        DistributedBrakedown::master_commit(worker_commitments, evaluations.len(), &mut transcript)
+            .map_err(|error| CliError(format!("PCS master commit failed: {error:?}")))?;
+    let master_commit_ms = millis(master_start.elapsed());
+    Ok(PcsCommitBreakdown {
+        commitment,
+        partition_ms,
+        worker_commit_ms,
+        master_commit_ms,
+        commit_ms: millis(commit_start.elapsed()),
+        network_commit_bytes: 0,
+    })
+}
+
+fn pcs_sample_evaluations(size: usize) -> Vec<FieldElement> {
+    (0..size)
+        .map(|index| {
+            let value = ((index as u64 + 1).wrapping_mul(0x9E37_79B1) ^ 0xA5A5_5A5A) % 1_000_003;
+            FieldElement::from(value + 1)
+        })
+        .collect()
+}
+
+fn pcs_sample_point(size: usize, trial: usize) -> Vec<FieldElement> {
+    let vars = nv_power(size);
+    (0..vars)
+        .map(|index| FieldElement::from(((trial + index + 2) as u64 * 17) + 3))
+        .collect()
+}
+
+fn paper_b_target(size: usize, workers: usize) -> usize {
+    let t = (size / workers.max(1)).max(1);
+    let log_t = nv_power(t).max(1);
+    workers.saturating_mul(log_t)
+}
+
 fn run_loopback_network_proof(config: &Config) -> Result<Vec<MetricRecord>, CliError> {
     let mut addrs = Vec::with_capacity(config.workers);
     let mut handles = Vec::with_capacity(config.workers);
@@ -4658,6 +5839,30 @@ impl NetworkPcsClient {
         .map_err(|error| CliError(format!("network compact PCS opening failed: {error:?}")))
     }
 
+    fn open_full<T: Transcript>(
+        &mut self,
+        evaluations: &[FieldElement],
+        commitment: &DistributedCommitment,
+        point: &[FieldElement],
+        params: DistributedPcsParams,
+        transcript: &mut T,
+    ) -> Result<DistributedOpening, CliError> {
+        let session = self
+            .commit_sessions
+            .get(&commitment.root)
+            .cloned()
+            .ok_or_else(|| CliError("network PCS commitment session not found".to_owned()))?;
+        DistributedBrakedown::open_at_after_commitment_with_batch_worker_provider(
+            evaluations,
+            commitment,
+            point,
+            params,
+            transcript,
+            |requests| self.open_workers(&session, requests),
+        )
+        .map_err(|error| CliError(format!("network full PCS opening failed: {error:?}")))
+    }
+
     fn open_workers(
         &mut self,
         session: &str,
@@ -5406,6 +6611,99 @@ fn records_to_json(records: &[MetricRecord]) -> String {
     out
 }
 
+fn pcs_records_to_csv(records: &[PcsMetricRecord]) -> String {
+    let mut out = format!("{PCS_SOURCE_CSV_HEADER}\n");
+    for record in records {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{:.6},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{}\n",
+            record.runner,
+            record.opening,
+            record.trial,
+            record.workers,
+            nv_power(record.size),
+            record.size,
+            record.t_rows_per_worker,
+            record.paper_b_target,
+            record.shard_len,
+            record.pcs_queries_requested,
+            record.pcs_queries_effective,
+            record.partition_ms,
+            record.worker_commit_ms,
+            record.master_commit_ms,
+            record.commit_ms,
+            record.open_ms,
+            record.verify_ms,
+            record.commitment_bytes,
+            record.opening_proof_bytes,
+            record.communication_bytes,
+            record.network_commit_bytes,
+            record.network_open_bytes,
+            record.network_bytes,
+            option_usize_csv(record.host_logical_cores),
+            option_usize_csv(record.cores_per_worker),
+            record.core_affinity.unwrap_or(""),
+            record.verified,
+            csv_escape(record.failure_reason.as_deref().unwrap_or(""))
+        ));
+    }
+    out
+}
+
+fn pcs_records_to_json(records: &[PcsMetricRecord]) -> String {
+    let mut out = String::from("[\n");
+    for (index, record) in records.iter().enumerate() {
+        if index > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&format!(
+            concat!(
+                "  {{\"runner\":\"{}\",\"opening\":\"{}\",\"trial\":{},\"workers\":{},",
+                "\"nv_power\":{},\"size\":{},\"t_rows_per_worker\":{:.6},",
+                "\"paper_b_target\":{},\"shard_len\":{},",
+                "\"pcs_queries_requested\":{},\"pcs_queries_effective\":{},",
+                "\"partition_ms\":{:.6},\"worker_commit_ms\":{:.6},",
+                "\"master_commit_ms\":{:.6},\"commit_ms\":{:.6},",
+                "\"open_ms\":{:.6},\"verify_ms\":{:.6},",
+                "\"commitment_bytes\":{},\"opening_proof_bytes\":{},",
+                "\"communication_bytes\":{},\"network_commit_bytes\":{},",
+                "\"network_open_bytes\":{},\"network_bytes\":{},",
+                "\"host_logical_cores\":{},\"cores_per_worker\":{},",
+                "\"core_affinity\":{},\"verified\":{},\"failure_reason\":{}}}"
+            ),
+            json_escape(record.runner),
+            json_escape(record.opening),
+            record.trial,
+            record.workers,
+            nv_power(record.size),
+            record.size,
+            record.t_rows_per_worker,
+            record.paper_b_target,
+            record.shard_len,
+            record.pcs_queries_requested,
+            record.pcs_queries_effective,
+            record.partition_ms,
+            record.worker_commit_ms,
+            record.master_commit_ms,
+            record.commit_ms,
+            record.open_ms,
+            record.verify_ms,
+            record.commitment_bytes,
+            record.opening_proof_bytes,
+            record.communication_bytes,
+            record.network_commit_bytes,
+            record.network_open_bytes,
+            record.network_bytes,
+            option_usize_json(record.host_logical_cores),
+            option_usize_json(record.cores_per_worker),
+            option_str_json(record.core_affinity),
+            record.verified,
+            option_string_json(record.failure_reason.as_deref())
+        ));
+    }
+    out.push_str("\n]\n");
+    out
+}
+
 fn records_to_csv(records: &[MetricRecord]) -> String {
     let mut out = format!("{SOURCE_CSV_HEADER}\n");
     for record in records {
@@ -5681,6 +6979,82 @@ fn benchmark_stats(records: &[MetricRecord]) -> Vec<BenchmarkStatsRecord> {
             .then(left.workers.cmp(&right.workers))
     });
     stats
+}
+
+fn pcs_benchmark_stats(records: &[PcsMetricRecord]) -> Vec<PcsStatsRecord> {
+    let mut groups: Vec<Vec<&PcsMetricRecord>> = Vec::new();
+    for record in records {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            let first = group[0];
+            first.runner == record.runner
+                && first.opening == record.opening
+                && first.workers == record.workers
+                && first.size == record.size
+        }) {
+            group.push(record);
+        } else {
+            groups.push(vec![record]);
+        }
+    }
+    let mut stats = groups
+        .into_iter()
+        .map(|group| {
+            let first = group[0];
+            let failure_reasons = group
+                .iter()
+                .filter_map(|record| record.failure_reason.as_ref())
+                .cloned()
+                .collect::<Vec<_>>();
+            PcsStatsRecord {
+                runner: first.runner,
+                opening: first.opening,
+                workers: first.workers,
+                size: first.size,
+                samples: group.len(),
+                verified_count: group.iter().filter(|record| record.verified).count(),
+                commit_ms: mean_stddev(group.iter().map(|record| record.commit_ms)),
+                open_ms: mean_stddev(group.iter().map(|record| record.open_ms)),
+                verify_ms: mean_stddev(group.iter().map(|record| record.verify_ms)),
+                opening_proof_bytes: mean_stddev(
+                    group.iter().map(|record| record.opening_proof_bytes as f64),
+                ),
+                communication_bytes: mean_stddev(
+                    group.iter().map(|record| record.communication_bytes as f64),
+                ),
+                network_bytes: mean_stddev(group.iter().map(|record| record.network_bytes as f64)),
+                failure_reasons,
+            }
+        })
+        .collect::<Vec<_>>();
+    stats.sort_by_key(|record| (record.runner, record.opening, record.workers, record.size));
+    stats
+}
+
+fn pcs_summary_stats_to_csv(stats: &[PcsStatsRecord]) -> String {
+    let mut out = format!("{PCS_SUMMARY_STATS_CSV_HEADER}\n");
+    for record in stats {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{}\n",
+            record.runner,
+            record.opening,
+            record.workers,
+            nv_power(record.size),
+            record.size,
+            record.samples,
+            record.verified_count,
+            record.commit_ms.mean,
+            record.commit_ms.stddev,
+            record.open_ms.mean,
+            record.open_ms.stddev,
+            record.verify_ms.mean,
+            record.verify_ms.stddev,
+            record.opening_proof_bytes.mean,
+            record.communication_bytes.mean,
+            record.network_bytes.mean,
+            csv_escape(&record.failure_reasons.join(";"))
+        ));
+    }
+    out
 }
 
 fn mean_stddev(values: impl Iterator<Item = f64>) -> MeanStddev {
@@ -5994,6 +7368,26 @@ fn csv_escape(input: &str) -> String {
     }
 }
 
+fn option_usize_csv(value: Option<usize>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn option_usize_json(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn option_str_json(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn option_string_json(value: Option<&str>) -> String {
+    option_str_json(value)
+}
+
 fn create_result_run_dir(out_dir: &Path, suffix: &str) -> Result<(u64, String, PathBuf), CliError> {
     fs::create_dir_all(out_dir)
         .map_err(|error| CliError(format!("create benchmark root failed: {error}")))?;
@@ -6004,6 +7398,38 @@ fn create_result_run_dir(out_dir: &Path, suffix: &str) -> Result<(u64, String, P
             format!("bench-{timestamp}-{suffix}")
         } else {
             format!("bench-{timestamp}-{suffix}-{attempt:02}")
+        };
+        let run_dir = out_dir.join(&run_label);
+        match fs::create_dir(&run_dir) {
+            Ok(()) => return Ok((run_id, run_label, run_dir)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(CliError(format!(
+                    "create benchmark dir {} failed: {error}",
+                    run_dir.display()
+                )));
+            }
+        }
+    }
+    Err(CliError(format!(
+        "could not create a fresh benchmark directory under {} after repeated run-id collisions",
+        out_dir.display()
+    )))
+}
+
+fn create_prefixed_result_run_dir(
+    out_dir: &Path,
+    prefix: &str,
+) -> Result<(u64, String, PathBuf), CliError> {
+    fs::create_dir_all(out_dir)
+        .map_err(|error| CliError(format!("create benchmark root failed: {error}")))?;
+    let run_id = unix_timestamp_seconds()?;
+    let timestamp = unix_timestamp_label(run_id)?;
+    for attempt in 0..128_u64 {
+        let run_label = if attempt == 0 {
+            format!("{prefix}-{timestamp}")
+        } else {
+            format!("{prefix}-{timestamp}-{attempt:02}")
         };
         let run_dir = out_dir.join(&run_label);
         match fs::create_dir(&run_dir) {
@@ -6099,6 +7525,46 @@ fn benchmark_result_manifest_json(
     let mut out = String::from("{\n");
     out.push_str("  \"schema_version\": 1,\n");
     out.push_str("  \"generated_by\": \"pq-experiments benchmark manifest\",\n");
+    out.push_str(&format!("  \"run_id\": {run_id},\n"));
+    out.push_str(&format!("  \"artifact_count\": {},\n", entries.len()));
+    out.push_str(&format!(
+        "  \"self_artifact\": \"{}\",\n",
+        json_escape(RESULT_MANIFEST)
+    ));
+    out.push_str("  \"files\": [\n");
+    for (index, (path, bytes, digest)) in entries.iter().enumerate() {
+        let comma = if index + 1 == entries.len() { "" } else { "," };
+        out.push_str(&format!(
+            "    {{\"path\":\"{}\",\"bytes\":{},\"sha256\":\"{}\"}}{}\n",
+            json_escape(path),
+            bytes,
+            digest,
+            comma
+        ));
+    }
+    out.push_str("  ]\n");
+    out.push_str("}\n");
+    Ok(out)
+}
+
+fn pcs_result_manifest_json(run_dir: &Path, run_id: u64) -> Result<String, CliError> {
+    let mut entries = Vec::new();
+    for artifact in PCS_BENCHMARK_ARTIFACTS {
+        if *artifact == RESULT_MANIFEST {
+            continue;
+        }
+        let path = run_dir.join(artifact);
+        let bytes = fs::read(&path)
+            .map_err(|error| CliError(format!("read {} failed: {error}", path.display())))?;
+        entries.push((
+            artifact.to_string(),
+            bytes.len(),
+            hex_digest(sha256(&bytes)),
+        ));
+    }
+    let mut out = String::from("{\n");
+    out.push_str("  \"schema_version\": 1,\n");
+    out.push_str("  \"generated_by\": \"pq-experiments pcs benchmark manifest\",\n");
     out.push_str(&format!("  \"run_id\": {run_id},\n"));
     out.push_str(&format!("  \"artifact_count\": {},\n", entries.len()));
     out.push_str(&format!(
@@ -7817,6 +9283,220 @@ fn benchmark_summary(
     out
 }
 
+fn pcs_benchmark_summary(
+    command: &PcsBenchmarkCommand,
+    records: &[PcsMetricRecord],
+    phase_timings: &[PhaseTimingRecord],
+) -> String {
+    let mut out = String::new();
+    out.push_str("# PCS Benchmark Summary\n\n");
+    out.push_str("This report measures the distributed Brakedown PCS layer only. It does not include the R1CS or Plonkish PIOP proof paths.\n\n");
+    out.push_str("## Configuration\n\n");
+    out.push_str(&format!("- runner: {}\n", command.runner.as_str()));
+    out.push_str(&format!("- opening: {}\n", command.opening.as_str()));
+    out.push_str(&format!("- sizes: {:?}\n", command.sizes));
+    out.push_str(&format!("- workers: {:?}\n", command.workers));
+    out.push_str(&format!("- pcs_queries: {}\n", command.pcs_queries));
+    out.push_str(&format!("- repeats: {}\n", command.repeats));
+    if let Some(plan) = &command.worker_core_plan {
+        out.push_str(&format!(
+            "- network core plan: host_logical_cores={}, max_workers={}, cores_per_worker={}, mode={}\n",
+            plan.host_logical_cores,
+            plan.max_workers,
+            plan.cores_per_worker,
+            worker_affinity_mode()
+        ));
+    }
+    out.push_str("\n## Theory Baseline\n\n");
+    out.push_str("The paper sets T=N/M and chooses B=M log(N/M). Under the stated BaseFold-like underlying PCS costs, Protocol 11 targets O(N/M) work per prover and O(M log^2(N/M)) verifier/proof size. This benchmark records N, M, measured T, and the B target for each row so measured data can be compared against that model.\n\n");
+    out.push_str("## Aggregate Rows\n\n");
+    out.push_str("| runner | opening | n | N | workers | samples | commit ms | open ms | verify ms | opening bytes | network bytes | verified |\n");
+    out.push_str(
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
+    for stat in pcs_benchmark_stats(records) {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {:.3} | {:.3} | {:.3} | {:.0} | {:.0} | {} |\n",
+            stat.runner,
+            stat.opening,
+            nv_power(stat.size),
+            stat.size,
+            stat.workers,
+            stat.samples,
+            stat.commit_ms.mean,
+            stat.open_ms.mean,
+            stat.verify_ms.mean,
+            stat.opening_proof_bytes.mean,
+            stat.network_bytes.mean,
+            stat.verified_count
+        ));
+    }
+    out.push_str("\n## Phase Timing\n\n");
+    for timing in phase_timings {
+        out.push_str(&format!(
+            "- {} / {}: elapsed_ms={:.3}, recorded_prove_ms={:.3}, recorded_verify_ms={:.3}, inferred_overhead_ms={:.3}\n",
+            timing.phase,
+            timing.detail,
+            timing.elapsed_ms,
+            timing.recorded_prove_ms,
+            timing.recorded_verify_ms,
+            timing.inferred_overhead_ms
+        ));
+    }
+    out
+}
+
+fn pcs_benchmark_overview_html(
+    run_id: u64,
+    command: &PcsBenchmarkCommand,
+    records: &[PcsMetricRecord],
+) -> String {
+    let stats = pcs_benchmark_stats(records);
+    let mut html = String::new();
+    html.push_str(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>PCS Benchmark</title><style>",
+    );
+    html.push_str("body{font-family:Arial,sans-serif;margin:24px;color:#1f2937}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #d1d5db;padding:6px;text-align:right}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}h1,h2{color:#111827}code{background:#f3f4f6;padding:2px 4px}a{color:#075985}.chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:18px;margin:12px 0 24px}.chart-grid figure{margin:0}.chart-grid img{width:100%;height:auto;border:1px solid #d1d5db}.chart-grid figcaption{font-size:12px;color:#4b5563;margin-top:4px}");
+    html.push_str("</style></head><body>");
+    html.push_str(&format!("<h1>Distributed Brakedown PCS Benchmark</h1><p>run_id={run_id}. This is a PCS-only Commit/Open report.</p>"));
+    html.push_str("<h2>Configuration</h2><ul>");
+    html.push_str(&format!(
+        "<li>runner=<code>{}</code>, opening=<code>{}</code>, pcs_queries=<code>{}</code>, repeats=<code>{}</code></li>",
+        html_escape(command.runner.as_str()),
+        html_escape(command.opening.as_str()),
+        command.pcs_queries,
+        command.repeats
+    ));
+    html.push_str(&format!(
+        "<li>sizes=<code>{:?}</code>, workers=<code>{:?}</code></li>",
+        command.sizes, command.workers
+    ));
+    html.push_str("</ul>");
+    html.push_str("<h2>Brief Charts</h2>");
+    for runner in ["local", "network"] {
+        if !records.iter().any(|record| record.runner == runner) {
+            continue;
+        }
+        html.push_str(&format!(
+            "<h3>{} runner</h3><section class=\"chart-grid\">",
+            html_escape(runner)
+        ));
+        let mut charts = vec![
+            (
+                format!("{runner}_commit_time_by_size.svg"),
+                format!("{runner} commit time by PCS size"),
+            ),
+            (
+                format!("{runner}_open_time_by_size.svg"),
+                format!("{runner} open time by PCS size"),
+            ),
+            (
+                format!("{runner}_verify_time_by_size.svg"),
+                format!("{runner} verify time by PCS size"),
+            ),
+            (
+                format!("{runner}_opening_bytes_by_size.svg"),
+                format!("{runner} opening proof bytes by PCS size"),
+            ),
+        ];
+        if runner == "network" {
+            charts.push((
+                "network_network_bytes_by_size.svg".to_owned(),
+                "network bytes by PCS size".to_owned(),
+            ));
+        }
+        charts.push((
+            format!("{runner}_worker_scaling_max_size.svg"),
+            format!("{runner} worker scaling at max PCS size"),
+        ));
+        for (artifact, caption) in charts {
+            html.push_str(&format!(
+                "<figure><a href=\"{artifact}\"><img src=\"{artifact}\" alt=\"{}\"></a><figcaption>{}</figcaption></figure>",
+                html_escape(&caption),
+                html_escape(&caption)
+            ));
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("<h2>Artifacts</h2><p><a href=\"source.csv\">source.csv</a> | <a href=\"summary_stats.csv\">summary_stats.csv</a> | <a href=\"summary.txt\">summary.txt</a> | <a href=\"commit_time_by_size.svg\">combined commit chart</a> | <a href=\"open_time_by_size.svg\">combined open chart</a> | <a href=\"verify_time_by_size.svg\">combined verify chart</a> | <a href=\"opening_bytes_by_size.svg\">combined opening bytes chart</a> | <a href=\"network_bytes_by_size.svg\">combined network bytes chart</a> | <a href=\"worker_scaling_max_size.svg\">combined scaling chart</a></p>");
+    html.push_str("<h2>Aggregate Metrics</h2><table><thead><tr><th>runner</th><th>opening</th><th>n</th><th>N</th><th>workers</th><th>samples</th><th>verified</th><th>commit ms</th><th>open ms</th><th>verify ms</th><th>opening bytes</th><th>network bytes</th></tr></thead><tbody>");
+    for stat in stats {
+        html.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.0}</td><td>{:.0}</td></tr>",
+            html_escape(stat.runner),
+            html_escape(stat.opening),
+            nv_power(stat.size),
+            stat.size,
+            stat.workers,
+            stat.samples,
+            stat.verified_count,
+            stat.commit_ms.mean,
+            stat.open_ms.mean,
+            stat.verify_ms.mean,
+            stat.opening_proof_bytes.mean,
+            stat.network_bytes.mean
+        ));
+    }
+    html.push_str("</tbody></table>");
+    html.push_str("<h2>Theory Note</h2><p>The paper's PCS target is per-prover <code>O(N/M)</code> work with proof and verifier around <code>O(M log^2(N/M))</code> after choosing <code>B=M log(N/M)</code>. See <code>Doc/pcs_theory_audit.md</code> for implementation alignment details.</p>");
+    html.push_str("</body></html>\n");
+    html
+}
+
+fn pcs_benchmark_metadata_json(
+    run_id: u64,
+    command: &PcsBenchmarkCommand,
+    records: &[PcsMetricRecord],
+) -> String {
+    let verified = records.iter().filter(|record| record.verified).count();
+    let mut out = String::from("{\n");
+    out.push_str("  \"schema_version\": 1,\n");
+    out.push_str("  \"run_kind\": \"pcs-benchmark\",\n");
+    out.push_str("  \"generated_by\": \"pq-experiments pcs-benchmark\",\n");
+    out.push_str(&format!("  \"run_id\": {run_id},\n"));
+    out.push_str(&format!(
+        "  \"sizes\": {},\n",
+        serde_json::to_string(&command.sizes).unwrap_or_else(|_| "[]".to_owned())
+    ));
+    out.push_str(&format!(
+        "  \"workers\": {},\n",
+        serde_json::to_string(&command.workers).unwrap_or_else(|_| "[]".to_owned())
+    ));
+    out.push_str(&format!("  \"pcs_queries\": {},\n", command.pcs_queries));
+    out.push_str(&format!("  \"repeats\": {},\n", command.repeats));
+    out.push_str(&format!(
+        "  \"warmup_enabled\": {},\n",
+        command.warmup_enabled
+    ));
+    out.push_str(&format!(
+        "  \"runner\": \"{}\",\n",
+        json_escape(command.runner.as_str())
+    ));
+    out.push_str(&format!(
+        "  \"opening\": \"{}\",\n",
+        json_escape(command.opening.as_str())
+    ));
+    out.push_str("  \"theory_scope\": \"Doc/pq_dSNARK.pdf pages 22-31, Protocol 8-11\",\n");
+    out.push_str(&format!("  \"record_count\": {},\n", records.len()));
+    out.push_str(&format!("  \"verified_count\": {},\n", verified));
+    out.push_str(&format!(
+        "  \"rejected_count\": {},\n",
+        records.len().saturating_sub(verified)
+    ));
+    match &command.worker_core_plan {
+        Some(plan) => out.push_str(&format!(
+            "  \"core_allocation\": {{\"host_logical_cores\":{},\"max_workers\":{},\"cores_per_worker\":{},\"mode\":\"{}\"}}\n",
+            plan.host_logical_cores,
+            plan.max_workers,
+            plan.cores_per_worker,
+            worker_affinity_mode()
+        )),
+        None => out.push_str("  \"core_allocation\": null\n"),
+    }
+    out.push_str("}\n");
+    out
+}
+
 fn build_profile() -> &'static str {
     if cfg!(debug_assertions) {
         "debug"
@@ -8186,6 +9866,193 @@ fn compile_paper_figures(run_dir: &Path, compiler: FigureCompiler) -> Result<(),
     Ok(())
 }
 
+fn write_pcs_benchmark_charts(run_dir: &Path, records: &[PcsMetricRecord]) -> Result<(), CliError> {
+    write_pcs_runner_split_charts(run_dir, records)?;
+    write_text_file(
+        &run_dir.join("commit_time_by_size.svg"),
+        &pcs_line_chart_svg(
+            records,
+            "PCS commit time by size",
+            "Commit time (ms)",
+            |r| r.commit_ms,
+        ),
+    )?;
+    write_text_file(
+        &run_dir.join("commit_time_by_size.tex"),
+        &pcs_line_chart_pgfplots(
+            records,
+            "PCS commit time by size",
+            "Commit time (ms)",
+            |r| r.commit_ms,
+        ),
+    )?;
+    write_text_file(
+        &run_dir.join("open_time_by_size.svg"),
+        &pcs_line_chart_svg(records, "PCS open time by size", "Open time (ms)", |r| {
+            r.open_ms
+        }),
+    )?;
+    write_text_file(
+        &run_dir.join("open_time_by_size.tex"),
+        &pcs_line_chart_pgfplots(records, "PCS open time by size", "Open time (ms)", |r| {
+            r.open_ms
+        }),
+    )?;
+    write_text_file(
+        &run_dir.join("verify_time_by_size.svg"),
+        &pcs_line_chart_svg(
+            records,
+            "PCS verify time by size",
+            "Verify time (ms)",
+            |r| r.verify_ms,
+        ),
+    )?;
+    write_text_file(
+        &run_dir.join("verify_time_by_size.tex"),
+        &pcs_line_chart_pgfplots(
+            records,
+            "PCS verify time by size",
+            "Verify time (ms)",
+            |r| r.verify_ms,
+        ),
+    )?;
+    write_text_file(
+        &run_dir.join("opening_bytes_by_size.svg"),
+        &pcs_line_chart_svg(
+            records,
+            "PCS opening bytes by size",
+            "Opening bytes (KiB)",
+            |r| r.opening_proof_bytes as f64 / 1024.0,
+        ),
+    )?;
+    write_text_file(
+        &run_dir.join("opening_bytes_by_size.tex"),
+        &pcs_line_chart_pgfplots(
+            records,
+            "PCS opening bytes by size",
+            "Opening bytes (KiB)",
+            |r| r.opening_proof_bytes as f64 / 1024.0,
+        ),
+    )?;
+    write_text_file(
+        &run_dir.join("network_bytes_by_size.svg"),
+        &pcs_line_chart_svg(
+            records,
+            "PCS network bytes by size",
+            "Network bytes (KiB)",
+            |r| r.network_bytes as f64 / 1024.0,
+        ),
+    )?;
+    write_text_file(
+        &run_dir.join("network_bytes_by_size.tex"),
+        &pcs_line_chart_pgfplots(
+            records,
+            "PCS network bytes by size",
+            "Network bytes (KiB)",
+            |r| r.network_bytes as f64 / 1024.0,
+        ),
+    )?;
+    write_text_file(
+        &run_dir.join("worker_scaling_max_size.svg"),
+        &pcs_worker_scaling_svg(records),
+    )?;
+    write_text_file(
+        &run_dir.join("worker_scaling_max_size.tex"),
+        &pcs_worker_scaling_pgfplots(records),
+    )?;
+    Ok(())
+}
+
+fn write_pcs_runner_split_charts(
+    run_dir: &Path,
+    records: &[PcsMetricRecord],
+) -> Result<(), CliError> {
+    for runner in ["local", "network"] {
+        let runner_records = records
+            .iter()
+            .filter(|record| record.runner == runner)
+            .cloned()
+            .collect::<Vec<_>>();
+        write_pcs_metric_chart_pair(
+            run_dir,
+            &runner_records,
+            &format!("{runner}_commit_time_by_size"),
+            &format!("PCS {runner} commit time by size"),
+            "Commit time (ms)",
+            |record| record.commit_ms,
+        )?;
+        write_pcs_metric_chart_pair(
+            run_dir,
+            &runner_records,
+            &format!("{runner}_open_time_by_size"),
+            &format!("PCS {runner} open time by size"),
+            "Open time (ms)",
+            |record| record.open_ms,
+        )?;
+        write_pcs_metric_chart_pair(
+            run_dir,
+            &runner_records,
+            &format!("{runner}_verify_time_by_size"),
+            &format!("PCS {runner} verify time by size"),
+            "Verify time (ms)",
+            |record| record.verify_ms,
+        )?;
+        write_pcs_metric_chart_pair(
+            run_dir,
+            &runner_records,
+            &format!("{runner}_opening_bytes_by_size"),
+            &format!("PCS {runner} opening bytes by size"),
+            "Opening bytes (KiB)",
+            |record| record.opening_proof_bytes as f64 / 1024.0,
+        )?;
+        write_pcs_metric_chart_pair(
+            run_dir,
+            &runner_records,
+            &format!("{runner}_network_bytes_by_size"),
+            &format!("PCS {runner} network bytes by size"),
+            "Network bytes (KiB)",
+            |record| record.network_bytes as f64 / 1024.0,
+        )?;
+        write_text_file(
+            &run_dir.join(format!("{runner}_worker_scaling_max_size.svg")),
+            &pcs_worker_scaling_svg_with_title(
+                &runner_records,
+                &format!("PCS {runner} worker scaling at max size"),
+            ),
+        )?;
+        write_text_file(
+            &run_dir.join(format!("{runner}_worker_scaling_max_size.tex")),
+            &pcs_worker_scaling_pgfplots_with_title(
+                &runner_records,
+                &format!("PCS {runner} worker scaling at max size"),
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn write_pcs_metric_chart_pair<F>(
+    run_dir: &Path,
+    records: &[PcsMetricRecord],
+    stem: &str,
+    title: &str,
+    y_label: &str,
+    value: F,
+) -> Result<(), CliError>
+where
+    F: Fn(&PcsMetricRecord) -> f64 + Copy,
+{
+    write_text_file(
+        &run_dir.join(format!("{stem}.svg")),
+        &pcs_line_chart_svg(records, title, y_label, value),
+    )?;
+    write_text_file(
+        &run_dir.join(format!("{stem}.tex")),
+        &pcs_line_chart_pgfplots(records, title, y_label, value),
+    )?;
+    Ok(())
+}
+
 fn select_figure_compiler(compiler: FigureCompiler) -> Result<&'static str, CliError> {
     match compiler {
         FigureCompiler::Auto => {
@@ -8318,6 +10185,537 @@ where
     svg
 }
 
+fn pcs_line_chart_svg<F>(
+    records: &[PcsMetricRecord],
+    title: &str,
+    y_label: &str,
+    value: F,
+) -> String
+where
+    F: Fn(&PcsMetricRecord) -> f64,
+{
+    let stats = pcs_chart_points(records, value);
+    simple_svg_chart(title, y_label, &stats)
+}
+
+fn simple_svg_chart(title: &str, y_label: &str, points: &[PcsChartPoint]) -> String {
+    simple_svg_chart_with_x(
+        title,
+        "PCS polynomial exponent n in N=2^n",
+        "n=",
+        y_label,
+        points,
+    )
+}
+
+fn simple_svg_chart_with_x(
+    title: &str,
+    x_label: &str,
+    x_tick_prefix: &str,
+    y_label: &str,
+    points: &[PcsChartPoint],
+) -> String {
+    let width = 980.0;
+    let left = 86.0;
+    let right = 940.0;
+    let top = 70.0;
+    let bottom = 350.0;
+    let plot_width = right - left;
+    let plot_height = bottom - top;
+    let legend_columns = 4_usize;
+    let mut series = points
+        .iter()
+        .filter(|point| point.value > 0.0 && point.value.is_finite())
+        .map(|point| (point.runner, point.opening, point.series_workers))
+        .collect::<Vec<_>>();
+    series.sort_unstable();
+    series.dedup();
+    let legend_rows = series.len().div_ceil(legend_columns).max(1);
+    let legend_top = 430.0;
+    let height = legend_top + (legend_rows as f64) * 24.0 + 24.0;
+    let mut powers = points
+        .iter()
+        .map(|point| point.nv_power)
+        .collect::<Vec<_>>();
+    powers.sort_unstable();
+    powers.dedup();
+    let positive_values = points
+        .iter()
+        .map(|point| point.value)
+        .filter(|value| *value > 0.0 && value.is_finite())
+        .collect::<Vec<_>>();
+    let min_y = positive_values
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let max_y = positive_values.iter().copied().fold(0.0_f64, f64::max);
+    let (log_min, log_max) = if positive_values.is_empty() {
+        (0_i32, 1_i32)
+    } else {
+        let min_exp = min_y.log10().floor() as i32;
+        let mut max_exp = max_y.log10().ceil() as i32;
+        if max_exp <= min_exp {
+            max_exp = min_exp + 1;
+        }
+        (min_exp, max_exp)
+    };
+    let x_pos = |power: usize| -> f64 {
+        if powers.len() <= 1 {
+            left + plot_width / 2.0
+        } else {
+            let idx = powers
+                .iter()
+                .position(|candidate| *candidate == power)
+                .unwrap_or(0);
+            left + (idx as f64) * plot_width / ((powers.len() - 1) as f64)
+        }
+    };
+    let y_pos = |value: f64| {
+        let ratio = (value.log10() - f64::from(log_min)) / f64::from(log_max - log_min);
+        bottom - ratio.clamp(0.0, 1.0) * plot_height
+    };
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">\n<title>{}</title>\n<!-- PCS chart uses stroke-dasharray for series distinction. -->\n<rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>\n<text x=\"490\" y=\"32\" text-anchor=\"middle\" font-family=\"Arial\" font-size=\"20\">{}</text>\n<text x=\"18\" y=\"210\" transform=\"rotate(-90 18 210)\" text-anchor=\"middle\" font-family=\"Arial\" font-size=\"13\">{}</text>\n<text x=\"520\" y=\"402\" text-anchor=\"middle\" font-family=\"Arial\" font-size=\"13\">{}</text>\n<line x1=\"{left}\" y1=\"{bottom}\" x2=\"{right}\" y2=\"{bottom}\" stroke=\"#444\"/>\n<line x1=\"{left}\" y1=\"{top}\" x2=\"{left}\" y2=\"{bottom}\" stroke=\"#444\"/>\n",
+        svg_escape(title),
+        svg_escape(title),
+        svg_escape(y_label),
+        svg_escape(x_label)
+    );
+    for exponent in log_min..=log_max {
+        let tick_value = 10_f64.powi(exponent);
+        let y = y_pos(tick_value);
+        svg.push_str(&format!(
+            "<line x1=\"{left}\" y1=\"{y:.1}\" x2=\"{right}\" y2=\"{y:.1}\" stroke=\"#e5e7eb\"/>\n<text x=\"76\" y=\"{:.1}\" text-anchor=\"end\" dominant-baseline=\"middle\" font-family=\"Arial\" font-size=\"12\">10^{}</text>\n",
+            y + 1.0,
+            exponent
+        ));
+    }
+    for power in &powers {
+        let x = x_pos(*power);
+        svg.push_str(&format!(
+            "<text x=\"{x:.1}\" y=\"374\" text-anchor=\"middle\" font-family=\"Arial\" font-size=\"12\">{}{power}</text>\n",
+            svg_escape(x_tick_prefix)
+        ));
+    }
+    for (series_index, (runner, opening, series_workers)) in series.iter().enumerate() {
+        let color = svg_color(series_index);
+        let dash = svg_dash(*series_workers, opening);
+        let mut coords = points
+            .iter()
+            .filter(|point| {
+                point.runner == *runner
+                    && point.opening == *opening
+                    && point.series_workers == *series_workers
+                    && point.value > 0.0
+                    && point.value.is_finite()
+            })
+            .collect::<Vec<_>>();
+        coords.sort_by_key(|point| point.nv_power);
+        if coords.len() >= 2 {
+            let polyline = coords
+                .iter()
+                .map(|point| format!("{:.1},{:.1}", x_pos(point.nv_power), y_pos(point.value)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            svg.push_str(&format!(
+                "<polyline fill=\"none\" stroke=\"{color}\" stroke-width=\"2\" stroke-dasharray=\"{dash}\" points=\"{polyline}\"/>\n"
+            ));
+        }
+        for point in coords {
+            let worker_label = point
+                .series_workers
+                .map(|workers| format!(" w{workers}"))
+                .unwrap_or_default();
+            svg.push_str(&format!(
+                "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"4\" fill=\"{color}\"><title>{} {}{} {}{}: {:.3}</title></circle>\n",
+                x_pos(point.nv_power),
+                y_pos(point.value),
+                svg_escape(point.runner),
+                svg_escape(point.opening),
+                worker_label,
+                svg_escape(x_tick_prefix),
+                point.nv_power,
+                point.value
+            ));
+        }
+        let legend_x = 90.0 + ((series_index % legend_columns) as f64) * 220.0;
+        let legend_y = legend_top + ((series_index / legend_columns) as f64) * 24.0;
+        let legend_worker_label = series_workers
+            .map(|workers| format!(" w{workers}"))
+            .unwrap_or_default();
+        svg.push_str(&format!(
+            "<line x1=\"{legend_x:.1}\" y1=\"{legend_y:.1}\" x2=\"{:.1}\" y2=\"{legend_y:.1}\" stroke=\"{color}\" stroke-width=\"2\" stroke-dasharray=\"{dash}\"/>\n<circle cx=\"{:.1}\" cy=\"{legend_y:.1}\" r=\"3\" fill=\"{color}\"/>\n<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"Arial\" font-size=\"12\" dominant-baseline=\"middle\" fill=\"#111827\">{} {}{}</text>\n",
+            legend_x + 28.0,
+            legend_x + 14.0,
+            legend_x + 36.0,
+            legend_y,
+            svg_escape(runner),
+            svg_escape(opening),
+            legend_worker_label
+        ));
+    }
+    if series.is_empty() {
+        svg.push_str(
+            "<text x=\"490\" y=\"215\" text-anchor=\"middle\" font-family=\"Arial\" font-size=\"14\" fill=\"#6b7280\">No positive rows for this runner/metric.</text>\n",
+        );
+    }
+    if points
+        .iter()
+        .any(|point| point.value <= 0.0 || !point.value.is_finite())
+    {
+        svg.push_str(&format!(
+            "<text x=\"90\" y=\"{:.1}\" font-family=\"Arial\" font-size=\"11\" fill=\"#6b7280\">Non-positive values are omitted from the log-scale plot.</text>\n",
+            height - 8.0
+        ));
+    }
+    svg.push_str("</svg>\n");
+    svg
+}
+
+fn svg_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn svg_color(index: usize) -> &'static str {
+    const COLORS: &[&str] = &[
+        "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#6B7280",
+    ];
+    COLORS[index % COLORS.len()]
+}
+
+fn svg_dash(workers: Option<usize>, opening: &str) -> &'static str {
+    match (workers.unwrap_or(1), opening) {
+        (1, "compact") => "none",
+        (1, _) => "10 4",
+        (2, "compact") => "6 4",
+        (2, _) => "6 4 2 4",
+        (4, "compact") => "2 4",
+        (4, _) => "2 4 8 4",
+        (8, "compact") => "12 4",
+        (8, _) => "12 4 2 4",
+        (_, "compact") => "4 3",
+        _ => "8 3 2 3",
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PcsChartPoint {
+    runner: &'static str,
+    opening: &'static str,
+    series_workers: Option<usize>,
+    nv_power: usize,
+    value: f64,
+}
+
+fn pcs_chart_points<F>(records: &[PcsMetricRecord], value: F) -> Vec<PcsChartPoint>
+where
+    F: Fn(&PcsMetricRecord) -> f64,
+{
+    let mut points = Vec::new();
+    for stats in pcs_benchmark_stats(records) {
+        let matching = records
+            .iter()
+            .filter(|record| {
+                record.runner == stats.runner
+                    && record.opening == stats.opening
+                    && record.workers == stats.workers
+                    && record.size == stats.size
+            })
+            .collect::<Vec<_>>();
+        let mean = mean_stddev(matching.into_iter().map(&value)).mean;
+        points.push(PcsChartPoint {
+            runner: stats.runner,
+            opening: stats.opening,
+            series_workers: Some(stats.workers),
+            nv_power: nv_power(stats.size),
+            value: mean,
+        });
+    }
+    points
+}
+
+fn pcs_line_chart_pgfplots<F>(
+    records: &[PcsMetricRecord],
+    title: &str,
+    y_label: &str,
+    value: F,
+) -> String
+where
+    F: Fn(&PcsMetricRecord) -> f64,
+{
+    let points = pcs_chart_points(records, value);
+    let mut powers = points
+        .iter()
+        .map(|point| point.nv_power)
+        .collect::<Vec<_>>();
+    powers.sort_unstable();
+    powers.dedup();
+    if powers.is_empty() {
+        powers.push(0);
+    }
+    let mut tex = pgfplots_start_log_y(
+        title,
+        "PCS polynomial exponent $n$ in $N=2^n$",
+        y_label,
+        &powers,
+    );
+    let mut series = points
+        .iter()
+        .map(|point| (point.runner, point.opening, point.series_workers))
+        .collect::<Vec<_>>();
+    series.sort_unstable();
+    series.dedup();
+    for (series_index, (runner, opening, series_workers)) in series.iter().enumerate() {
+        let coordinates = points
+            .iter()
+            .filter(|point| {
+                point.runner == *runner
+                    && point.opening == *opening
+                    && point.series_workers == *series_workers
+                    && point.value > 0.0
+                    && point.value.is_finite()
+            })
+            .map(|point| {
+                format!(
+                    "({}, {})",
+                    point.nv_power,
+                    format_pgfplots_number(point.value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        tex.push_str(&format!(
+            "\\addplot+[{}, {}, {}] coordinates {{{}}};\n",
+            pgfplots_color_for_index(series_index),
+            pgfplots_dash(series_workers.unwrap_or(1)),
+            pgfplots_marker(series_workers.unwrap_or(series_index + 1)),
+            coordinates
+        ));
+        let worker_label = series_workers
+            .map(|workers| format!(" w{workers}"))
+            .unwrap_or_default();
+        tex.push_str(&format!(
+            "\\addlegendentry{{{} {}{}}}\n",
+            runner, opening, worker_label
+        ));
+    }
+    tex.push_str("\\end{axis}\n\\end{tikzpicture}\n");
+    tex
+}
+
+fn pcs_worker_scaling_svg(records: &[PcsMetricRecord]) -> String {
+    pcs_worker_scaling_svg_with_title(records, "PCS worker scaling at max size")
+}
+
+fn pcs_worker_scaling_svg_with_title(records: &[PcsMetricRecord], title: &str) -> String {
+    let points = pcs_worker_scaling_points(records);
+    let mut workers = points.iter().map(|point| point.workers).collect::<Vec<_>>();
+    workers.sort_unstable();
+    workers.dedup();
+    if workers.is_empty() {
+        workers.push(1);
+    }
+    let min_worker = workers.iter().copied().min().unwrap_or(1) as f64;
+    let max_worker = workers.iter().copied().max().unwrap_or(1) as f64;
+    let observed_max = points
+        .iter()
+        .map(|point| point.speedup)
+        .fold(1.0_f64, f64::max);
+    let (max_y, y_step) = scaling_axis_bounds(max_worker.max(observed_max));
+    let mut svg = paper_svg_start(
+        title,
+        "Speedup is measured against the same runner/opening at workers=1. Dashed line is the perfect-scaling upper bound.",
+    );
+    draw_plot_frame(&mut svg, "Commit+open speedup", "Workers");
+    draw_y_grid(&mut svg, max_y, y_step);
+    draw_x_numeric_ticks(&mut svg, &workers, min_worker, max_worker);
+    let mut series = points
+        .iter()
+        .map(|point| (point.runner, point.opening))
+        .collect::<Vec<_>>();
+    series.sort_unstable();
+    series.dedup();
+    draw_legend_box(&mut svg, series.len() + 1);
+    for (series_index, (runner, opening)) in series.iter().enumerate() {
+        let color = chart_color(series_index);
+        let line_points = points
+            .iter()
+            .filter(|point| point.runner == *runner && point.opening == *opening)
+            .map(|point| {
+                (
+                    plot_x_numeric(point.workers as f64, min_worker, max_worker),
+                    plot_y(point.speedup, max_y),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !line_points.is_empty() {
+            let polyline = line_points
+                .iter()
+                .map(|(x, y)| format!("{x:.1},{y:.1}"))
+                .collect::<Vec<_>>();
+            if polyline.len() > 1 {
+                svg.push_str(&format!(
+                    "<polyline class=\"series-line\" fill=\"none\" stroke=\"{}\" points=\"{}\" />\n",
+                    color,
+                    polyline.join(" ")
+                ));
+            }
+            for (x, y) in &line_points {
+                svg.push_str(&marker_svg(*x, *y, color, series_index + 1));
+            }
+            svg.push_str(&format!(
+                "<g class=\"legend-entry\" transform=\"translate(765,{})\"><line x1=\"0\" y1=\"0\" x2=\"24\" y2=\"0\" stroke=\"{}\" stroke-width=\"2.4\" />{}<text x=\"34\" y=\"4\">{} {}</text></g>\n",
+                88 + series_index * 24,
+                color,
+                marker_svg(12.0, 0.0, color, series_index + 1),
+                xml_escape(runner),
+                xml_escape(opening)
+            ));
+        }
+    }
+    let ideal_points = workers
+        .iter()
+        .map(|worker| {
+            let x = plot_x_numeric(*worker as f64, min_worker, max_worker);
+            let y = plot_y(*worker as f64, max_y);
+            format!("{x:.1},{y:.1}")
+        })
+        .collect::<Vec<_>>();
+    if ideal_points.len() > 1 {
+        svg.push_str(&format!(
+            "<polyline class=\"ideal-line\" fill=\"none\" points=\"{}\" />\n",
+            ideal_points.join(" ")
+        ));
+    }
+    svg.push_str(&format!(
+        "<g class=\"legend-entry\" transform=\"translate(765,{})\"><line x1=\"0\" y1=\"0\" x2=\"24\" y2=\"0\" class=\"ideal-line\"/><text x=\"34\" y=\"4\">Perfect upper bound</text></g>\n",
+        88 + series.len() * 24
+    ));
+    svg.push_str("</svg>\n");
+    svg
+}
+
+fn pcs_worker_scaling_pgfplots(records: &[PcsMetricRecord]) -> String {
+    pcs_worker_scaling_pgfplots_with_title(records, "PCS worker scaling at max size")
+}
+
+fn pcs_worker_scaling_pgfplots_with_title(records: &[PcsMetricRecord], title: &str) -> String {
+    let points = pcs_worker_scaling_points(records);
+    let mut workers = points.iter().map(|point| point.workers).collect::<Vec<_>>();
+    workers.sort_unstable();
+    workers.dedup();
+    if workers.is_empty() {
+        workers.push(1);
+    }
+    let observed_max = points
+        .iter()
+        .map(|point| point.speedup)
+        .fold(1.0_f64, f64::max);
+    let max_worker = workers.iter().copied().max().unwrap_or(1) as f64;
+    let (max_y, y_step) = scaling_axis_bounds(max_worker.max(observed_max));
+    let mut tex = pgfplots_start_with_extra(
+        title,
+        "Workers",
+        "Commit+open speedup",
+        &workers,
+        false,
+        &linear_y_axis_options(max_y, y_step),
+    );
+    let mut series = points
+        .iter()
+        .map(|point| (point.runner, point.opening))
+        .collect::<Vec<_>>();
+    series.sort_unstable();
+    series.dedup();
+    for (series_index, (runner, opening)) in series.iter().enumerate() {
+        let coordinates = points
+            .iter()
+            .filter(|point| point.runner == *runner && point.opening == *opening)
+            .map(|point| {
+                format!(
+                    "({}, {})",
+                    point.workers,
+                    format_pgfplots_number(point.speedup)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        tex.push_str(&format!(
+            "\\addplot+[{}, solid, {}] coordinates {{{}}};\n",
+            pgfplots_color_for_index(series_index),
+            pgfplots_marker(series_index + 2),
+            coordinates
+        ));
+        tex.push_str(&format!("\\addlegendentry{{{} {}}}\n", runner, opening));
+    }
+    let ideal_coordinates = workers
+        .iter()
+        .map(|worker| format!("({}, {})", worker, worker))
+        .collect::<Vec<_>>();
+    if !ideal_coordinates.is_empty() {
+        tex.push_str(&format!(
+            "\\addplot+[pqIdeal, dashed, mark=none] coordinates {{{}}};\n",
+            ideal_coordinates.join(" ")
+        ));
+        tex.push_str("\\addlegendentry{Perfect upper bound}\n");
+    }
+    tex.push_str("\\end{axis}\n\\end{tikzpicture}\n");
+    tex
+}
+
+#[derive(Clone, Debug)]
+struct PcsScalingPoint {
+    runner: &'static str,
+    opening: &'static str,
+    workers: usize,
+    speedup: f64,
+}
+
+fn pcs_worker_scaling_points(records: &[PcsMetricRecord]) -> Vec<PcsScalingPoint> {
+    let max_size = records.iter().map(|record| record.size).max().unwrap_or(0);
+    let stats = pcs_benchmark_stats(records)
+        .into_iter()
+        .filter(|record| record.size == max_size)
+        .collect::<Vec<_>>();
+    let mut points = Vec::new();
+    for record in &stats {
+        let baseline = stats.iter().find(|candidate| {
+            candidate.runner == record.runner
+                && candidate.opening == record.opening
+                && candidate.workers == 1
+        });
+        if let Some(baseline) = baseline {
+            let baseline_time = baseline.commit_ms.mean + baseline.open_ms.mean;
+            let current_time = record.commit_ms.mean + record.open_ms.mean;
+            if current_time > 0.0 {
+                points.push(PcsScalingPoint {
+                    runner: record.runner,
+                    opening: record.opening,
+                    workers: record.workers,
+                    speedup: baseline_time / current_time,
+                });
+            }
+        }
+    }
+    points.sort_by_key(|point| (point.runner, point.opening, point.workers));
+    points
+}
+
+fn pgfplots_color_for_index(index: usize) -> &'static str {
+    match index % 6 {
+        0 => "pqR1CS",
+        1 => "pqPlonkish",
+        2 => "pqGreen",
+        3 => "pqPurple",
+        4 => "pqGold",
+        _ => "pqIdeal",
+    }
+}
+
 fn worker_scaling_svg(records: &[MetricRecord]) -> String {
     let scaling = worker_scaling_context(records);
     let min_worker = scaling.workers.iter().copied().min().unwrap_or(1) as f64;
@@ -8334,9 +10732,7 @@ fn worker_scaling_svg(records: &[MetricRecord]) -> String {
             }
         }
     }
-    let raw_max_y = observed_max.max(max_worker).max(1.0);
-    let y_step = nice_axis_step(raw_max_y, 5);
-    let max_y = (raw_max_y / y_step).ceil() * y_step;
+    let (max_y, y_step) = scaling_axis_bounds(observed_max.max(max_worker).max(1.0));
     let mut svg = paper_svg_start(
         &format!(
             "Worker scaling at n={} (nv={})",
@@ -8620,8 +11016,22 @@ fn line_chart_pgfplots(
 
 fn worker_scaling_pgfplots(records: &[MetricRecord]) -> String {
     let scaling = worker_scaling_context(records);
+    let max_worker = scaling.workers.iter().copied().max().unwrap_or(1) as f64;
+    let mut observed_max = 1.0_f64;
+    for series in &scaling.series {
+        for point in &series.points {
+            observed_max = observed_max.max(point.speedup);
+        }
+        if let Some(serial_overhead) = series.serial_overhead {
+            for worker in &scaling.workers {
+                observed_max =
+                    observed_max.max(amdahl_diagnostic_speedup(*worker, serial_overhead));
+            }
+        }
+    }
+    let (max_y, y_step) = scaling_axis_bounds(observed_max.max(max_worker).max(1.0));
 
-    let mut tex = pgfplots_start(
+    let mut tex = pgfplots_start_with_extra(
         &format!(
             "Worker scaling at n={} (nv={})",
             nv_power(scaling.max_size),
@@ -8630,6 +11040,8 @@ fn worker_scaling_pgfplots(records: &[MetricRecord]) -> String {
         "Workers",
         "Speedup vs workers=1",
         &scaling.workers,
+        false,
+        &linear_y_axis_options(max_y, y_step),
     );
     for (series_index, series) in scaling.series.iter().enumerate() {
         if let Some(serial_overhead) = series.serial_overhead {
@@ -9236,6 +11648,31 @@ fn verified_positive_records(records: &[MetricRecord]) -> Vec<&MetricRecord> {
 }
 
 fn pgfplots_start(title: &str, x_label: &str, y_label: &str, x_ticks: &[usize]) -> String {
+    pgfplots_start_with_options(title, x_label, y_label, x_ticks, false)
+}
+
+fn pgfplots_start_log_y(title: &str, x_label: &str, y_label: &str, x_ticks: &[usize]) -> String {
+    pgfplots_start_with_options(title, x_label, y_label, x_ticks, true)
+}
+
+fn pgfplots_start_with_options(
+    title: &str,
+    x_label: &str,
+    y_label: &str,
+    x_ticks: &[usize],
+    log_y: bool,
+) -> String {
+    pgfplots_start_with_extra(title, x_label, y_label, x_ticks, log_y, &[])
+}
+
+fn pgfplots_start_with_extra(
+    title: &str,
+    x_label: &str,
+    y_label: &str,
+    x_ticks: &[usize],
+    log_y: bool,
+    extra_options: &[String],
+) -> String {
     let mut tex = String::new();
     tex.push_str(PGFPLOTS_PREAMBLE_COMMENT);
     tex.push_str("% Source data: source.csv and source.json.\n");
@@ -9265,10 +11702,21 @@ fn pgfplots_start(title: &str, x_label: &str, y_label: &str, x_ticks: &[usize]) 
         "  every axis plot/.append style={line width=0.95pt, mark options={scale=0.85, solid}},\n",
     );
     tex.push_str("  scaled ticks=false,\n");
+    if log_y {
+        tex.push_str("  ymode=log,\n");
+        tex.push_str("  log basis y=10,\n");
+        tex.push_str("  log ticks with fixed point=false,\n");
+    }
     tex.push_str("  unbounded coords=discard,\n");
     if !x_ticks.is_empty() {
         let ticks = x_ticks.iter().map(ToString::to_string).collect::<Vec<_>>();
         tex.push_str(&format!("  xtick={{{}}},\n", ticks.join(",")));
+    }
+    for option in extra_options {
+        tex.push_str(option);
+        if !option.ends_with('\n') {
+            tex.push('\n');
+        }
     }
     tex.push_str("]\n");
     tex
@@ -9550,6 +11998,26 @@ fn nice_axis_step(max_value: f64, target_ticks: usize) -> f64 {
     nice_fraction * base
 }
 
+fn scaling_axis_bounds(max_value: f64) -> (f64, f64) {
+    let raw_max_y = max_value.max(1.0);
+    let y_step = nice_axis_step(raw_max_y, 8);
+    let max_y = (raw_max_y / y_step).ceil() * y_step;
+    (max_y, y_step)
+}
+
+fn linear_y_axis_options(max_y: f64, step: f64) -> Vec<String> {
+    let tick_count = (max_y / step).round() as usize;
+    let ticks = (0..=tick_count)
+        .map(|idx| format_pgfplots_number(step * idx as f64))
+        .collect::<Vec<_>>()
+        .join(",");
+    vec![
+        "  ymin=0,".to_owned(),
+        format!("  ymax={},", format_pgfplots_number(max_y)),
+        format!("  ytick={{{ticks}}},"),
+    ]
+}
+
 fn format_axis_value(value: f64) -> String {
     if value.abs() < 1.0e-9 {
         "0".to_owned()
@@ -9650,8 +12118,10 @@ fn usage() -> String {
   cargo run -p pq-experiments -- list-proofs [--results results] [--format text|json|csv]
   cargo run -p pq-experiments -- verify-proof --dir results/bench-... [--all | --proof ID] [--format json|csv]
   cargo run -p pq-experiments -- benchmark [--paper-preset] [--runner local|network|both] [--sizes 4,8,16 | --size-range 4..16 | --nv-powers/--n-values 2,3,4 | --nv-range/--n-range 2..6] [--workers 1,2,4 | --worker-power-range 0..2] [--pcs-queries N] [--host-cores N] [--worker-cores N] [--compile-figures] [--out DIR]
+  cargo run -p pq-experiments -- pcs-benchmark [--runner local|network|both] [--opening compact|full|both] [--sizes 256,512,1024 | --size-range 256..1024 | --nv-powers/--n-values 8,9,10 | --nv-range/--n-range 8..10] [--workers 1,2,4 | --worker-power-range 0..2] [--pcs-queries N] [--host-cores N] [--worker-cores N] [--no-pcs-warmup] [--out DIR]
   cargo run -p pq-experiments -- quick-smoke [--out DIR]
   cargo run -p pq-experiments -- verify-results --dir results/bench-... [--format json|csv] [--paper-quality]
+  cargo run -p pq-experiments -- verify-pcs-results --dir results/pcs-bench-... [--format json|csv]
   cargo run -p pq-experiments -- net-demo [--workers N] [--format json|csv]
   cargo run -p pq-experiments -- worker --addr HOST:PORT --id N
   cargo run -p pq-experiments -- master --addrs A,B [--ids 0,1] [--session S] [--payload P] [--shutdown] [--format json|csv]
@@ -9988,6 +12458,63 @@ mod tests {
     }
 
     #[test]
+    fn parses_pcs_benchmark_defaults_and_opening_expansion() {
+        let command = parse_pcs_benchmark_command(&[]).expect("default PCS benchmark command");
+        assert_eq!(command.sizes, vec![256, 512, 1024]);
+        assert_eq!(command.workers, vec![1, 2, 4]);
+        assert_eq!(command.pcs_queries, 1);
+        assert_eq!(command.repeats, 1);
+        assert_eq!(command.runner, BenchmarkRunner::Both);
+        assert_eq!(command.opening, PcsOpeningSelection::Compact);
+        assert_eq!(command.opening.variants(), vec![PcsOpeningVariant::Compact]);
+
+        let explicit = parse_pcs_benchmark_command(&[
+            "--runner".to_owned(),
+            "network".to_owned(),
+            "--opening".to_owned(),
+            "full".to_owned(),
+            "--n-values".to_owned(),
+            "2,3".to_owned(),
+            "--workers".to_owned(),
+            "1,2".to_owned(),
+            "--pcs-queries".to_owned(),
+            "2".to_owned(),
+        ])
+        .expect("explicit PCS benchmark command");
+        assert_eq!(explicit.runner, BenchmarkRunner::Network);
+        assert_eq!(explicit.opening.variants(), vec![PcsOpeningVariant::Full]);
+        assert_eq!(explicit.sizes, vec![4, 8]);
+        assert_eq!(explicit.workers, vec![1, 2]);
+        assert_eq!(explicit.pcs_queries, 2);
+    }
+
+    #[test]
+    fn rejects_invalid_pcs_benchmark_grid() {
+        let non_power_of_two = parse_pcs_benchmark_command(&[
+            "--sizes".to_owned(),
+            "3".to_owned(),
+            "--workers".to_owned(),
+            "1".to_owned(),
+        ])
+        .expect_err("PCS size must be a power of two");
+        assert!(non_power_of_two.0.contains("power of two"));
+
+        let too_many_workers = parse_pcs_benchmark_command(&[
+            "--sizes".to_owned(),
+            "2".to_owned(),
+            "--workers".to_owned(),
+            "4".to_owned(),
+        ])
+        .expect_err("PCS workers cannot exceed size");
+        assert!(too_many_workers.0.contains("cannot exceed size"));
+
+        let bad_opening =
+            parse_pcs_benchmark_command(&["--opening".to_owned(), "short".to_owned()])
+                .expect_err("PCS opening parser rejects unknown variants");
+        assert!(bad_opening.0.contains("unsupported --opening"));
+    }
+
+    #[test]
     fn benchmark_progress_counts_real_jobs() {
         let command = parse_benchmark_command(&[
             "--runner".to_owned(),
@@ -10108,6 +12635,178 @@ mod tests {
     }
 
     #[test]
+    fn verifies_pcs_result_fixture_contract() {
+        let run_dir = temp_test_dir("pq_dsnark_pcs_verify_fixture");
+        fs::create_dir_all(&run_dir).expect("create PCS fixture dir");
+        let command = PcsBenchmarkCommand {
+            sizes: vec![4],
+            workers: vec![1],
+            pcs_queries: 1,
+            repeats: 1,
+            runner: BenchmarkRunner::Both,
+            opening: PcsOpeningSelection::Both,
+            out_dir: PathBuf::from("results"),
+            host_logical_cores: None,
+            worker_cores: None,
+            worker_core_plan: None,
+            warmup_enabled: true,
+        };
+        let records = vec![
+            PcsMetricRecord {
+                runner: "local",
+                opening: "compact",
+                trial: 1,
+                workers: 1,
+                size: 4,
+                t_rows_per_worker: 4.0,
+                paper_b_target: paper_b_target(4, 1),
+                shard_len: 4,
+                pcs_queries_requested: 1,
+                pcs_queries_effective: 1,
+                partition_ms: 0.1,
+                worker_commit_ms: 0.2,
+                master_commit_ms: 0.1,
+                commit_ms: 0.4,
+                open_ms: 0.3,
+                verify_ms: 0.2,
+                commitment_bytes: 64,
+                opening_proof_bytes: 96,
+                communication_bytes: 128,
+                network_commit_bytes: 0,
+                network_open_bytes: 0,
+                network_bytes: 0,
+                host_logical_cores: None,
+                cores_per_worker: None,
+                core_affinity: None,
+                verified: true,
+                failure_reason: None,
+            },
+            PcsMetricRecord {
+                runner: "network",
+                opening: "full",
+                trial: 1,
+                workers: 1,
+                size: 4,
+                t_rows_per_worker: 4.0,
+                paper_b_target: paper_b_target(4, 1),
+                shard_len: 4,
+                pcs_queries_requested: 1,
+                pcs_queries_effective: 1,
+                partition_ms: 0.0,
+                worker_commit_ms: 0.5,
+                master_commit_ms: 0.0,
+                commit_ms: 0.5,
+                open_ms: 0.4,
+                verify_ms: 0.2,
+                commitment_bytes: 64,
+                opening_proof_bytes: 128,
+                communication_bytes: 160,
+                network_commit_bytes: 80,
+                network_open_bytes: 120,
+                network_bytes: 200,
+                host_logical_cores: None,
+                cores_per_worker: None,
+                core_affinity: None,
+                verified: true,
+                failure_reason: None,
+            },
+        ];
+        let timings = vec![
+            PhaseTimingRecord {
+                phase: "setup".to_owned(),
+                detail: "setup".to_owned(),
+                elapsed_ms: 0.1,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 0.1,
+            },
+            PhaseTimingRecord {
+                phase: "pcs_job".to_owned(),
+                detail: "runner=local opening=compact".to_owned(),
+                elapsed_ms: 1.0,
+                recorded_prove_ms: 0.7,
+                recorded_verify_ms: 0.2,
+                inferred_overhead_ms: 0.1,
+            },
+            PhaseTimingRecord {
+                phase: "pcs_job".to_owned(),
+                detail: "runner=network opening=full".to_owned(),
+                elapsed_ms: 1.2,
+                recorded_prove_ms: 0.9,
+                recorded_verify_ms: 0.2,
+                inferred_overhead_ms: 0.1,
+            },
+            PhaseTimingRecord {
+                phase: "source_and_chart_artifacts".to_owned(),
+                detail: "artifacts".to_owned(),
+                elapsed_ms: 0.1,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 0.1,
+            },
+            PhaseTimingRecord {
+                phase: "final_result_artifacts".to_owned(),
+                detail: "final".to_owned(),
+                elapsed_ms: 0.1,
+                recorded_prove_ms: 0.0,
+                recorded_verify_ms: 0.0,
+                inferred_overhead_ms: 0.1,
+            },
+            PhaseTimingRecord {
+                phase: "total".to_owned(),
+                detail: "total".to_owned(),
+                elapsed_ms: 2.0,
+                recorded_prove_ms: 1.6,
+                recorded_verify_ms: 0.4,
+                inferred_overhead_ms: 0.0,
+            },
+        ];
+        write_text_file(&run_dir.join("source.csv"), &pcs_records_to_csv(&records))
+            .expect("write PCS source CSV");
+        write_text_file(&run_dir.join("source.json"), &pcs_records_to_json(&records))
+            .expect("write PCS source JSON");
+        write_text_file(
+            &run_dir.join("summary_stats.csv"),
+            &pcs_summary_stats_to_csv(&pcs_benchmark_stats(&records)),
+        )
+        .expect("write PCS summary CSV");
+        write_pcs_benchmark_charts(&run_dir, &records).expect("write PCS charts");
+        write_text_file(
+            &run_dir.join("metadata.json"),
+            &pcs_benchmark_metadata_json(1, &command, &records),
+        )
+        .expect("write PCS metadata");
+        write_text_file(
+            &run_dir.join("phase_timing.csv"),
+            &phase_timing_to_csv(&timings),
+        )
+        .expect("write PCS phase CSV");
+        write_text_file(
+            &run_dir.join("phase_timing.json"),
+            &phase_timing_to_json(&timings),
+        )
+        .expect("write PCS phase JSON");
+        write_text_file(
+            &run_dir.join("summary.txt"),
+            &pcs_benchmark_summary(&command, &records, &timings),
+        )
+        .expect("write PCS summary");
+        write_text_file(
+            &run_dir.join(OVERVIEW_HTML),
+            &pcs_benchmark_overview_html(1, &command, &records),
+        )
+        .expect("write PCS overview");
+        let manifest = pcs_result_manifest_json(&run_dir, 1).expect("PCS manifest");
+        write_text_file(&run_dir.join(RESULT_MANIFEST), &manifest).expect("write PCS manifest");
+
+        let report = verify_pcs_result_dir(&run_dir).expect("verify PCS result fixture");
+        assert_eq!(report.source_rows_checked, 2);
+        assert_eq!(report.summary_rows_checked, 2);
+        assert_eq!(report.phase_rows_checked, 6);
+        fs::remove_dir_all(&run_dir).expect("cleanup PCS fixture");
+    }
+
+    #[test]
     fn scripts_directory_has_only_interactive_entrypoints() {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -10133,8 +12832,44 @@ mod tests {
                 "interactive-linux.sh",
                 "interactive-macos.sh",
                 "interactive-powershell.cmd",
+                "pcs-benchmark-linux.sh",
+                "pcs-benchmark-macos.sh",
+                "pcs-benchmark-powershell.cmd",
             ]
         );
+    }
+
+    #[test]
+    fn pcs_scripts_offer_zero_exit_without_running_benchmark() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+        for script_name in [
+            "pcs-benchmark-linux.sh",
+            "pcs-benchmark-macos.sh",
+            "pcs-benchmark-powershell.cmd",
+        ] {
+            let script = fs::read_to_string(repo_root.join("scripts").join(script_name))
+                .expect("read PCS benchmark script");
+            assert!(script.contains("Distributed Brakedown PCS benchmark"));
+            assert!(script.contains("pcs-benchmark"));
+            assert!(script.contains("0) Exit") || script.contains("0^) Exit"));
+            assert!(script.contains("exit 0") || script.contains("exit /b 0"));
+            assert!(script.contains("--opening"));
+            assert!(script.contains("compact"));
+            assert!(script.contains("--n-range"));
+            assert!(script.contains("--worker-power-range"));
+            assert!(script.contains("minimum PCS size exponent n for N=2^n"));
+            assert!(script.contains("maximum PCS size exponent n for N=2^n"));
+            assert!(script.contains("minimum worker exponent for workers=2^w"));
+            assert!(script.contains("maximum worker exponent for workers=2^w"));
+            assert!(!script.contains("--out"));
+            assert!(!script.contains("[8,9,10]"));
+            assert!(!script.contains("[1,2,4]"));
+            assert!(!script.contains("[results]"));
+        }
     }
 
     #[test]
@@ -10341,6 +13076,29 @@ mod tests {
         assert_eq!(positional.dir, PathBuf::from("results/bench-2"));
         assert_eq!(positional.format, OutputFormat::Json);
         assert!(!positional.paper_quality);
+
+        let pcs = parse_verify_pcs_results_command(&[
+            "--dir".to_owned(),
+            "results/pcs-bench-1".to_owned(),
+            "--format".to_owned(),
+            "csv".to_owned(),
+        ])
+        .expect("verify-pcs-results command");
+        assert_eq!(pcs.dir, PathBuf::from("results/pcs-bench-1"));
+        assert_eq!(pcs.format, OutputFormat::Csv);
+        assert!(!pcs.paper_quality);
+
+        let pcs_paper_quality = parse_verify_pcs_results_command(&[
+            "--dir".to_owned(),
+            "results/pcs-bench-1".to_owned(),
+            "--paper-quality".to_owned(),
+        ])
+        .expect_err("PCS verifier rejects proof-benchmark-only flag");
+        assert!(
+            pcs_paper_quality
+                .0
+                .contains("unknown verify-pcs-results argument")
+        );
     }
 
     #[test]
