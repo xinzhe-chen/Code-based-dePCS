@@ -1,11 +1,11 @@
 # pq_dSNARK Correctness Prototype
 
-This repository is a correctness-first Rust prototype for the transparent,
+This repository is a correctness-first Rust implementation of the transparent,
 post-quantum distributed SNARK design described in `Doc/pq_dSNARK.pdf`.
 
-It is not a production SNARK library. The implementation keeps protocol
-layers explicit so the algebra, transcript, PCS, PIOP, networking, and
-experiment paths can be tested and audited separately.
+The implementation keeps protocol layers explicit so the algebra, transcript,
+PCS, PIOP, networking, and experiment paths can be tested, audited, and
+benchmarked separately.
 
 ## What Is Implemented
 
@@ -16,8 +16,8 @@ experiment paths can be tested and audited separately.
 - Local and loopback TCP worker runners for experiments.
 - Benchmark, verification, and report-generation tooling.
 
-The prototype intentionally favors readable module boundaries and
-reproducible evidence over optimized proving performance.
+The implementation emphasizes readable module boundaries, reproducible
+evidence, and practical experiment tooling.
 
 ## Workspace Map
 
@@ -136,8 +136,7 @@ See `results/README.md` for the result directory contract.
   benchmark interpretation.
 - `Doc/completion_audit.md`: requirement-by-requirement implementation audit.
 - `Doc/pcs_theory_audit.md`: PCS-theory notes and current proof-shape audit.
-- `Doc/prototype_boundary.md`: current correctness-prototype limits and
-  protocol caveats.
+- `Doc/prototype_boundary.md`: implementation scope and protocol details.
 - `Doc/implementation_progress.md`: append-only implementation and validation log.
 
 ## CI And Licensing

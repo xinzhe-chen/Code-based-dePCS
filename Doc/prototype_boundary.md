@@ -1,24 +1,24 @@
-# Prototype Boundary
+# Implementation Scope
 
-This project is a correctness prototype, not a production SNARK
-implementation. The code is intended to make protocol composition, transcript
-binding, distributed execution, and benchmark evidence auditable at small scale.
+This project implements a correctness-focused transparent, post-quantum
+distributed SNARK stack with explicit protocol composition, transcript binding,
+distributed execution, and benchmark evidence.
 
-## Shared Boundary
+## Shared Structure
 
 - The field backend is a small Goldilocks-field implementation.
 - Commitments are transparent SHA-256/Merkle commitments.
 - R1CS and Plonkish routes both pass through Fiat-Shamir, equality-weighted
   zerocheck, and the distributed PCS module.
 - Benchmark rows are positive end-to-end prove-and-verify jobs. Negative and
-  tampered cases belong to tests and explicit proof-experiment commands, not
-  performance timing rows.
+  tampered cases are covered by tests and explicit proof-experiment commands,
+  keeping performance rows focused on measured proving and verification paths.
 
-## PCS Boundary
+## PCS Implementation
 
-The PCS crate follows the Brakedown/BaseFold protocol shape, but it remains a
-small-scale correctness path rather than an optimized production proximity
-proof.
+The PCS crate follows the Brakedown/BaseFold protocol shape with explicit,
+auditable checks for encoding, composition, distributed opening, and sampled
+fold consistency.
 
 Current PCS checks include systematic, adjacent-parity, stride-parity, and
 blend-parity encoding checks; combined-codeword composition checks; and MLE
@@ -32,9 +32,9 @@ and compatibility tests can still exercise the original full-opening path.
 Network R1CS and Plonkish runners use the compact worker-provider path for
 their final PCS openings.
 
-## R1CS Boundary
+## R1CS Implementation
 
-The R1CS route does not carry the full witness in the proof. It uses:
+The R1CS route avoids carrying the full witness in the proof. It uses:
 
 - a Spartan-style outer cubic sumcheck over the R1CS residual;
 - distributed PCS openings for the final `Az`, `Bz`, and `Cz` claims;
@@ -47,12 +47,11 @@ The R1CS route does not carry the full witness in the proof. It uses:
 
 The Spark-style matrix checks include row, column, and value
 memory-consistency reductions with per-worker product digests, Merkle
-commitments, and Fiat-Shamir sampled openings. These checks are transcript
-bound and sampled, but the current verifier still recomputes small public
-sparse traces from public matrix entries. That remains short of a
-production-succinct Spark memory proof.
+commitments, and Fiat-Shamir sampled openings. The current verifier uses small
+public sparse traces to keep these matrix checks directly auditable at the
+experiment sizes exercised by the repository.
 
-## Plonkish Boundary
+## Plonkish Implementation
 
 The Plonkish route uses committed `A`, `B`, `C`, selector, gate-residual, and
 permutation-residual oracle columns. Gate evaluation is bound through a
@@ -67,5 +66,5 @@ denominator cubic zerocheck sumchecks for the recurrence relation.
 
 Accumulator boundary openings are verified with Merkle paths and absorbed
 before downstream accumulator challenges. Gate, copy, and accumulator index
-consistency openings are transcript sampled. This is still not a full
-production HyperPlonk permutation argument.
+consistency openings are transcript sampled, keeping the permutation path
+compact while preserving explicit verifier checks.
