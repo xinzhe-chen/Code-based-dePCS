@@ -65,8 +65,9 @@ run_pcs_benchmark() {
   local host_cores host_worker_max default_worker_max
   host_cores="$(sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')"
   host_worker_max="$(max_power_of_two_exponent "$host_cores")"
-  runner="$(prompt_required_choice 'runner local|network|both' local network both)"
-  opening="$(prompt_choice_default 'opening compact|full|both' compact compact full both)"
+  runner="local-network"
+  printf 'runner: local-network\n'
+  opening="$(prompt_choice_default 'opening protocol11' protocol11 protocol11)"
   n_min="$(prompt_text_hidden_default 'minimum PCS size exponent n for N=2^n' '8')"
   n_max="$(prompt_text_hidden_default 'maximum PCS size exponent n for N=2^n' '10')"
   if ((n_min > n_max)); then
@@ -81,7 +82,7 @@ run_pcs_benchmark() {
   if ((default_worker_max > 3)); then
     default_worker_max=3
   fi
-  worker_min="$(prompt_text_hidden_default 'minimum worker exponent for workers=2^w' '0')"
+  worker_min="$(prompt_text_hidden_default 'minimum worker exponent for workers=2^w' '1')"
   worker_max="$(prompt_text_hidden_default 'maximum worker exponent for workers=2^w' "$default_worker_max")"
   if ((worker_min > worker_max)); then
     printf 'minimum worker exponent must be <= maximum worker exponent\n' >&2

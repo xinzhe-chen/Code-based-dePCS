@@ -1,92 +1,57 @@
 # PCS Theory Audit
 
-This audit is scoped to the distributed Brakedown PCS path used by the new
-`pq-experiments pcs-benchmark` workflow. It is not a proof that the repository
-implements every optimization in the paper; it separates measured prototype
-behavior from the PCS target in `Doc/pq_dSNARK.pdf`.
+This repository is scoped to the Chapter 4 distributed transparent PCS path in
+`Doc/pq_dSNARK.pdf`.
 
-## Scope
+## Current Protocol Surface
 
-- Paper: `Doc/pq_dSNARK.pdf` pages 22-31, covering Section 4, Protocols 8-11,
-  and the distributed Brakedown complexity discussion.
-- Current implementation: `pq-pcs` distributed commit/open/verify, compact
-  opening, encoding check, byte accounting, and network worker integration.
-- Reference implementation: `C:\Projects\deSpartan2` files
-  `crates/deSpartan2/src/provider/pcs/di_brakedown.rs`,
-  `distributed_encoding.rs`, `provider/pcs/brakedown.rs`,
-  `linear_code/brakedown.rs`, and the distributed Brakedown example scripts.
+- `pq-pcs::DistributedBrakedown::commit` implements the Protocol 11 commit
+  phase over a row-wise distributed matrix. Each worker commits to hashes of
+  encoded columns, matching the distributed Merkle commitment role in the
+  paper.
+- `pq-pcs::DistributedBrakedown::open` implements the Protocol 11 evaluation
+  phase: verifier challenge vector `a`, `beta = eq(s1, row)`, per-worker
+  commitments to `E1/F1/E2/F2`, Merkle column sampling over the encoded domain,
+  `F2(s2)` aggregation, and two Protocol 10 encoding proofs.
+- Protocols 8 and 9 are represented by per-worker transparent PC commitments
+  and evaluation openings for `E1/E2/F1/F2`; verifier-side checks aggregate
+  local claimed values into the global claim.
+- Protocol 10 now follows the paper shape: the verifier samples `u`, the prover
+  forms `H_u`, proves `sum_b E(b) * H_u(b) = 0` with product sumcheck, opens
+  `H_u(r)` and distributed `E(r)` through the transparent PC, then checks the
+  systematic relation `E(u', 0, 0) = F(u')`.
+- The `H_u` verifier path no longer materializes full `eq(u)` and `eq(r)`
+  tables to recompute `H_u(r)`. Instead, the BaseFold verifier checks sampled
+  original-layer `H_u[j]` leaves lazily from the sparse parity-check column,
+  using only the O(1)-sized column support of the in-repo code.
+- Protocol 10 verification also no longer constructs the full sparse
+  parity-check matrix just to bind dimensions. The transcript absorbs an O(1)
+  `BrakedownParityShape` derived from the code spec: `rows = 4n`,
+  `cols = 4n`, and `nnz = 14n` for the current in-repo constraint system
+  (`5n + 5n + 4n` nonzero entries).
 
-## Matches
+## Implementation Boundary
 
-- Distributed commit shape: `pq-pcs` keeps the Protocol 8/9 split between
-  per-worker shard commitments and a master-level distributed commitment.
-- Open/verify API shape: both full and compact opening variants are available
-  for distributed openings, and the benchmark records open time, verify time,
-  proof bytes, communication bytes, and network bytes separately.
-- Fiat-Shamir transcript separation: the current PCS code absorbs the
-  distributed commitment before deriving opening challenges, matching the
-  paper's transcript-driven protocol flow at the PCS layer.
-- Byte accounting: `pq-pcs` exposes commitment size, full proof size, compact
-  proof size, and communication-byte helpers. The PCS verifier checks local rows
-  have zero network bytes and network rows have positive network bytes.
-- Benchmark grid: the PCS-only workflow measures `N`, `M`, `T=N/M`, and the
-  paper target `B=M log(N/M)` for every runner/opening/trial row.
+The default transparent PC backend is an in-repository BaseFold-semantics
+Merkle folding commitment: it commits to MLE evaluations, folds by the claimed
+evaluation point, and verifies sampled folding paths through Merkle openings.
+This replaces the older full-vector verifier path; verifier-facing Protocol 10
+and Protocol 11 proofs no longer carry full witness rows or full codewords.
 
-## Partial
+The field remains the 64-bit Goldilocks field. The default `lambda=128` is
+implemented as a query-budget parameter for proximity/folding checks; this is
+not a claim that a single Goldilocks field element provides 128 bits of
+algebraic security by itself.
 
-- Protocol 10 encoding proof: `pq-pcs` has an encoding check path, but the
-  current benchmark treats it as part of PCS correctness/prototype validation
-  rather than a separately parameterized Protocol 10 sub-benchmark.
-- Protocol 11 distributed Brakedown composition: the code exercises distributed
-  commit/open/verify and compact openings, but it does not yet expose every
-  paper-level subphase as a first-class benchmark column.
-- Master aggregation timing: local mode splits partition, worker commit, and
-  master aggregation timing. Network mode records end-to-end network commit
-  timing and byte counts, but worker and master timing cannot be fully separated
-  without adding server-side phase telemetry.
-- Paper parameter `B`: the report records the target `B=M log(N/M)` but the
-  current implementation does not force every internal code parameter to equal
-  the paper's asymptotic tuning.
-- deSpartan2 comparison: deSpartan2 has a more mature distributed Brakedown
-  implementation and distributed encoding organization. The current repo uses
-  it as a reference for module boundaries and expected protocol phases, not as
-  a source-compatible implementation.
-
-## Missing
-
-- Dedicated Protocol 10 benchmark columns for encoding proof prover time,
-  verifier time, and bytes.
-- Server-side network phase telemetry for partition, per-worker commit, master
-  aggregation, open construction, and worker response serialization.
-- A full paper-quality complexity validator that asserts observed scaling
-  against `O(N/M)` prover work and `O(M log^2(N/M))` proof/verifier targets.
-- A direct artifact diff against deSpartan2 proof objects or transcript states.
-
-## Intentionally Prototype
-
-- The PCS benchmark is correctness-first: every row must verify, and verifier
-  failure is surfaced as `failure_reason`. It is not presented as an optimized
-  production benchmark.
-- Compact and full openings are both measured because the repository exposes
-  both paths. The compact path is the more report-relevant communication target,
-  while full openings remain useful for regression checks.
-- Network byte accounting is measured at the client/worker exchange boundary.
-  It is sufficient for runner comparison, but it should not be treated as a
-  full transport stack profile.
+The remaining proof-level caveat is code distance: the current deterministic
+constant-degree expander-style code is sparse and systematic, and its matching
+`H` is tested, but the repository does not yet include a formal constant
+relative-distance proof for that concrete graph family.
 
 ## Benchmark Contract
 
-`pq-experiments pcs-benchmark` writes `results/pcs-bench-YYYYMMDD-HHMMSS/` with:
-
-- `metadata.json`
-- `result_manifest.json`
-- `source.csv` and `source.json`
-- `summary_stats.csv`
-- `summary.txt`
-- `overview.html`
-- phase timing artifacts
-- commit/open/verify/proof-byte/network-byte/scaling SVG and PGFPlots charts
-
-`pq-experiments verify-pcs-results --dir <run>` validates the PCS artifact
-schema, manifest hashes, non-negative timings, verified rows, local/network byte
-rules, and compact/full proof-byte accounting.
+`pq-experiments pcs-benchmark` measures only the `protocol11` dePCS path. CSV
+outputs separate verifier-facing proof payload fields from `communication_bytes`,
+which is reserved for measured bytes sent plus bytes received. The dePCS local
+TCP runner records `network_commit_bytes`, `network_open_bytes`, and
+`network_bytes` from actual framed socket traffic.

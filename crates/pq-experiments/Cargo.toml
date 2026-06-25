@@ -6,12 +6,9 @@ license.workspace = true
 
 [dependencies]
 pq-core = { path = "../pq-core" }
-pq-net = { path = "../pq-net" }
 pq-pcs = { path = "../pq-pcs" }
-pq-piop-plonkish = { path = "../pq-piop-plonkish" }
-pq-piop-r1cs = { path = "../pq-piop-r1cs" }
 pq-transcript = { path = "../pq-transcript" }
-rayon = { workspace = true }
+bincode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

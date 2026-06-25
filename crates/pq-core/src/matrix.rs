@@ -190,8 +190,8 @@ impl PrecomputedSparseMatrix {
     /// Precomputes row buckets following Spartan2's sparse-matrix accelerator:
     /// unit coefficients, small signed coefficients, and general field values.
     ///
-    /// Source reference: `third_party/Spartan2/src/r1cs/sparse.rs`,
-    /// `PrecomputedSparseMatrix::from_sparse`.
+    /// Precompute row buckets so repeated sparse matrix-vector products do not
+    /// rescan the full entry list for each row.
     pub fn from_sparse(matrix: &SparseMatrix) -> Self {
         let mut unit_pos = vec![Vec::new(); matrix.rows];
         let mut unit_neg = vec![Vec::new(); matrix.rows];

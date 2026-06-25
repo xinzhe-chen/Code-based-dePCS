@@ -1,5 +1,5 @@
 # Rust build products
-/target/
+target/
 
 # Benchmark outputs are generated artifacts. Keep the directory documentation,
 # but do not version local scratch runs. Curated publishable runs can be copied
@@ -14,6 +14,8 @@
 *.log
 *.tmp
 *.bak
+*.pyc
+__pycache__/
 /results/bench-*/*.png
 /results/pcs-bench-*/*.png
 

@@ -1,0 +1,14 @@
+[submodule "external/PIP_FRI"]
+	path = external/PIP_FRI
+	url = git@github.com:Louhc/PIP_FRI-and-DePIP_FRI.git
+	branch = benchmark-timing
+[submodule "external/HyperPianist"]
+	path = external/HyperPianist
+	url = git@github.com:Louhc/HyperPianist.git
+	branch = benchmark-timing
+[submodule "external/HyperFond"]
+	path = external/HyperFond
+	url = git@github.com:Louhc/HyperFond.git
+[submodule "external/winterfell"]
+	path = external/winterfell
+	url = git@github.com:Louhc/FRIttata.git

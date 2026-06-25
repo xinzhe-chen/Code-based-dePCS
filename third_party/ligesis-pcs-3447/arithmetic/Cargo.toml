@@ -1,0 +1,38 @@
+[package]
+name = "arithmetic"
+version = "0.1.0"
+edition = "2021"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ark-bls12-381 = { version = "0.4.0", default-features = false, features = [ "curve" ] }
+ark-ff = { version = "^0.4.0", default-features = false, features = ["std"] }
+ark-poly = { version = "^0.4.0", default-features = false, features = ["std"] }
+ark-serialize =  { version = "^0.4.0", default-features = false, features = ["std"] }
+ark-std = { version = "^0.4.0", default-features = false, features = ["std"] }
+displaydoc = { version = "0.2.3", default-features = false }
+rand_chacha = { version = "0.3.0", default-features = false }
+rand_core = "0.6.4"
+
+[dev-dependencies]
+ark-ec = { version = "^0.4.0", default-features = false }
+criterion = "0.5.1"
+
+[features]
+default = []
+print-trace = [
+    "ark-std/print-trace"
+    ]
+
+[[bench]]
+name = "mle_eval"
+path = "benches/bench.rs"
+harness = false
+
+[[bench]]
+name = "bind_poly"
+path = "benches/bind_poly_bench.rs"
+harness = false
+
+[lints.rust]
+warnings = "allow"

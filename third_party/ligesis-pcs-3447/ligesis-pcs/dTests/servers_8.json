@@ -1,0 +1,17 @@
+{
+    "servers": [
+        {"name": "node-1",  "host": "10.128.0.48"},
+        {"name": "node-2",  "host": "10.128.0.49"},
+        {"name": "node-3",  "host": "10.128.0.50"},
+        {"name": "node-4",  "host": "10.128.0.51"},
+        {"name": "node-5",  "host": "10.128.0.52"},
+        {"name": "node-6",  "host": "10.128.0.53"},
+        {"name": "node-7",  "host": "10.128.0.54"},
+        {"name": "node-8",  "host": "10.128.0.55"}
+    ],
+    "zone": "us-central1-a",
+    "project": "",
+    "user": "louhc",
+    "remote_dir": "~/ligesis-pcs",
+    "network_port": 18000
+}

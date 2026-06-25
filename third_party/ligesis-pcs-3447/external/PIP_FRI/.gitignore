@@ -1,0 +1,4 @@
+**/target
+**/*.rs.bk
+Cargo.lock
+de_pip_fri/data/*.txt

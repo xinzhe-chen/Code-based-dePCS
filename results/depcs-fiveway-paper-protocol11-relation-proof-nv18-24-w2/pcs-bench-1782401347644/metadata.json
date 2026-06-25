@@ -1,0 +1,12 @@
+{
+  "run_kind": "pcs-benchmark",
+  "run_id": 1782401347644,
+  "polynomial_lengths": [4194304],
+  "workers": [2],
+  "cores_per_worker": 10,
+  "pcs_queries": 1,
+  "security_bits": 100,
+  "repeats": 1,
+  "records": 1,
+  "elapsed_seconds": 3.583608
+}

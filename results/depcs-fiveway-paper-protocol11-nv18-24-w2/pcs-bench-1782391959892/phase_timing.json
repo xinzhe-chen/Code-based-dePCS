@@ -1,0 +1,34 @@
+[
+  {
+    "phase": "job",
+    "scope": "runner=paper-network-protocol11 opening=protocol11 nv=19 workers=2 trial=1",
+    "elapsed_ms": 1494.3962,
+    "commit_ms": 799.406,
+    "open_ms": 596.6708,
+    "verify_ms": 98.3194
+  },
+  {
+    "phase": "paper_worker_commit",
+    "scope": "runner=paper-network-protocol11 opening=protocol11 nv=19 workers=2 trial=1",
+    "elapsed_ms": 799.406,
+    "commit_ms": 0.0,
+    "open_ms": 0.0,
+    "verify_ms": 0.0
+  },
+  {
+    "phase": "paper_protocol11_open",
+    "scope": "runner=paper-network-protocol11 opening=protocol11 nv=19 workers=2 trial=1",
+    "elapsed_ms": 596.6708,
+    "commit_ms": 0.0,
+    "open_ms": 0.0,
+    "verify_ms": 0.0
+  },
+  {
+    "phase": "paper_protocol11_verify",
+    "scope": "runner=paper-network-protocol11 opening=protocol11 nv=19 workers=2 trial=1",
+    "elapsed_ms": 98.3194,
+    "commit_ms": 0.0,
+    "open_ms": 0.0,
+    "verify_ms": 0.0
+  }
+]

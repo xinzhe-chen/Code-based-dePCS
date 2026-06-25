@@ -1,0 +1,108 @@
+[package]
+name = "ligesis-pcs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arithmetic = { path = "../arithmetic" }
+deNetwork = { path = "../deNetwork" }
+transcript = { path = "../transcript" }
+util = { path = "../util" }
+
+ark-bls12-381 = { version = "0.4.0", default-features = false, features = ["curve"] }
+ark-ec = { version = "^0.4.0", default-features = false }
+ark-ff = { version = "^0.4.0", default-features = false, features = ["asm", "std"] }
+ark-poly = { version = "^0.4.0", default-features = false, features = ["std"] }
+ark-serialize = { version = "^0.4.0", default-features = false, features = ["std"] }
+ark-std = { version = "^0.4.0", default-features = false, features = ["std"] }
+
+derivative = { version = "2", features = ["use_core"] }
+displaydoc = { version = "0.2.3", default-features = false }
+itertools = "0.11.0"
+rand = "0.8.5"
+rand_chacha = { version = "0.3.0", default-features = false }
+rand_core = "0.6.4"
+serde = { version = "1.0.209", features = ["derive"] }
+sha2 = { version = "0.10.9" }
+
+[features]
+default = []
+debug = []
+print-trace = [
+    "arithmetic/print-trace",
+    "ark-std/print-trace",
+]
+
+[dev-dependencies]
+ark-bn254 = { version = "0.4.0", features = ["asm"] }
+clap = { version = "4", features = ["derive"] }
+
+# winterfell dependencies for dFrittata
+winter-fri = { path = "../external/winterfell/fri", features = ["std"] }
+winter-crypto = { path = "../external/winterfell/crypto", features = ["std"] }
+winter-math = { path = "../external/winterfell/math", features = ["std"] }
+winter-utils = { path = "../external/winterfell/utils/core", features = ["std"] }
+winter-rand-utils = { path = "../external/winterfell/utils/rand" }
+
+[[example]]
+name = "dLigesis"
+path = "dTests/dLigesis.rs"
+
+[[example]]
+name = "dDeepFold"
+path = "dTests/dDeepFold.rs"
+
+[[example]]
+name = "dDeepFoldBatch"
+path = "dTests/dDeepFoldBatch.rs"
+
+[[example]]
+name = "dMerkle"
+path = "dTests/dMerkle.rs"
+
+[[example]]
+name = "dChunkedBatch"
+path = "dTests/dChunkedBatch.rs"
+
+[[example]]
+name = "dMultiChunkedBatchBench"
+path = "dTests/dMultiChunkedBatchBench.rs"
+
+[[example]]
+name = "dMultiChunkedBatchProfile"
+path = "dTests/dMultiChunkedBatchProfile.rs"
+
+[[example]]
+name = "dNetworkBench"
+path = "dTests/dNetworkBench.rs"
+
+[[example]]
+name = "dSumcheck"
+path = "dTests/dSumcheck.rs"
+
+[[example]]
+name = "dFrittata"
+path = "dTests/dFrittata.rs"
+
+[[bench]]
+name = "ligesis_bench"
+harness = false
+
+[[bench]]
+name = "deepfold_bench"
+harness = false
+
+[[bench]]
+name = "sis_hash_bench"
+harness = false
+
+[[bench]]
+name = "fft_bench"
+harness = false
+
+[[bench]]
+name = "ligero_bench"
+harness = false
+
+[lints.rust]
+warnings = "allow"

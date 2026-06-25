@@ -14,23 +14,19 @@ if not "%choice%"=="1" (
   goto menu
 )
 
-set "runner="
-set "opening=compact"
+set "runner=local-network"
+set "opening=protocol11"
 set "n_min=8"
 set "n_max=10"
-set "worker_min=0"
+set "worker_min=1"
 set "worker_max=2"
 set "pcs_queries=1"
 
-set /p "runner=runner local^|network^|both: "
-if not "%runner%"=="local" if not "%runner%"=="network" if not "%runner%"=="both" (
-  echo expected one of: local network both
-  goto menu
-)
-set /p "opening=opening compact^|full^|both [compact]: "
-if "%opening%"=="" set "opening=compact"
-if not "%opening%"=="compact" if not "%opening%"=="full" if not "%opening%"=="both" (
-  echo expected one of: compact full both
+echo runner local-network
+set /p "opening=opening protocol11 [protocol11]: "
+if "%opening%"=="" set "opening=protocol11"
+if not "%opening%"=="protocol11" (
+  echo expected: protocol11
   goto menu
 )
 set /p "n_min=minimum PCS size exponent n for N=2^n: "

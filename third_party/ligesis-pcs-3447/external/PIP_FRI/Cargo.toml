@@ -1,0 +1,19 @@
+[workspace]
+
+members = [
+  "utils",
+  "fri",
+  "polyfrim",
+  "pip_fri",
+  "de_pip_fri",
+  "virgo",
+  "deepfold",
+]
+
+[patch.crates-io]
+ark-ff = { git = "https://github.com/zhaowenlan1779/algebra", branch = "optimize" }
+ark-serialize = { git = "https://github.com/zhaowenlan1779/algebra", branch = "optimize" }
+ark-relations = { git = "https://github.com/zhaowenlan1779/snark", branch = "optimize" }
+
+[profile.release]
+lto = "fat"

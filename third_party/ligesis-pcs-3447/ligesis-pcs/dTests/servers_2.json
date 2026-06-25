@@ -1,0 +1,11 @@
+{
+    "servers": [
+        {"name": "node-1",  "host": "10.128.0.48"},
+        {"name": "node-2",  "host": "10.128.0.49"},
+    ],
+    "zone": "us-central1-a",
+    "project": "",
+    "user": "louhc",
+    "remote_dir": "~/ligesis-pcs",
+    "network_port": 18000
+}

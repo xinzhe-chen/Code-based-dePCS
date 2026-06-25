@@ -1,0 +1,25 @@
+{
+    "servers": [
+        {"name": "node-1",  "host": "10.128.0.48"},
+        {"name": "node-2",  "host": "10.128.0.49"},
+        {"name": "node-3",  "host": "10.128.0.50"},
+        {"name": "node-4",  "host": "10.128.0.51"},
+        {"name": "node-5",  "host": "10.128.0.52"},
+        {"name": "node-6",  "host": "10.128.0.53"},
+        {"name": "node-7",  "host": "10.128.0.54"},
+        {"name": "node-8",  "host": "10.128.0.55"},
+        {"name": "node-9",  "host": "10.128.0.56"},
+        {"name": "node-10", "host": "10.128.0.57"},
+        {"name": "node-11", "host": "10.128.0.58"},
+        {"name": "node-12", "host": "10.128.0.59"},
+        {"name": "node-13", "host": "10.128.0.60"},
+        {"name": "node-14", "host": "10.128.0.61"},
+        {"name": "node-15", "host": "10.128.0.62"},
+        {"name": "node-16", "host": "10.128.0.63"}
+    ],
+    "zone": "us-central1-a",
+    "project": "",
+    "user": "louhc",
+    "remote_dir": "~/ligesis-pcs",
+    "network_port": 18000
+}

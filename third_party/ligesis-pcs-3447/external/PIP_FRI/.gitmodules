@@ -1,0 +1,24 @@
+[submodule "local_dep/local_dep/algebra"]
+	path = local_dep/local_dep/algebra
+	url = https://github.com/zhaowenlan1779/algebra
+	branch = optimize
+[submodule "local_dep/local_dep/curves"]
+	path = local_dep/local_dep/curves
+	url = https://github.com/zhaowenlan1779/curves
+	branch = optimize
+[submodule "local_dep/local_dep/snark"]
+	path = local_dep/local_dep/snark
+	url = https://github.com/zhaowenlan1779/snark
+	branch = optimize
+[submodule "local_dep/algebra"]
+	path = local_dep/algebra
+	url = https://github.com/zhaowenlan1779/algebra
+	branch = optimize
+[submodule "local_dep/curves"]
+	path = local_dep/curves
+	url = https://github.com/zhaowenlan1779/curves
+	branch = optimize
+[submodule "local_dep/snark"]
+	path = local_dep/snark
+	url = https://github.com/zhaowenlan1779/snark
+	branch = optimize
