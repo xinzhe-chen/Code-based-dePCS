@@ -1,0 +1,12 @@
+# dePCS benchmark summary
+
+- polynomial_lengths: [4194304]
+- workers: [2]
+- cores_per_worker: 10
+- pcs_queries: 1
+- security_bits: 100
+- repeats: 1
+
+| opening | nv | polynomial length N | workers | commit ms | open ms | verify ms | proof KiB | send+recv KiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| protocol11 | 22 | 4194304 | 2 | 1294.165 | 786.452 | 9.655 | 795.23 | 788.26 |

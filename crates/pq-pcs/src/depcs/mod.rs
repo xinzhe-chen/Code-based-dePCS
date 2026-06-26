@@ -1,7 +1,7 @@
 //! Artifact-backed dePCS implementation.
 //!
 //! The submodules mirror Protocol 6 through Protocol 11 from
-//! `Doc/pq_dSNARK.pdf`. This refactor is intentionally structural: public CLI,
+//! `Doc/papers/pq_dSNARK.pdf`. This refactor is intentionally structural: public CLI,
 //! benchmark CSV fields, transcript labels, proof serialization, timing points,
 //! and communication accounting stay unchanged.
 

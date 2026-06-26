@@ -30,106 +30,39 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
-      - name: Windows interactive script smoke
+      - name: Windows benchmark script smoke
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $smoke = @("0") | .\scripts\interactive-powershell.cmd -NoPause 2>&1 | Out-String
-          $smoke
-          if ($LASTEXITCODE -ne 0) { throw "PowerShell interactive menu exit smoke failed" }
-          $generated = Resolve-Path .\target\windows\interactive-powershell.generated.ps1
-          $errors = $null
-          $tokens = $null
-          [System.Management.Automation.Language.Parser]::ParseFile($generated, [ref]$tokens, [ref]$errors) | Out-Null
-          if ($errors.Count -gt 0) { $errors | ForEach-Object { $_.Message }; throw "Embedded PowerShell payload parse failed" }
-          if ($smoke -notmatch "pq_dSNARK interactive entrypoint") { throw "PowerShell menu did not render" }
-          if ($smoke -notmatch "1\. Environment setup/check" -or $smoke -notmatch "3\. Verify experiments" -or $smoke -notmatch "4\. Performance benchmark") { throw "PowerShell menu did not expose the simplified top-level actions" }
-          if ($smoke -match "== Proof Experiment Wizard ==|== Performance Benchmark Wizard ==|== Verify Experiments Wizard ==|\[pq_dSNARK\] building|cargo build") { throw "PowerShell menu exit triggered a predetermined experiment" }
+          $menu = "0" | cmd /c "scripts\pcs-benchmark-powershell.cmd" 2>&1 | Out-String
+          $menu
+          if ($LASTEXITCODE -ne 0) { throw "benchmark menu exit smoke failed" }
+          if ($menu -notmatch "Distributed Brakedown PCS benchmark") { throw "benchmark menu title missing" }
+          if ($menu -notmatch "Run PCS benchmark") { throw "benchmark menu run option missing" }
 
-      - name: Windows network benchmark smoke
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cargo run -p pq-experiments --release -- benchmark --runner network --n-range "2..2" --workers "1,2" --pcs-queries 1 --out results
-          $latest = Get-ChildItem -LiteralPath results -Directory -Filter "bench-*" | Sort-Object Name | Select-Object -Last 1
-          if ($null -eq $latest) { throw "benchmark did not create a results directory" }
-          if ($latest.Name -notmatch '^bench-\d{8}-\d{6}-performance') { throw "performance benchmark directory name is not timestamped with performance suffix" }
-          if (-not (Test-Path -LiteralPath (Join-Path $latest.FullName "overview.html"))) { throw "overview.html missing" }
-          if (-not (Test-Path -LiteralPath (Join-Path $latest.FullName "proofs\index.json"))) { throw "stored proof index missing" }
-          $verify = cargo run -p pq-experiments -- verify-results $latest.FullName --format json
-          $verify
-          if ($verify -notmatch '"files_checked":27') { throw "verify-results did not include benchmark proof bundles in manifest verification" }
-          if ($verify -notmatch '"source_rows_checked":4') { throw "semantic source row check missing from verify-results output" }
-          if ($verify -notmatch '"phase_rows_checked":11') { throw "semantic phase row check missing from verify-results output" }
-          if ($verify -notmatch '"summary_rows_checked":4') { throw "semantic summary row check missing from verify-results output" }
-          $proofs = cargo run -p pq-experiments -- list-proofs --results results --format json
-          $proofs
-          if ($proofs -notmatch '"proof_count":4') { throw "list-proofs did not detect benchmark proof bundles" }
-          $proofVerify = cargo run -p pq-experiments -- verify-proof $latest.FullName --all --format json
-          $proofVerify
-          if ($proofVerify -notmatch '"verified":4') { throw "verify-proof did not verify every stored proof" }
-          if (-not (Test-Path -LiteralPath (Join-Path $latest.FullName "verifications"))) { throw "verify-proof report directory missing" }
-          $verifyAfter = cargo run -p pq-experiments -- verify-results $latest.FullName --format json
-          if ($verifyAfter -notmatch '"files_checked":27') { throw "extra proof verification polluted benchmark manifest verification" }
-
-      - name: Bash interactive script smoke
+      - name: Bash benchmark script smoke
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          bash -n scripts/interactive-linux.sh
-          bash -n scripts/interactive-macos.sh
-          linux_output="$(echo 0 | bash scripts/interactive-linux.sh 2>&1)"
-          printf '%s\n' "$linux_output"
-          grep -q 'pq_dSNARK interactive entrypoint' <<< "$linux_output"
-          grep -q '1. Environment setup/check' <<< "$linux_output"
-          grep -q '3. Verify experiments' <<< "$linux_output"
-          grep -q '4. Performance benchmark' <<< "$linux_output"
-          ! grep -Eq '== Proof Experiment Wizard ==|== Performance Benchmark Wizard ==|== Verify Experiments Wizard ==|\[pq_dSNARK\] building|cargo build' <<< "$linux_output"
-          macos_output="$(echo 0 | bash scripts/interactive-macos.sh 2>&1)"
-          printf '%s\n' "$macos_output"
-          grep -q 'pq_dSNARK interactive entrypoint' <<< "$macos_output"
-          grep -q '1. Environment setup/check' <<< "$macos_output"
-          grep -q '3. Verify experiments' <<< "$macos_output"
-          grep -q '4. Performance benchmark' <<< "$macos_output"
-          ! grep -Eq '== Proof Experiment Wizard ==|== Performance Benchmark Wizard ==|== Verify Experiments Wizard ==|\[pq_dSNARK\] building|cargo build' <<< "$macos_output"
+          bash -n scripts/pcs-benchmark-linux.sh
+          bash -n scripts/pcs-benchmark-macos.sh
+          menu="$(printf '0\n' | bash scripts/pcs-benchmark-linux.sh 2>&1)"
+          printf '%s\n' "$menu"
+          grep -q 'Distributed Brakedown PCS benchmark' <<< "$menu"
+          grep -q 'Run PCS benchmark' <<< "$menu"
 
-      - name: macOS quick smoke
-        if: runner.os == 'macOS'
+      - name: dePCS benchmark + verify smoke
         shell: bash
         run: |
-          quick_output="$(cargo run -p pq-experiments -- quick-smoke --out target/quick-smoke)"
-          printf '%s\n' "$quick_output"
-          grep -q '"ok":true' <<< "$quick_output"
-          grep -q '"source_rows_checked":2' <<< "$quick_output"
-          grep -q '"proofs_verified":2' <<< "$quick_output"
-          grep -q '"verify_report_html"' <<< "$quick_output"
-
-      - name: Linux benchmark smoke
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          cargo run -p pq-experiments --release -- benchmark --runner network --n-range 2..2 --workers 1,2 --pcs-queries 1 --out results
+          cargo run -p pq-experiments --release -- pcs-benchmark \
+            --opening protocol11 --backend deepfold --nv-values 10 --workers 2 \
+            --no-pcs-warmup --out results
           latest=""
-          for dir in results/bench-*; do
+          for dir in results/pcs-bench-*; do
             test -d "$dir" || continue
             latest="$dir"
           done
           test -n "$latest"
-          [[ "${latest##*/}" =~ ^bench-[0-9]{8}-[0-9]{6}-performance ]]
-          test -f "$latest/overview.html"
-          test -f "$latest/proofs/index.json"
-          verify_output="$(cargo run -p pq-experiments -- verify-results "$latest" --format json)"
+          verify_output="$(cargo run -p pq-experiments --release -- verify-pcs-results --dir "$latest" --format json)"
           printf '%s\n' "$verify_output"
-          grep -q '"files_checked":27' <<< "$verify_output"
-          grep -q '"source_rows_checked":4' <<< "$verify_output"
-          grep -q '"phase_rows_checked":11' <<< "$verify_output"
-          grep -q '"summary_rows_checked":4' <<< "$verify_output"
-          proofs_output="$(cargo run -p pq-experiments -- list-proofs --results results --format json)"
-          printf '%s\n' "$proofs_output"
-          grep -q '"proof_count":4' <<< "$proofs_output"
-          proof_verify_output="$(cargo run -p pq-experiments -- verify-proof "$latest" --all --format json)"
-          printf '%s\n' "$proof_verify_output"
-          grep -q '"verified":4' <<< "$proof_verify_output"
-          test -d "$latest/verifications"
-          verify_after="$(cargo run -p pq-experiments -- verify-results "$latest" --format json)"
-          grep -q '"files_checked":27' <<< "$verify_after"
+          grep -q '"ok":true' <<< "$verify_output"

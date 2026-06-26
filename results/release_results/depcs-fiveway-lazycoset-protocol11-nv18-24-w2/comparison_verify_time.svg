@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="1280" viewBox="0 0 980 1280">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="24" y="32" font-family="Arial" font-size="18" fill="#111827">dePCS BaseFold vs DeepFold vs external PCS verify time</text>
+<text x="24" y="54" font-family="Arial" font-size="12" fill="#4b5563">Verifier time by nv and node count; blocked external rows are omitted.</text>
+<text x="24" y="101" font-family="Arial" font-size="12" fill="#111827">LigeSIS dLigesis nodes=2 nv=18</text>
+<rect x="260" y="84" width="80.4" height="20" fill="#d97706"/>
+<text x="348.4" y="99" font-family="Arial" font-size="12" fill="#111827">14.461 ms</text>
+<text x="24" y="135" font-family="Arial" font-size="12" fill="#111827">dFRIttata-PCS nodes=2 nv=18</text>
+<rect x="260" y="118" width="46.7" height="20" fill="#d97706"/>
+<text x="314.7" y="133" font-family="Arial" font-size="12" fill="#111827">8.408 ms</text>
+<text x="24" y="169" font-family="Arial" font-size="12" fill="#111827">dPIP-FRI-PCS nodes=2 nv=18</text>
+<rect x="260" y="152" width="8.6" height="20" fill="#d97706"/>
+<text x="276.6" y="167" font-family="Arial" font-size="12" fill="#111827">1.541 ms</text>
+<text x="24" y="203" font-family="Arial" font-size="12" fill="#111827">dePCS_Basefold nodes=2 nv=18</text>
+<rect x="260" y="186" width="48.7" height="20" fill="#2563eb"/>
+<text x="316.7" y="201" font-family="Arial" font-size="12" fill="#111827">8.756 ms</text>
+<text x="24" y="237" font-family="Arial" font-size="12" fill="#111827">dePCS_Deepfold nodes=2 nv=18</text>
+<rect x="260" y="220" width="34.3" height="20" fill="#2563eb"/>
+<text x="302.3" y="235" font-family="Arial" font-size="12" fill="#111827">6.166 ms</text>
+<text x="24" y="271" font-family="Arial" font-size="12" fill="#111827">LigeSIS dLigesis nodes=2 nv=19</text>
+<rect x="260" y="254" width="106.8" height="20" fill="#d97706"/>
+<text x="374.8" y="269" font-family="Arial" font-size="12" fill="#111827">19.209 ms</text>
+<text x="24" y="305" font-family="Arial" font-size="12" fill="#111827">dFRIttata-PCS nodes=2 nv=19</text>
+<rect x="260" y="288" width="54.6" height="20" fill="#d97706"/>
+<text x="322.6" y="303" font-family="Arial" font-size="12" fill="#111827">9.824 ms</text>
+<text x="24" y="339" font-family="Arial" font-size="12" fill="#111827">dPIP-FRI-PCS nodes=2 nv=19</text>
+<rect x="260" y="322" width="13.0" height="20" fill="#d97706"/>
+<text x="281.0" y="337" font-family="Arial" font-size="12" fill="#111827">2.344 ms</text>
+<text x="24" y="373" font-family="Arial" font-size="12" fill="#111827">dePCS_Basefold nodes=2 nv=19</text>
+<rect x="260" y="356" width="53.9" height="20" fill="#2563eb"/>
+<text x="321.9" y="371" font-family="Arial" font-size="12" fill="#111827">9.703 ms</text>
+<text x="24" y="407" font-family="Arial" font-size="12" fill="#111827">dePCS_Deepfold nodes=2 nv=19</text>
+<rect x="260" y="390" width="39.5" height="20" fill="#2563eb"/>
+<text x="307.5" y="405" font-family="Arial" font-size="12" fill="#111827">7.108 ms</text>
+<text x="24" y="441" font-family="Arial" font-size="12" fill="#111827">LigeSIS dLigesis nodes=2 nv=20</text>
+<rect x="260" y="424" width="153.8" height="20" fill="#d97706"/>
+<text x="421.8" y="439" font-family="Arial" font-size="12" fill="#111827">27.657 ms</text>
+<text x="24" y="475" font-family="Arial" font-size="12" fill="#111827">dFRIttata-PCS nodes=2 nv=20</text>
+<rect x="260" y="458" width="61.2" height="20" fill="#d97706"/>
+<text x="329.2" y="473" font-family="Arial" font-size="12" fill="#111827">11.006 ms</text>
+<text x="24" y="509" font-family="Arial" font-size="12" fill="#111827">dPIP-FRI-PCS nodes=2 nv=20</text>
+<rect x="260" y="492" width="11.0" height="20" fill="#d97706"/>
+<text x="279.0" y="507" font-family="Arial" font-size="12" fill="#111827">1.972 ms</text>
+<text x="24" y="543" font-family="Arial" font-size="12" fill="#111827">dePCS_Basefold nodes=2 nv=20</text>
+<rect x="260" y="526" width="62.2" height="20" fill="#2563eb"/>
+<text x="330.2" y="541" font-family="Arial" font-size="12" fill="#111827">11.185 ms</text>
+<text x="24" y="577" font-family="Arial" font-size="12" fill="#111827">dePCS_Deepfold nodes=2 nv=20</text>
+<rect x="260" y="560" width="45.2" height="20" fill="#2563eb"/>
+<text x="313.2" y="575" font-family="Arial" font-size="12" fill="#111827">8.136 ms</text>
+<text x="24" y="611" font-family="Arial" font-size="12" fill="#111827">LigeSIS dLigesis nodes=2 nv=21</text>
+<rect x="260" y="594" width="213.8" height="20" fill="#d97706"/>
+<text x="481.8" y="609" font-family="Arial" font-size="12" fill="#111827">38.458 ms</text>
+<text x="24" y="645" font-family="Arial" font-size="12" fill="#111827">dFRIttata-PCS nodes=2 nv=21</text>
+<rect x="260" y="628" width="66.2" height="20" fill="#d97706"/>
+<text x="334.2" y="643" font-family="Arial" font-size="12" fill="#111827">11.901 ms</text>
+<text x="24" y="679" font-family="Arial" font-size="12" fill="#111827">dPIP-FRI-PCS nodes=2 nv=21</text>
+<rect x="260" y="662" width="13.9" height="20" fill="#d97706"/>
+<text x="281.9" y="677" font-family="Arial" font-size="12" fill="#111827">2.504 ms</text>
+<text x="24" y="713" font-family="Arial" font-size="12" fill="#111827">dePCS_Basefold nodes=2 nv=21</text>
+<rect x="260" y="696" width="66.3" height="20" fill="#2563eb"/>
+<text x="334.3" y="711" font-family="Arial" font-size="12" fill="#111827">11.933 ms</text>
+<text x="24" y="747" font-family="Arial" font-size="12" fill="#111827">dePCS_Deepfold nodes=2 nv=21</text>
+<rect x="260" y="730" width="49.4" height="20" fill="#2563eb"/>
+<text x="317.4" y="745" font-family="Arial" font-size="12" fill="#111827">8.889 ms</text>
+<text x="24" y="781" font-family="Arial" font-size="12" fill="#111827">LigeSIS dLigesis nodes=2 nv=22</text>
+<rect x="260" y="764" width="313.1" height="20" fill="#d97706"/>
+<text x="581.1" y="779" font-family="Arial" font-size="12" fill="#111827">56.317 ms</text>
+<text x="24" y="815" font-family="Arial" font-size="12" fill="#111827">dFRIttata-PCS nodes=2 nv=22</text>
+<rect x="260" y="798" width="74.6" height="20" fill="#d97706"/>
+<text x="342.6" y="813" font-family="Arial" font-size="12" fill="#111827">13.414 ms</text>
+<text x="24" y="849" font-family="Arial" font-size="12" fill="#111827">dPIP-FRI-PCS nodes=2 nv=22</text>
+<rect x="260" y="832" width="14.0" height="20" fill="#d97706"/>
+<text x="282.0" y="847" font-family="Arial" font-size="12" fill="#111827">2.525 ms</text>
+<text x="24" y="883" font-family="Arial" font-size="12" fill="#111827">dePCS_Basefold nodes=2 nv=22</text>
+<rect x="260" y="866" width="76.5" height="20" fill="#2563eb"/>
+<text x="344.5" y="881" font-family="Arial" font-size="12" fill="#111827">13.766 ms</text>
+<text x="24" y="917" font-family="Arial" font-size="12" fill="#111827">dePCS_Deepfold nodes=2 nv=22</text>
+<rect x="260" y="900" width="53.7" height="20" fill="#2563eb"/>
+<text x="321.7" y="915" font-family="Arial" font-size="12" fill="#111827">9.655 ms</text>
+<text x="24" y="951" font-family="Arial" font-size="12" fill="#111827">LigeSIS dLigesis nodes=2 nv=23</text>
+<rect x="260" y="934" width="468.0" height="20" fill="#d97706"/>
+<text x="736.0" y="949" font-family="Arial" font-size="12" fill="#111827">84.179 ms</text>
+<text x="24" y="985" font-family="Arial" font-size="12" fill="#111827">dFRIttata-PCS nodes=2 nv=23</text>
+<rect x="260" y="968" width="76.7" height="20" fill="#d97706"/>
+<text x="344.7" y="983" font-family="Arial" font-size="12" fill="#111827">13.804 ms</text>
+<text x="24" y="1019" font-family="Arial" font-size="12" fill="#111827">dPIP-FRI-PCS nodes=2 nv=23</text>
+<rect x="260" y="1002" width="15.9" height="20" fill="#d97706"/>
+<text x="283.9" y="1017" font-family="Arial" font-size="12" fill="#111827">2.867 ms</text>
+<text x="24" y="1053" font-family="Arial" font-size="12" fill="#111827">dePCS_Basefold nodes=2 nv=23</text>
+<rect x="260" y="1036" width="121.5" height="20" fill="#2563eb"/>
+<text x="389.5" y="1051" font-family="Arial" font-size="12" fill="#111827">21.846 ms</text>
+<text x="24" y="1087" font-family="Arial" font-size="12" fill="#111827">dePCS_Deepfold nodes=2 nv=23</text>
+<rect x="260" y="1070" width="61.2" height="20" fill="#2563eb"/>
+<text x="329.2" y="1085" font-family="Arial" font-size="12" fill="#111827">11.015 ms</text>
+<text x="24" y="1121" font-family="Arial" font-size="12" fill="#111827">LigeSIS dLigesis nodes=2 nv=24</text>
+<rect x="260" y="1104" width="640.0" height="20" fill="#d97706"/>
+<text x="908.0" y="1119" font-family="Arial" font-size="12" fill="#111827">115.111 ms</text>
+<text x="24" y="1155" font-family="Arial" font-size="12" fill="#111827">dFRIttata-PCS nodes=2 nv=24</text>
+<rect x="260" y="1138" width="84.2" height="20" fill="#d97706"/>
+<text x="352.2" y="1153" font-family="Arial" font-size="12" fill="#111827">15.149 ms</text>
+<text x="24" y="1189" font-family="Arial" font-size="12" fill="#111827">dPIP-FRI-PCS nodes=2 nv=24</text>
+<rect x="260" y="1172" width="17.4" height="20" fill="#d97706"/>
+<text x="285.4" y="1187" font-family="Arial" font-size="12" fill="#111827">3.132 ms</text>
+<text x="24" y="1223" font-family="Arial" font-size="12" fill="#111827">dePCS_Basefold nodes=2 nv=24</text>
+<rect x="260" y="1206" width="110.7" height="20" fill="#2563eb"/>
+<text x="378.7" y="1221" font-family="Arial" font-size="12" fill="#111827">19.917 ms</text>
+<text x="24" y="1257" font-family="Arial" font-size="12" fill="#111827">dePCS_Deepfold nodes=2 nv=24</text>
+<rect x="260" y="1240" width="78.8" height="20" fill="#2563eb"/>
+<text x="346.8" y="1255" font-family="Arial" font-size="12" fill="#111827">14.165 ms</text>
+</svg>

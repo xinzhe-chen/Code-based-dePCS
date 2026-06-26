@@ -1,7 +1,7 @@
 //! Protocol 11: Distributed Brakedown.
 //!
 //! This module implements the end-to-end distributed dePCS flow from
-//! `Doc/pq_dSNARK.pdf`, Protocol 11. The worker-id prefix of the opening point
+//! `Doc/papers/pq_dSNARK.pdf`, Protocol 11. The worker-id prefix of the opening point
 //! corresponds to `s1`; the shard-local suffix corresponds to `s2`. Worker
 //! openings carry the local PCS proof, and the master assembles the global
 //! claim plus two Protocol 10 encoding relations for `E1 = Enc(F1)` and

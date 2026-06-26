@@ -7,7 +7,7 @@ arithmetization, and sumcheck structure should be ported from these sources.
 ## Spartan2
 
 - Upstream: `https://github.com/microsoft/Spartan2.git`
-- Local path: `third_party/Spartan2`
+- Local path: `third_party/references/Spartan2`
 - Pinned commit: `0d4f1409e8f30536b8b25ed3f81bc446ed717e61`
 - License: MIT
 - Intended use: R1CS frontend, Spartan-style sumcheck organization, and
@@ -21,7 +21,7 @@ arithmetization, and sumcheck structure should be ported from these sources.
 ## HyperPlonk
 
 - Upstream: `https://github.com/EspressoSystems/hyperplonk.git`
-- Local path: `third_party/hyperplonk`
+- Local path: `third_party/references/hyperplonk`
 - Pinned commit: `2a3b55c97ad8a5d6627108a2e7def2aeccb7f3b9`
 - License: MIT
 - Intended use: Plonkish arithmetization, gate/permutation PIOP structure, and

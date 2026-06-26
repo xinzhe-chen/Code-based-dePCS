@@ -7,7 +7,7 @@ symbol-level port is completed.
 
 ## Spartan2
 
-- Pin: `third_party/Spartan2` at
+- Pin: `third_party/references/Spartan2` at
   `0d4f1409e8f30536b8b25ed3f81bc446ed717e61`.
 - License: MIT.
 - Referenced structure:
@@ -22,7 +22,7 @@ symbol-level port is completed.
   - `crates/pq-piop-r1cs` owns the distributed Spartan-style adapter and
     Spark-like multiset checks.
 - Source-level ports completed:
-  - `third_party/Spartan2/src/r1cs/sparse.rs::PrecomputedSparseMatrix`
+  - `third_party/references/Spartan2/src/r1cs/sparse.rs::PrecomputedSparseMatrix`
     coefficient bucketing has been ported to
     `crates/pq-core/src/matrix.rs::PrecomputedSparseMatrix`. The local version
     keeps the same semantic buckets (`+1`, `-1`, signed small coefficients
@@ -38,7 +38,7 @@ symbol-level port is completed.
 
 ## HyperPlonk
 
-- Pin: `third_party/hyperplonk` at
+- Pin: `third_party/references/hyperplonk` at
   `2a3b55c97ad8a5d6627108a2e7def2aeccb7f3b9`.
 - License: MIT.
 - Referenced structure:
@@ -52,14 +52,14 @@ symbol-level port is completed.
   - `crates/pq-piop-plonkish` has the executable gate plus permutation PIOP
     adapter used by the experiment CLI.
 - Source-level ports completed:
-  - `third_party/hyperplonk/hyperplonk/src/custom_gate.rs::CustomizedGates`
+  - `third_party/references/hyperplonk/hyperplonk/src/custom_gate.rs::CustomizedGates`
     vanilla Plonk gate representation has been ported to
     `crates/pq-core/src/plonkish.rs::CustomizedGate`. The local executable
     path now evaluates row constraints through the ported monomial evaluator,
-    following `third_party/hyperplonk/hyperplonk/src/utils.rs::eval_f`.
+    following `third_party/references/hyperplonk/hyperplonk/src/utils.rs::eval_f`.
     Tests check the vanilla gate degree, selector/witness counts, monomial
     count, and equality with direct Plonk row evaluation.
-  - `third_party/hyperplonk/hyperplonk/src/utils.rs::eval_perm_gate` product
+  - `third_party/references/hyperplonk/hyperplonk/src/utils.rs::eval_perm_gate` product
     factors `w + beta * id + gamma` and `w + beta * perm + gamma` have been
     ported to `crates/pq-piop-plonkish/src/lib.rs` as
     `hyperplonk_permutation_products`. The current accumulator proof uses this

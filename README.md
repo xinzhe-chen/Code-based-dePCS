@@ -1,7 +1,7 @@
 # pq_dSNARK dePCS
 
 This repository is now focused on the transparent distributed polynomial
-commitment scheme (dePCS) from `Doc/pq_dSNARK.pdf`, Chapter 4.
+commitment scheme (dePCS) from `Doc/papers/pq_dSNARK.pdf`, Chapter 4.
 
 The implementation keeps the PCS layer explicit:
 
@@ -69,7 +69,7 @@ default local command below is a scaled reproduction that uses `nv=14..18`
 to stay within the 15 minute deadline.
 
 ```bash
-python crates/pq-experiments/scripts/depcs-ligesis-compare.py \
+python scripts/depcs-ligesis-compare.py \
   --out results/depcs-ligesis-nv14-18-workers2-4-8-16 \
   --depcs-nv-range 14..18 \
   --depcs-workers 2,4,8,16 \
@@ -86,7 +86,7 @@ By default the comparison script attempts `depcs-basefold-batch`
 DeepFold backend failures are treated as experiment failures rather than being
 silently omitted. The DeepFold path uses the local Arkworks-compatible
 Goldilocks RS/FFT core with rate-1/4 query-policy transcript binding; details
-and soundness notes are tracked in `Doc/pcs_batch_backend_soundness.md`.
+and soundness notes are tracked in `Doc/audits/pcs_batch_backend_soundness.md`.
 Older `deepfold:2` artifacts are legacy rate-1/2 runs and should not be mixed
 into the default rate-1/4 comparison series.
 
@@ -136,7 +136,7 @@ provides 128-bit algebraic security by itself.
 
 ## Documentation
 
-- `Doc/pq_dSNARK.pdf`: paper under review.
-- `Doc/pcs_theory_audit.md`: PCS-theory notes and implementation audit.
-- `Doc/depcs_audit_report_v2.md`: current post-parity-check dePCS audit.
-- `Doc/LigeSIS.pdf`: LigeSIS comparison reference.
+- `Doc/papers/pq_dSNARK.pdf`: paper under review.
+- `Doc/audits/pcs_theory_audit.md`: PCS-theory notes and implementation audit.
+- `Doc/audits/depcs_audit_report_v2.md`: current post-parity-check dePCS audit.
+- `Doc/papers/LigeSIS.pdf`: LigeSIS comparison reference.
