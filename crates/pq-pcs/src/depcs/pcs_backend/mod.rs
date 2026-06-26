@@ -29,10 +29,13 @@ impl PreparedPaperProver {
     }
 
     pub(crate) fn open(
-        &self,
+        self,
         point: &[PaperField],
         evaluation: PaperField,
     ) -> PaperDepcsResult<PaperPcsOpeningProof> {
+        // Consume the prepared prover: `prove`/`generate_proof` mutate/consume it,
+        // and the worker cache is opened at most once, so taking ownership here
+        // avoids the O(domain) deep clone of the codeword + Merkle tree per open.
         match self {
             Self::BaseFold(prover) => Ok(basefold::open_prepared(prover, point, evaluation)),
             Self::DeepFold(prover) => deepfold::open_prepared(prover, point, evaluation),
@@ -118,6 +121,21 @@ pub(super) fn interpolate_cosets(nv: usize, code_rate_log: usize) -> Vec<Coset<P
     )];
     for index in 1..=nv {
         cosets.push(cosets[index - 1].pow(2));
+    }
+    cosets
+}
+
+/// Verifier-side coset chain that never materializes the O(domain) element
+/// tables. The artifact verifier only reads O(query * log N) sampled points via
+/// `element_at`/`element_inv_at`, so building the full domain (as the prover must
+/// for FFT folding) made verification Θ(N) instead of polylogarithmic.
+pub(super) fn interpolate_cosets_lazy(nv: usize, code_rate_log: usize) -> Vec<Coset<PaperField>> {
+    let mut cosets = vec![Coset::new_lazy(
+        1 << (nv + code_rate_log),
+        PaperField::from_int(1),
+    )];
+    for index in 1..=nv {
+        cosets.push(cosets[index - 1].pow_lazy(2));
     }
     cosets
 }

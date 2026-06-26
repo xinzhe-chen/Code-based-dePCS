@@ -7,7 +7,7 @@
 use paper_basefold::{prover as basefold_prover, verifier as basefold_verifier};
 use paper_util::{STEP, algebra::polynomial::MultilinearPolynomial, random_oracle::RandomOracle};
 
-use super::interpolate_cosets;
+use super::{interpolate_cosets, interpolate_cosets_lazy};
 use crate::depcs::types::*;
 
 pub(crate) fn prepare_prover(
@@ -22,11 +22,10 @@ pub(crate) fn prepare_prover(
 }
 
 pub(crate) fn open_prepared(
-    prover: &basefold_prover::Prover<PaperField>,
+    mut prover: basefold_prover::Prover<PaperField>,
     point: &[PaperField],
     evaluation: PaperField,
 ) -> PaperPcsOpeningProof {
-    let mut prover = prover.clone();
     prover.prove(&point.to_vec());
     PaperPcsOpeningProof::BaseFold(PaperBaseFoldProof {
         evaluation,
@@ -67,7 +66,7 @@ pub(crate) fn verify_opening(
     oracle: &RandomOracle<PaperField>,
     code_rate_log: usize,
 ) -> bool {
-    let cosets = interpolate_cosets(nv, code_rate_log);
+    let cosets = interpolate_cosets_lazy(nv, code_rate_log);
     let mut verifier = basefold_verifier::Verifier::new(nv, &cosets, *root, oracle, STEP);
     verifier.set_open_point(&opening.shard_point);
     verifier.set_evalutation(proof.evaluation);

@@ -7,7 +7,7 @@
 use paper_deepfold::{self, prover as deepfold_prover, verifier as deepfold_verifier};
 use paper_util::{STEP, algebra::polynomial::MultilinearPolynomial, random_oracle::RandomOracle};
 
-use super::interpolate_cosets;
+use super::{interpolate_cosets, interpolate_cosets_lazy};
 use crate::depcs::types::*;
 
 pub(crate) fn prepare_prover(
@@ -29,11 +29,11 @@ pub(crate) fn prepare_prover(
 }
 
 pub(crate) fn open_prepared(
-    prover: &deepfold_prover::Prover<PaperField>,
+    prover: deepfold_prover::Prover<PaperField>,
     point: &[PaperField],
     evaluation: PaperField,
 ) -> PaperDepcsResult<PaperPcsOpeningProof> {
-    let proof = prover.clone().generate_proof(point.to_vec());
+    let proof = prover.generate_proof(point.to_vec());
     if proof.evaluation != evaluation {
         return Err(PaperDepcsError::InvalidEvaluation);
     }
@@ -59,7 +59,7 @@ pub(crate) fn verify_opening(
     oracle: &RandomOracle<PaperField>,
     code_rate_log: usize,
 ) -> bool {
-    let cosets = interpolate_cosets(nv, code_rate_log);
+    let cosets = interpolate_cosets_lazy(nv, code_rate_log);
     let mut verifier =
         deepfold_verifier::Verifier::new(nv, &cosets, commitment.clone(), oracle, STEP);
     verifier.set_open_point(&opening.shard_point);

@@ -156,13 +156,15 @@ pub fn open_worker(
 }
 
 pub fn open_worker_cached(
-    cache: &PaperWorkerCache,
+    cache: PaperWorkerCache,
     commitment: &PaperProtocol11Commitment,
     point: &[PaperField],
 ) -> PaperDepcsResult<PaperProtocol11WorkerOpening> {
     // Eval steps 4-8, worker side with staged cache. This preserves the paper's
     // worker-local opening but avoids rebuilding the already prepared PCS state.
-    let input = prepare_cached_worker_opening_input(cache, commitment, point)?;
+    // The cache is consumed so the prepared prover is moved (not cloned) into the
+    // opening; each worker shard is opened at most once per commit.
+    let input = prepare_cached_worker_opening_input(&cache, commitment, point)?;
     let proof = cache.prepared.open(&input.shard_point, input.value)?;
     Ok(PaperProtocol11WorkerOpening {
         worker_id: input.worker_id,

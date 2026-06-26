@@ -637,8 +637,8 @@ fn serve_pcs_network_worker_stream(stream: &mut TcpStream) -> Result<(), CliErro
             }
             PcsWorkerRequest::PaperOpen { commitment, point } => {
                 let start = Instant::now();
-                if let Some(state) = &state {
-                    if let Some(cache) = &state.paper_cache {
+                if let Some(state) = state.as_mut() {
+                    if let Some(cache) = state.paper_cache.take() {
                         match depcs::open_worker_cached(cache, &commitment, &point) {
                             Ok(opening) => PcsWorkerResponse::PaperOpen {
                                 opening,

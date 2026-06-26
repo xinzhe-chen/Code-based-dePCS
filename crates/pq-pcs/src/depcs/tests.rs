@@ -94,7 +94,7 @@ fn paper_depcs_cached_worker_open_roundtrips() {
     .unwrap();
     let point = sample_point(commitment.nv);
     let openings = caches
-        .iter()
+        .into_iter()
         .map(|cache| open_worker_cached(cache, &commitment, &point).unwrap())
         .collect::<Vec<_>>();
     let (proof, _) = assemble_opening(&commitment, point, openings).unwrap();
@@ -111,5 +111,5 @@ fn paper_depcs_cached_worker_open_rejects_wrong_commitment() {
             .unwrap();
     commitment.workers_commitments[0].leaf_digest[0] ^= 1;
     let point = sample_point(commitment.nv);
-    assert!(open_worker_cached(&cache, &commitment, &point).is_err());
+    assert!(open_worker_cached(cache, &commitment, &point).is_err());
 }

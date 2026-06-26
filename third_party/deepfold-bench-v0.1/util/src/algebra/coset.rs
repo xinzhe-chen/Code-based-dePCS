@@ -139,6 +139,22 @@ impl<T: MyField> Coset<T> {
         }
     }
 
+    /// Construct a coset without materializing its element/inverse tables.
+    /// `element_at`/`element_inv_at` then compute points lazily as powers of the
+    /// domain generator. Use this on the verifier side, where only O(query*log)
+    /// points are ever read and the full O(order) tables are pure overhead.
+    /// The prover must keep using `new`, since folding scans the whole table.
+    pub fn new_lazy(order: usize, shift: T) -> Self {
+        assert!(!shift.is_zero());
+        let omega = T::get_generator(order);
+        Coset {
+            elements: Arc::new(Vec::new()),
+            elements_inv: Arc::new(Vec::new()),
+            fft_eval_domain: Radix2Domain::new(order, omega),
+            shift,
+        }
+    }
+
     pub fn order(&self) -> usize {
         self.fft_eval_domain.order
     }
@@ -149,16 +165,39 @@ impl<T: MyField> Coset<T> {
         Coset::new(self.order() / lowbit, self.shift.pow(index))
     }
 
+    /// Lazy analogue of `pow`: derive the squared/strided coset without building
+    /// its element tables, so a chain of lazy cosets stays allocation-free.
+    pub fn pow_lazy(&self, index: usize) -> Coset<T> {
+        assert_eq!(index & (index - 1), 0);
+        let lowbit = (index as i64 & (-(index as i64))) as usize;
+        Coset::new_lazy(self.order() / lowbit, self.shift.pow(index))
+    }
+
     pub fn generator(&self) -> T {
         self.fft_eval_domain.omega
     }
 
     pub fn element_at(&self, index: usize) -> T {
-        self.elements[index]
+        // Lazy cosets (built via `new_lazy`) carry no materialized element table;
+        // compute `shift * omega^index` on demand so a verifier that only reads
+        // O(query * log) sampled points never allocates the full O(domain) vector.
+        if self.elements.is_empty() {
+            self.shift * self.fft_eval_domain.omega.pow(index)
+        } else {
+            self.elements[index]
+        }
     }
 
     pub fn element_inv_at(&self, index: usize) -> T {
-        self.elements_inv[index]
+        if self.elements_inv.is_empty() {
+            // Materialized `elements_inv[i] = shift * omega^(-i)`; recover the
+            // inverse exponent modulo the domain order with a single field pow.
+            let order = self.fft_eval_domain.order;
+            let exp = (order - index % order) % order;
+            self.shift * self.fft_eval_domain.omega.pow(exp)
+        } else {
+            self.elements_inv[index]
+        }
     }
 
     pub fn all_elements_inv(&self) -> Vec<T> {
