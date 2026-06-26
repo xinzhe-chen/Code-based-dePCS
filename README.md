@@ -5,12 +5,9 @@ commitment scheme (dePCS) from `Doc/papers/pq_dSNARK.pdf`, Chapter 4.
 
 The implementation keeps the PCS layer explicit:
 
-- `crates/pq-core`: field, multilinear-extension, polynomial, partition, and
-  sparse-matrix utility types.
-- `crates/pq-transcript`: Fiat-Shamir transcript API.
-- `crates/pq-sumcheck`: sumcheck helper protocols used by PCS checks.
-- `crates/pq-pcs`: Protocol 6/8/9/10/11 dePCS with batch-only transparent
-  encoded folding PCS backends: BaseFold rate-1/4 and DeepFold rate-1/4.
+- `crates/pq-core`: field, multilinear-extension, and polynomial types.
+- `crates/pq-pcs`: Protocol 6/8/9/10/11 distributed dePCS over the vendored
+  BaseFold (rate-1/8) and DeepFold (rate-1/2) transparent folding PCS backends.
 - `crates/pq-experiments`: dePCS benchmark and result verifier.
 
 ## Build And Test
@@ -18,7 +15,9 @@ The implementation keeps the PCS layer explicit:
 ```bash
 cargo fmt --check
 cargo check --workspace
-cargo test --workspace
+# Scope tests to our crates; the vendored deepfold-bench is a separate
+# workspace whose members include heavy benchmark-style tests.
+cargo test -p pq-core -p pq-pcs -p pq-experiments
 ```
 
 ## dePCS Benchmark
@@ -29,17 +28,17 @@ committed polynomial length is `N = 2^nv`:
 ```bash
 cargo run -p pq-experiments --release -- pcs-benchmark \
   --opening protocol11 \
-  --backend basefold \
-  --backend-rate-inv 4 \
+  --backend deepfold \
   --nv-range 14..18 \
-  --workers 2,4,8,16 \
-  --cores-per-worker 1 \
+  --workers 2 \
   --pcs-queries 1 \
-  --security-bits 128 \
-  --repeats 1 \
   --no-pcs-warmup \
   --out results
 ```
+
+The backend selects the rate (BaseFold `1/8`, DeepFold `1/2`); the paper-backed
+path fixes the security parameter, so `--backend-rate-inv` and `--security-bits`
+only accept those backend-specific values.
 
 Or run the distributed-PCS comparison benchmark via a platform launcher (each
 forwards its arguments to `scripts/benchmark.py`; pass `--help` for options):
@@ -70,25 +69,23 @@ to stay within the 15 minute deadline.
 
 ```bash
 python scripts/benchmark.py \
-  --out results/depcs-ligesis-nv14-18-workers2-4-8-16 \
-  --depcs-nv-range 14..18 \
-  --depcs-workers 2,4,8,16 \
-  --cores-per-worker 1 \
-  --pcs-queries 1 \
-  --security-bits 128 \
-  --repeats 1 \
-  --ligesis-nvs 14,15,16,17,18 \
-  --ligesis-parties-list 1,2,4,8,16
+  --out results/depcs-fiveway-nv18-24-w2 \
+  --fair-sequential \
+  --depcs-nv-range 18..24 \
+  --depcs-workers 2 \
+  --depcs-backends basefold:8,deepfold:2 \
+  --depcs-opening protocol11 \
+  --ligesis-nvs 18,19,20,21,22,23,24 \
+  --ligesis-parties-list 2 \
+  --external-pcs-schemes dfrittata-pcs,dpip-fri-pcs \
+  --pcs-queries 1 --repeats 1
 ```
 
-By default the comparison script attempts `depcs-basefold-batch`
-(`basefold:4`), `depcs-deepfold-batch` (`deepfold:4`), and LigeSIS.
-DeepFold backend failures are treated as experiment failures rather than being
-silently omitted. The DeepFold path uses the local Arkworks-compatible
-Goldilocks RS/FFT core with rate-1/4 query-policy transcript binding; details
-and soundness notes are tracked in `Doc/audits/pcs_batch_backend_soundness.md`.
-Older `deepfold:2` artifacts are legacy rate-1/2 runs and should not be mixed
-into the default rate-1/4 comparison series.
+The command above compares the two paper-backed distributed dePCS backends
+(BaseFold rate-1/8 and DeepFold rate-1/2, Protocol 11) against the three vendored
+baselines under `third_party/ligesis-pcs-3447`: LigeSIS, dFRIttata, and
+dPIP-FRI. Their example binaries are built and run as separate processes; rows
+that fail to build or run are recorded as blocked rather than silently dropped.
 
 The script writes:
 
