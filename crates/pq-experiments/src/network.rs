@@ -11,14 +11,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use pq_core::FieldElement;
-use pq_pcs::{
-    PcsBackendConfig, Protocol11WorkerCommitment, Protocol11WorkerMatrixColumnProof,
-    Protocol11WorkerOpenPayload,
-    depcs::{
-        self, PaperDepcsConfig, PaperProtocol11Commitment, PaperProtocol11WorkerCommitment,
-        PaperProtocol11WorkerOpening,
-    },
+use pq_pcs::depcs::{
+    self, PaperDepcsConfig, PaperProtocol11Commitment, PaperProtocol11WorkerCommitment,
+    PaperProtocol11WorkerOpening,
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,28 +21,6 @@ use crate::CliError;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum PcsWorkerRequest {
-    CommitRows {
-        original_len: usize,
-        workers: usize,
-        worker_id: usize,
-        backend: PcsBackendConfig,
-        rows: Vec<Vec<FieldElement>>,
-    },
-    CommitSeeded {
-        original_len: usize,
-        workers: usize,
-        worker_id: usize,
-        backend: PcsBackendConfig,
-        evaluation_seed: u64,
-    },
-    OpenPrepare {
-        a: Vec<FieldElement>,
-        beta: Vec<FieldElement>,
-    },
-    OpenColumns {
-        commitment: pq_pcs::Protocol11Commitment,
-        query_indices: Vec<usize>,
-    },
     PaperCommitSeeded {
         original_len: usize,
         workers: usize,
@@ -63,15 +36,6 @@ pub(crate) enum PcsWorkerRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum PcsWorkerResponse {
-    Commit {
-        commitment: Protocol11WorkerCommitment,
-    },
-    OpenPrepare {
-        payload: Protocol11WorkerOpenPayload,
-    },
-    OpenColumns {
-        proof: Protocol11WorkerMatrixColumnProof,
-    },
     PaperCommit {
         commitment: PaperProtocol11WorkerCommitment,
         elapsed_ms: f64,
@@ -157,10 +121,9 @@ pub(crate) fn spawn_pcs_network_workers(
             .stderr(Stdio::null())
             .spawn()
             .map_err(|error| CliError(format!("spawn PCS network worker failed: {error}")))?;
-        let stream = connect_with_retry(&addr, Duration::from_secs(10)).map_err(|error| {
+        let stream = connect_with_retry(&addr, Duration::from_secs(10)).inspect_err(|_| {
             let _ = child.kill();
             let _ = child.wait();
-            error
         })?;
         clients.push(PcsNetworkWorkerClient {
             child,

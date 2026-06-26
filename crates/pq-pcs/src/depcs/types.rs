@@ -10,7 +10,9 @@ use paper_util::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::artifact::{PAPER_PCS_SECURITY_BITS, PaperPcsBackend, paper_query_count_for_code_rate};
+use crate::depcs::backend::{
+    PAPER_PCS_SECURITY_BITS, PaperPcsBackend, paper_query_count_for_code_rate,
+};
 
 use super::utils::round_up_to_step;
 

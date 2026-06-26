@@ -36,7 +36,7 @@ pub(crate) struct Protocol6ClaimCheck {
 pub(crate) fn prove_composed_claim(
     commitment: &PaperProtocol11Commitment,
     point: &[PaperField],
-    worker_openings: &mut Vec<PaperProtocol11WorkerOpening>,
+    worker_openings: &mut [PaperProtocol11WorkerOpening],
 ) -> PaperDepcsResult<Protocol6CompositionClaim> {
     if worker_openings.len() != commitment.workers {
         return Err(PaperDepcsError::InvalidProof);
@@ -93,7 +93,7 @@ fn composed_claim_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact::PaperPcsBackend;
+    use crate::depcs::backend::PaperPcsBackend;
     use crate::depcs::{
         PaperDepcsConfig, assemble_opening, commit_from_worker_commitments, commit_worker,
         open_worker, sample_point,

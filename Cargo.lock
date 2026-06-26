@@ -1014,7 +1014,6 @@ dependencies = [
  "bincode",
  "pq-core",
  "pq-pcs",
- "pq-transcript",
  "serde",
  "serde_json",
 ]
@@ -1031,28 +1030,9 @@ dependencies = [
  "bincode",
  "deepfold",
  "pq-core",
- "pq-sumcheck",
- "pq-transcript",
  "rayon",
  "serde",
  "util",
-]
-
-[[package]]
-name = "pq-sumcheck"
-version = "0.1.0"
-dependencies = [
- "pq-core",
- "pq-transcript",
- "rayon",
- "serde",
-]
-
-[[package]]
-name = "pq-transcript"
-version = "0.1.0"
-dependencies = [
- "pq-core",
 ]
 
 [[package]]

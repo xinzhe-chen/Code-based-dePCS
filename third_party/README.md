@@ -1,35 +1,27 @@
-# Third-Party Source Reuse Plan
+# Third-party sources
 
-The first implementation keeps the protocol code local and dependency-light so
-the module boundaries can be tested immediately. External sources are vendored
-under `third_party/` and pinned in `PINS.md` before their code is used for
-implementation work.
+This repository is scoped to the transparent distributed PCS (dePCS). Two
+vendored trees are kept:
 
-Required fixed sources:
+- **`deepfold-bench-v0.1/`** — the BaseFold / DeepFold artifact backend. This is
+  the only vendored **workspace dependency**: `crates/pq-pcs` depends on its
+  `basefold`, `deepfold`, and `util` crates by path. Do not move or rename it
+  without updating `crates/pq-pcs/Cargo.toml`.
+- **`ligesis-pcs-3447/`** — the three distributed-PCS comparison baselines the
+  benchmark measures against. It is *not* a workspace dependency;
+  `scripts/benchmark.py` builds and runs its example binaries as separate
+  processes:
+  - **LigeSIS (dLigesis)** — `ligesis-pcs/`
+  - **dFRIttata** — `ligesis-pcs/` example, backed by `external/winterfell`
+  - **dPIP-FRI** — `external/PIP_FRI`
 
-- Spartan / Spartan2: use only R1CS, sumcheck, and PIOP structure as reference.
-  Do not reuse Ristretto, IPA, KZG, or any non-PQ commitment layer as the final
-  PCS.
-- HyperPlonk / HyperPianist: use only Plonkish arithmetization, gate checks,
-  permutation checks, and distributed PIOP structure as reference. Do not reuse
-  KZG as the final PCS.
-- Brakedown / BaseFold: use as the target design for the transparent PCS
-  module. Any imported implementation must be pinned to an exact commit.
+  Override its location with `benchmark.py --ligesis-dir` if it moves.
 
-For any additional vendored source, record:
+Out of scope (removed): KZG/IPA/curve commitments and the earlier PIOP-frontend
+reference sources (Spartan2, HyperPlonk). Only transparent hash/Merkle +
+Brakedown/BaseFold-style code is on the dePCS path.
 
-- upstream URL;
-- exact commit;
-- license;
-- copied paths;
-- local changes;
-- which protocol pieces are used and which commitment pieces are intentionally
-  excluded.
+## Hygiene
 
-Repository hygiene:
-
-- Do not commit upstream build outputs, benchmark result scratch files, or
-  generated plots from vendored projects.
-- Do not commit KZG SRS parameter binaries. HyperPlonk's `srs.params` is
-  ignored intentionally because this project does not use KZG or any
-  non-post-quantum commitment as its final PCS.
+- Do not commit upstream build outputs or benchmark scratch files from vendored
+  projects (`target/` and `results/` are git-ignored).

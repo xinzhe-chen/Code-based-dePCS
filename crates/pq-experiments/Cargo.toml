@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 pq-core = { path = "../pq-core" }
 pq-pcs = { path = "../pq-pcs" }
-pq-transcript = { path = "../pq-transcript" }
 bincode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

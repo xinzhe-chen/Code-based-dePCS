@@ -1,8 +1,6 @@
 [workspace]
 members = [
     "crates/pq-core",
-    "crates/pq-transcript",
-    "crates/pq-sumcheck",
     "crates/pq-pcs",
     "crates/pq-experiments",
 ]

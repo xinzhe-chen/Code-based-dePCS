@@ -41,15 +41,15 @@ cargo run -p pq-experiments --release -- pcs-benchmark \
   --out results
 ```
 
-Convenience wrappers:
+Or run the distributed-PCS comparison benchmark via a platform launcher (each
+forwards its arguments to `scripts/benchmark.py`; pass `--help` for options):
 
 ```powershell
-.\scripts\pcs-benchmark-powershell.cmd
+.\scripts\pcs-benchmark-powershell.cmd --help
 ```
 
 ```bash
-bash scripts/pcs-benchmark-linux.sh
-bash scripts/pcs-benchmark-macos.sh
+bash scripts/pcs-benchmark-linux.sh --help   # or scripts/pcs-benchmark-macos.sh
 ```
 
 Validate a generated run:
@@ -69,7 +69,7 @@ default local command below is a scaled reproduction that uses `nv=14..18`
 to stay within the 15 minute deadline.
 
 ```bash
-python scripts/depcs-ligesis-compare.py \
+python scripts/benchmark.py \
   --out results/depcs-ligesis-nv14-18-workers2-4-8-16 \
   --depcs-nv-range 14..18 \
   --depcs-workers 2,4,8,16 \

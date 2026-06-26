@@ -12,7 +12,7 @@ use paper_util::{
     random_oracle::RandomOracle,
 };
 
-use crate::artifact::PaperPcsBackend;
+use crate::depcs::backend::PaperPcsBackend;
 
 use super::types::*;
 use super::utils::panic_message;

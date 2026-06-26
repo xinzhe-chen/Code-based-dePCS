@@ -3120,7 +3120,7 @@ def main() -> int:
     parser.add_argument("--security-bits", "--lambda", dest="security_bits", type=int, default=128)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--skip-ligesis", action="store_true")
-    parser.add_argument("--ligesis-dir", default="third_party/references/ligesis-pcs-3447")
+    parser.add_argument("--ligesis-dir", default="third_party/ligesis-pcs-3447")
     parser.add_argument("--ligesis-nv", "--ligesis-mu", dest="ligesis_nv", type=int, default=14)
     parser.add_argument(
         "--ligesis-nvs",

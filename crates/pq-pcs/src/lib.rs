@@ -1,16 +1,11 @@
 //! Public entry point for the `pq-pcs` crate.
 //!
 //! The active artifact-backed dePCS implementation is organized under
-//! `depcs/` by pq_dSNARK Protocol 6 through Protocol 11. The historical
-//! Goldilocks/local compatibility implementation is kept under `legacy/` and
-//! re-exported here so existing callers and benchmark code keep the same API.
+//! `depcs/` by pq_dSNARK Protocol 6 through Protocol 11.
 
-pub mod artifact;
+// Test code uses `unwrap()` freely; the workspace denies `unwrap_used` for
+// non-test code only.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 pub mod depcs;
-pub mod legacy;
-
-pub use artifact as paper;
-pub use legacy::deepfold;
-pub use legacy::protocol11_local::*;
-
-pub(crate) use legacy::protocol11_local::MerkleTree;
+mod hash;

@@ -10,7 +10,8 @@ use paper_util::algebra::field::MyField;
 
 use paper_util::STEP;
 use paper_util::algebra::polynomial::MultilinearPolynomial;
-use pq_transcript::sha256;
+
+use crate::hash::sha256;
 
 use super::types::*;
 
@@ -21,6 +22,9 @@ pub(crate) fn deterministic_value(index: usize) -> PaperField {
     )
 }
 
+// STEP is a compile-time constant (currently 1); keeping the modulo makes the
+// rounding correct if STEP ever changes, so clippy's modulo_one is expected.
+#[allow(clippy::modulo_one)]
 pub(crate) fn round_up_to_step(nv: usize) -> usize {
     let rem = nv % STEP;
     if rem == 0 { nv } else { nv + (STEP - rem) }

@@ -132,7 +132,7 @@ pub(crate) fn verify_commitment_root(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact::PaperPcsBackend;
+    use crate::depcs::backend::PaperPcsBackend;
 
     #[test]
     fn protocol7_aggregates_and_checks_root() {

@@ -25,31 +25,34 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # Lint only our crates (--no-deps): the vendored deepfold-bench path-deps
+        # are a separate workspace with their own pre-existing clippy nits.
+        run: cargo clippy -p pq-core -p pq-pcs -p pq-experiments --no-deps --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace
+        # Scope to our crates: the vendored deepfold-bench path-deps are a
+        # separate workspace whose members include heavy benchmark-style tests
+        # (e.g. basefold) that would otherwise run under --workspace.
+        run: cargo test -p pq-core -p pq-pcs -p pq-experiments
 
-      - name: Windows benchmark script smoke
+      - name: Windows benchmark launcher smoke
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $menu = "0" | cmd /c "scripts\pcs-benchmark-powershell.cmd" 2>&1 | Out-String
-          $menu
-          if ($LASTEXITCODE -ne 0) { throw "benchmark menu exit smoke failed" }
-          if ($menu -notmatch "Distributed Brakedown PCS benchmark") { throw "benchmark menu title missing" }
-          if ($menu -notmatch "Run PCS benchmark") { throw "benchmark menu run option missing" }
+          $help = cmd /c "scripts\pcs-benchmark-powershell.cmd" --help 2>&1 | Out-String
+          $help
+          if ($LASTEXITCODE -ne 0) { throw "benchmark launcher --help failed" }
+          if ($help -notmatch "usage") { throw "benchmark.py usage not rendered" }
 
-      - name: Bash benchmark script smoke
+      - name: Bash benchmark launcher smoke
         if: runner.os != 'Windows'
         shell: bash
         run: |
           bash -n scripts/pcs-benchmark-linux.sh
           bash -n scripts/pcs-benchmark-macos.sh
-          menu="$(printf '0\n' | bash scripts/pcs-benchmark-linux.sh 2>&1)"
-          printf '%s\n' "$menu"
-          grep -q 'Distributed Brakedown PCS benchmark' <<< "$menu"
-          grep -q 'Run PCS benchmark' <<< "$menu"
+          help="$(bash scripts/pcs-benchmark-linux.sh --help 2>&1)"
+          printf '%s\n' "$help"
+          grep -qi 'usage' <<< "$help"
 
       - name: dePCS benchmark + verify smoke
         shell: bash

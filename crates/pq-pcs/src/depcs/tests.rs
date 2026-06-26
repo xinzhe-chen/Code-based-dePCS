@@ -1,5 +1,5 @@
 use super::*;
-use crate::artifact::PaperPcsBackend;
+use crate::depcs::backend::PaperPcsBackend;
 use paper_util::algebra::field::MyField;
 
 fn roundtrip(

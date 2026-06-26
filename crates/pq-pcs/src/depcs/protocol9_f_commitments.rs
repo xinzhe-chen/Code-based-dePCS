@@ -199,7 +199,7 @@ fn worker_opening_input_from_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact::PaperPcsBackend;
+    use crate::depcs::backend::PaperPcsBackend;
     use crate::depcs::{
         PaperDepcsConfig, commit_from_worker_commitments, commit_worker, open_worker, sample_point,
     };

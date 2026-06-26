@@ -2,18 +2,14 @@
 
 pub mod error;
 pub mod field;
-pub mod matrix;
 pub mod mle;
-pub mod partition;
 pub mod polynomial;
 
 pub use error::{CoreError, Result};
 pub use field::{FieldElement, GOLDILOCKS_MODULUS};
-pub use matrix::{PrecomputedSparseMatrix, PrecomputedSparseStats, SparseEntry, SparseMatrix};
 pub use mle::{
     MultilinearExtension, eq_basis, eq_eval, eq_evaluations, evaluate_mle, log2_power_of_two,
 };
-pub use partition::{Partition, PartitionPlan};
 pub use polynomial::{DensePolynomial, inner_product, lagrange_interpolate, powers};
 
 pub type MultilinearPolynomial = MultilinearExtension;
@@ -105,30 +101,5 @@ mod tests {
                 actual: MultilinearExtension::MAX_NUM_VARS + 1,
             })
         );
-    }
-
-    #[test]
-    fn partition_plan_checks_complete_non_overlapping_coverage() {
-        let plan = PartitionPlan::balanced(10, 3).expect("balanced plan should be valid");
-
-        assert_eq!(
-            plan.partitions(),
-            &[
-                Partition::new(0, 0, 4),
-                Partition::new(1, 4, 7),
-                Partition::new(2, 7, 10),
-            ]
-        );
-        assert!(plan.validate_coverage().is_ok());
-        assert_eq!(plan.owner_of(0), Some(0));
-        assert_eq!(plan.owner_of(4), Some(1));
-        assert_eq!(plan.owner_of(9), Some(2));
-        assert_eq!(plan.owner_of(10), None);
-
-        let gap = PartitionPlan::new(5, vec![Partition::new(0, 0, 2), Partition::new(1, 3, 5)]);
-        assert!(gap.is_err());
-
-        let overlap = PartitionPlan::new(5, vec![Partition::new(0, 0, 3), Partition::new(1, 2, 5)]);
-        assert!(overlap.is_err());
     }
 }

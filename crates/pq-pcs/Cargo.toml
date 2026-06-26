@@ -10,8 +10,6 @@ ark-poly = { workspace = true }
 ark-serialize = { workspace = true }
 ark-std = { workspace = true }
 pq-core = { path = "../pq-core" }
-pq-sumcheck = { path = "../pq-sumcheck" }
-pq-transcript = { path = "../pq-transcript" }
 rayon = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
