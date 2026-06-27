@@ -42,8 +42,9 @@ paper-backed path derives its effective query policy from the backend and
 Protocol 11 configuration; the CSV output records the requested and effective
 query counts separately.
 
-Or run the distributed-PCS comparison benchmark via a platform launcher (each
-forwards its arguments to `scripts/benchmark.py`; pass `--help` for options):
+Or run the distributed-PCS comparison benchmark via a platform launcher. With no
+arguments the launcher opens an interactive menu; with arguments it forwards
+them to `scripts/benchmark.py`:
 
 ```powershell
 .\scripts\pcs-benchmark-powershell.cmd --help
