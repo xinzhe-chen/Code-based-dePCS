@@ -139,6 +139,11 @@ impl MerkleTreeVerifier {
         if indices.len() != leaves.len() {
             return false;
         }
+        // Fail-closed: reject out-of-range indices (instead of authenticating a
+        // padded slot) and duplicate indices (instead of silently dedup'ing).
+        if indices.iter().any(|&idx| idx >= self.leave_number) {
+            return false;
+        }
         let padded = self.leave_number.next_power_of_two();
         let depth = padded.trailing_zeros() as usize;
         let mut known: Vec<(usize, Hash)> = indices
@@ -147,7 +152,9 @@ impl MerkleTreeVerifier {
             .map(|(&idx, leaf)| (idx, Blake3Algorithm::hash(leaf)))
             .collect();
         known.sort_by_key(|(idx, _)| *idx);
-        known.dedup_by_key(|(idx, _)| *idx);
+        if known.windows(2).any(|w| w[0].0 == w[1].0) {
+            return false;
+        }
         let mut pos = 0usize;
         for _level in 0..depth {
             let mut parents: Vec<(usize, Hash)> = Vec::with_capacity(known.len());
@@ -181,32 +188,6 @@ impl MerkleTreeVerifier {
             known = parents;
         }
         pos == proof_bytes.len() && known.len() == 1 && known[0].1 == self.merkle_root
-    }
-}
-
-pub struct MerkleRoot;
-impl MerkleRoot {
-    pub fn get_root(
-        proof_bytes: Vec<u8>,
-        index: usize,
-        leaf: Vec<u8>,
-        total_leaves_count: usize,
-    ) -> Hash {
-        let padded = total_leaves_count.next_power_of_two();
-        let depth = padded.trailing_zeros() as usize;
-        let mut cur = Blake3Algorithm::hash(&leaf);
-        let mut cur_idx = index;
-        let mut pos = 0usize;
-        for _ in 0..depth {
-            let sib = read_hash(&proof_bytes, &mut pos).expect("merkle path too short");
-            cur = if cur_idx % 2 == 0 {
-                hash_pair(&cur, &sib)
-            } else {
-                hash_pair(&sib, &cur)
-            };
-            cur_idx /= 2;
-        }
-        cur
     }
 }
 
@@ -264,6 +245,28 @@ mod tests {
         let mut long = proof.clone();
         long.push(0);
         assert!(!verifier.verify(long, &idx, &good));
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_duplicate_indices() {
+        let leaf_values: Vec<Vec<u8>> = (0..8)
+            .map(|i| as_bytes_vec(&[Mersenne61Ext::from_int(i as u64)]))
+            .collect();
+        let prover = MerkleTreeProver::new(leaf_values);
+        let root = prover.commit();
+        let verifier = MerkleTreeVerifier::new(8, &root);
+        let idx = vec![1, 4];
+        let proof = prover.open(&idx);
+        let leaves: Vec<Vec<u8>> = [1u64, 4]
+            .iter()
+            .map(|&i| as_bytes_vec(&[Mersenne61Ext::from_int(i)]))
+            .collect();
+        assert!(verifier.verify(proof.clone(), &idx, &leaves));
+        // out-of-range index (>= leave_number) must be rejected, not authenticated
+        // against a padded slot
+        assert!(!verifier.verify(proof.clone(), &vec![1, 8], &leaves));
+        // duplicate index must be rejected, not silently deduplicated
+        assert!(!verifier.verify(proof, &vec![1, 1], &leaves));
     }
 
     #[test]
