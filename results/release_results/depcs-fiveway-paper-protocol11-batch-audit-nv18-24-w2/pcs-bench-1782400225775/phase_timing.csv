@@ -1,5 +1,0 @@
-phase,scope,elapsed_ms,commit_ms,open_ms,verify_ms
-job,runner=paper-network-protocol11 opening=protocol11 nv=18 workers=2 trial=1,537.449400,313.302900,178.904900,45.241600
-paper_worker_commit,runner=paper-network-protocol11 opening=protocol11 nv=18 workers=2 trial=1,313.302900,0.000000,0.000000,0.000000
-paper_protocol11_open,runner=paper-network-protocol11 opening=protocol11 nv=18 workers=2 trial=1,178.904900,0.000000,0.000000,0.000000
-paper_protocol11_verify,runner=paper-network-protocol11 opening=protocol11 nv=18 workers=2 trial=1,45.241600,0.000000,0.000000,0.000000

@@ -4,13 +4,9 @@ target/
 # Local documentation (papers + audit notes) kept on disk but not versioned.
 /Doc/
 
-# Benchmark outputs are generated artifacts. results/ is a scratch zone: every
-# run lands there and is git-ignored. Only the policy doc and curated publishable
-# runs under results/release_results/ are versioned. Promote a run by moving it
-# into release_results/.
-/results/*
-!/results/README.md
-!/results/release_results/
+# Benchmark outputs are generated artifacts and are never versioned; results/ is
+# a purely local scratch zone for benchmark runs.
+/results/
 
 # Local logs and temporary report screenshots
 *.log
