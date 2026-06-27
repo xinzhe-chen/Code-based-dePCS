@@ -113,3 +113,43 @@ fn paper_depcs_cached_worker_open_rejects_wrong_commitment() {
     let point = sample_point(commitment.nv);
     assert!(open_worker_cached(cache, &commitment, &point).is_err());
 }
+
+// --- A1: canonical-order query value encoding must be fail-closed ---
+
+fn first_worker_basefold_values(proof: &mut PaperProtocol11Proof) -> &mut Vec<PaperField> {
+    match &mut proof.worker_openings[0].proof {
+        PaperPcsOpeningProof::BaseFold(bf) => &mut bf.query_results[0].proof_values,
+        PaperPcsOpeningProof::DeepFold(_) => panic!("expected a BaseFold worker proof"),
+    }
+}
+
+#[test]
+fn paper_depcs_rejects_tampered_query_value() {
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::BaseFold, 8);
+    first_worker_basefold_values(&mut proof)[0] += PaperField::from_int(1);
+    assert!(verify(&commitment, &proof).is_err());
+}
+
+#[test]
+fn paper_depcs_rejects_reordered_query_values() {
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::BaseFold, 8);
+    let values = first_worker_basefold_values(&mut proof);
+    let n = values.len();
+    assert!(n >= 2, "need at least two query values to reorder");
+    values.swap(0, n - 1);
+    assert!(verify(&commitment, &proof).is_err());
+}
+
+#[test]
+fn paper_depcs_rejects_missing_query_value() {
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::BaseFold, 8);
+    first_worker_basefold_values(&mut proof).pop();
+    assert!(verify(&commitment, &proof).is_err());
+}
+
+#[test]
+fn paper_depcs_rejects_extra_query_value() {
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::BaseFold, 8);
+    first_worker_basefold_values(&mut proof).push(PaperField::from_int(0));
+    assert!(verify(&commitment, &proof).is_err());
+}

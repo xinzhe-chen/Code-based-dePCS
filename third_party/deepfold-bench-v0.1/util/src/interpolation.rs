@@ -54,7 +54,12 @@ impl<T: MyField> InterpolateValue<T> {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let proof_values = proof_chunks.into_iter().flatten().collect();
+        // Drop the (recomputable) index keys; keep values in canonical order.
+        let proof_values = proof_chunks
+            .into_iter()
+            .flatten()
+            .map(|(_idx, value)| value)
+            .collect();
         let proof_bytes = self.merkle_tree.open(&leaf_indices);
         QueryResult {
             proof_bytes,

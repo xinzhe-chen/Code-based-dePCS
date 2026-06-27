@@ -6,6 +6,7 @@ use util::{
     merkle_tree::MerkleTreeVerifier,
     query_result::QueryResult,
 };
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct Verifier<T: MyField> {
@@ -78,6 +79,18 @@ impl<T: MyField> Verifier<T> {
     pub fn verify(&self, polynomial_proof: &Vec<QueryResult<T>>) -> bool {
         let mut leaf_indices = self.oracle.query_list.clone();
         let mut sum = self.sumcheck_values[0].0 + self.sumcheck_values[0].1;
+        // Rebuild per-layer index->value maps from the canonical-order
+        // proof_values (byte-identical to the pre-optimization HashMaps).
+        let leaf_size = 1 << self.step;
+        let mut li = self.oracle.query_list.clone();
+        let mut maps: Vec<HashMap<usize, T>> = Vec::with_capacity(polynomial_proof.len());
+        for layer in 0..polynomial_proof.len() {
+            let len = self.interpolate_cosets[layer * self.step].size() >> self.step;
+            li = li.iter().map(|v| v % len).collect();
+            li.sort();
+            li.dedup();
+            maps.push(polynomial_proof[layer].values_to_map(&li, leaf_size, len));
+        }
         for i in 0..self.total_round / self.step {
             let domain_size = self.interpolate_cosets[i * self.step].size();
             leaf_indices = leaf_indices
@@ -92,7 +105,7 @@ impl<T: MyField> Verifier<T> {
                 1 << self.step,
                 &self.polynomial_roots[i],
             );
-            let folding_value = &polynomial_proof[i].proof_values;
+            let folding_value = &maps[i];
 
             for k in 0..self.step {
                 let challenge = self.oracle.folding_challenges[i * self.step + k];
@@ -166,7 +179,7 @@ impl<T: MyField> Verifier<T> {
                     let point = self.interpolate_cosets[(i + 1) * self.step].element_at(*k);
                     assert_eq!(v, self.final_poly.clone().unwrap().evaluation_at(point));
                 } else {
-                    assert_eq!(v, polynomial_proof[i + 1].proof_values[k]);
+                    assert_eq!(v, maps[i + 1][k]);
                 }
             }
         }
