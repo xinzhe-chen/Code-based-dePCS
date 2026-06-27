@@ -1,7 +1,7 @@
 # pq_dSNARK dePCS
 
-This repository is now focused on the transparent distributed polynomial
-commitment scheme (dePCS) from `Doc/papers/pq_dSNARK.pdf`, Chapter 4.
+This repository is focused on the transparent distributed polynomial commitment
+scheme (dePCS) from `Doc/papers/pq_dSNARK.pdf`, Chapter 4.
 
 The implementation keeps the PCS layer explicit:
 
@@ -36,9 +36,11 @@ cargo run -p pq-experiments --release -- pcs-benchmark \
   --out results
 ```
 
-The backend selects the rate (BaseFold `1/8`, DeepFold `1/2`); the paper-backed
-path fixes the security parameter, so `--backend-rate-inv` and `--security-bits`
-only accept those backend-specific values.
+The backend selects the artifact PCS code rate: BaseFold uses rate `1/8` and
+DeepFold uses rate `1/2` in the paper-backed Protocol 11 path. The
+paper-backed path derives its effective query policy from the backend and
+Protocol 11 configuration; the CSV output records the requested and effective
+query counts separately.
 
 Or run the distributed-PCS comparison benchmark via a platform launcher (each
 forwards its arguments to `scripts/benchmark.py`; pass `--help` for options):
@@ -64,19 +66,19 @@ cargo run -p pq-experiments -- verify-pcs-results \
 The comparison harness follows the LigeSIS Distributed PCS convention:
 `nv` is the number of multilinear variables and `N = 2^nv` is the committed
 polynomial length. LigeSIS Figure 4 fixes `nv=28` and varies node count; the
-default local command below is a scaled reproduction that uses `nv=14..18`
-to stay within the 15 minute deadline.
+default local command below is a scaled reproduction over `nv=18..24` and
+worker counts `2,4`.
 
 ```bash
 python scripts/benchmark.py \
-  --out results/depcs-fiveway-nv18-24-w2 \
+  --out results/depcs-fiveway-parallel-merkle-nv18-24-w2-w4 \
   --fair-sequential \
   --depcs-nv-range 18..24 \
-  --depcs-workers 2 \
+  --depcs-workers 2,4 \
   --depcs-backends basefold:8,deepfold:2 \
   --depcs-opening protocol11 \
   --ligesis-nvs 18,19,20,21,22,23,24 \
-  --ligesis-parties-list 2 \
+  --ligesis-parties-list 2,4 \
   --external-pcs-schemes dfrittata-pcs,dpip-fri-pcs \
   --pcs-queries 1 --repeats 1
 ```
@@ -102,6 +104,24 @@ The script writes:
 LigeSIS rows that crash or hang in the vendored local runner are recorded as
 blocked instead of being treated as measurements.
 
+The latest local run of this command was written to
+`results/depcs-fiveway-parallel-merkle-nv18-24-w2-w4` on 2026-06-27. It
+completed all 70 scheduled benchmark rows with `max_active=1`, and all 28 dePCS
+`pcs-bench-*` artifact directories passed `verify-pcs-results`.
+
+Representative `nv=24` rows from that run:
+
+| scheme | workers | prover ms | verify ms | proof KiB | communication |
+| --- | ---: | ---: | ---: | ---: | --- |
+| dePCS DeepFold | 2 | 3788.955 | 9.736 | 948.32 | 940.63 KiB send+recv |
+| dePCS DeepFold | 4 | 2872.329 | 14.332 | 1689.63 | 1693.17 KiB send+recv |
+| dePCS BaseFold | 2 | 14058.825 | 12.194 | 1372.80 | 1365.71 KiB send+recv |
+| dePCS BaseFold | 4 | 9341.729 | 19.962 | 2451.29 | 2457.20 KiB send+recv |
+| LigeSIS | 2 | 4165.911 | 114.895 | 290.82 | 223621.12 KiB native |
+| LigeSIS | 4 | 2645.500 | 114.604 | 291.37 | 291420.16 KiB native |
+| dPIP-FRI | 2 | 3911.015 | 3.119 | 333.95 | 266416.46 KiB native |
+| dPIP-FRI | 4 | 2364.622 | 3.529 | 330.95 | 198915.93 KiB native |
+
 The older directory
 `results/depcs-basefold-full-nv10-16-workers1-2-4-8-16` used the old
 `n/nv/size` label convention. New reports use `nv` and `polynomial_length`.
@@ -118,18 +138,12 @@ proof. `communication_bytes` is reserved for measured bytes sent plus bytes
 received. dePCS rows use the local TCP network runner counters. LigeSIS rows
 use the vendored dLigesis `COMM_TOTAL_MB` counter.
 
-dePCS scalability is reported with two acceptance views. Worker-local compute
-speedup uses `worker_commit_ms + worker_eval_commit_ms`, which tracks shard
-commit/eval/encode work. End-to-end open/proof speedup uses full `open_ms`,
-which includes column openings, F2 openings, Protocol 10 batch openings,
-proof-size accounting, and aggregation overhead.
-
-The default query-security budget is `lambda=128`: BaseFold rate-1/4 and
-DeepFold rate-1/4 both use 64 PCS queries, and Protocol 11 column checks use
-the outer rate-1/4 policy. The arithmetic field is Goldilocks, so
-CSV/report metadata separately records `algebraic_security_bits=64`; the
-implementation does not claim that one Goldilocks challenge field element
-provides 128-bit algebraic security by itself.
+dePCS scalability is reported with two views. Worker-local compute speedup uses
+the per-worker local compute fields, while end-to-end open/proof speedup uses
+full `open_ms`, including openings, Protocol 10 work, proof-size accounting,
+and aggregation overhead. Current reports use the `Mersenne61Ext` field and
+Blake3 Merkle commitments; the CSV metadata records `security_target_bits`,
+`security_effective_bits`, and `algebraic_security_bits` for each row.
 
 ## Documentation
 
