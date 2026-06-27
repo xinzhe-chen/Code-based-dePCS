@@ -89,6 +89,31 @@ fn _fft<T: MyField>(a: &mut Vec<T>, omega: T) {
     }
 }
 
+/// Build `[shift * base^0, shift * base^1, ..., shift * base^(order-1)]`.
+/// The serial form is a `successors` recurrence (each term depends on the
+/// previous), so to parallelize we split into chunks and recover each chunk's
+/// starting term with a single `base.pow(chunk_start)`; within a chunk the
+/// cheap multiplicative recurrence runs serially. Small orders stay serial to
+/// avoid pool/`pow` overhead.
+fn coset_powers<T: MyField>(shift: T, base: T, order: usize) -> Vec<T> {
+    if order <= 1024 {
+        return std::iter::successors(Some(shift), |&last| Some(last * base))
+            .take(order)
+            .collect();
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let chunk = order.div_ceil(threads * 4).max(1);
+    let mut out = vec![shift; order];
+    out.par_chunks_mut(chunk).enumerate().for_each(|(c, slice)| {
+        let mut cur = shift * base.pow(c * chunk);
+        for x in slice.iter_mut() {
+            *x = cur;
+            cur *= base;
+        }
+    });
+    out
+}
+
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -129,13 +154,9 @@ impl<T: MyField> Coset<T> {
     pub fn new(order: usize, shift: T) -> Self {
         assert!(!shift.is_zero());
         let omega = T::get_generator(order);
-        let elements = std::iter::successors(Some(shift), |&last| Some(last * omega))
-            .take(order)
-            .collect();
         let omega_inv = omega.pow(order - 1);
-        let elements_inv = std::iter::successors(Some(shift), |&last| Some(last * omega_inv))
-            .take(order)
-            .collect();
+        let elements = coset_powers(shift, omega, order);
+        let elements_inv = coset_powers(shift, omega_inv, order);
         Coset {
             elements: Arc::new(elements),
             elements_inv: Arc::new(elements_inv),
