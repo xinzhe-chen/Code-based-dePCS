@@ -1,40 +1,80 @@
 use rayon::prelude::*;
-use rs_merkle::{Hasher, MerkleProof, MerkleTree};
+
+pub const MERKLE_ROOT_SIZE: usize = 32;
+type Hash = [u8; MERKLE_ROOT_SIZE];
 
 #[derive(Debug, Clone)]
 pub struct Blake3Algorithm {}
 
-impl Hasher for Blake3Algorithm {
-    type Hash = [u8; MERKLE_ROOT_SIZE];
-
-    fn hash(data: &[u8]) -> [u8; MERKLE_ROOT_SIZE] {
+impl Blake3Algorithm {
+    pub fn hash(data: &[u8]) -> Hash {
         blake3::hash(data).into()
     }
 }
 
-pub const MERKLE_ROOT_SIZE: usize = 32;
+#[inline]
+fn hash_pair(left: &Hash, right: &Hash) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(left);
+    hasher.update(right);
+    hasher.finalize().into()
+}
+
+#[inline]
+fn read_hash(buf: &[u8], pos: &mut usize) -> Option<Hash> {
+    if *pos + MERKLE_ROOT_SIZE > buf.len() {
+        return None;
+    }
+    let mut h = [0u8; MERKLE_ROOT_SIZE];
+    h.copy_from_slice(&buf[*pos..*pos + MERKLE_ROOT_SIZE]);
+    *pos += MERKLE_ROOT_SIZE;
+    Some(h)
+}
+
+/// Build all Merkle layers bottom-up. The leaf layer is padded to a power of two
+/// (deterministic zero padding); every internal layer is hashed in parallel,
+/// since the parent nodes of one layer are independent. `layers[0]` is the leaf
+/// layer and `layers.last()` is the single-element root layer.
+fn build_layers(mut leaves: Vec<Hash>) -> Vec<Vec<Hash>> {
+    if leaves.is_empty() {
+        return vec![vec![[0u8; MERKLE_ROOT_SIZE]]];
+    }
+    let padded = leaves.len().next_power_of_two();
+    leaves.resize(padded, [0u8; MERKLE_ROOT_SIZE]);
+    let mut layers = vec![leaves];
+    while layers.last().unwrap().len() > 1 {
+        let prev = layers.last().unwrap();
+        let next: Vec<Hash> = (0..prev.len() / 2)
+            .into_par_iter()
+            .map(|i| hash_pair(&prev[2 * i], &prev[2 * i + 1]))
+            .collect();
+        layers.push(next);
+    }
+    layers
+}
+
 #[derive(Clone)]
 pub struct MerkleTreeProver {
-    pub merkle_tree: MerkleTree<Blake3Algorithm>,
+    layers: Vec<Vec<Hash>>,
     leave_num: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct MerkleTreeVerifier {
-    pub merkle_root: [u8; MERKLE_ROOT_SIZE],
+    pub merkle_root: Hash,
     pub leave_number: usize,
 }
 
 impl MerkleTreeProver {
     pub fn new(leaf_values: Vec<Vec<u8>>) -> Self {
-        let leaves = leaf_values
+        let leave_num = leaf_values.len();
+        let leaves: Vec<Hash> = leaf_values
             .par_iter()
             .map(|x| Blake3Algorithm::hash(x))
-            .collect::<Vec<_>>();
-        let merkle_tree = MerkleTree::<Blake3Algorithm>::from_leaves(&leaves);
+            .collect();
         Self {
-            merkle_tree,
-            leave_num: leaf_values.len(),
+            layers: build_layers(leaves),
+            leave_num,
         }
     }
 
@@ -42,38 +82,105 @@ impl MerkleTreeProver {
         self.leave_num
     }
 
-    pub fn commit(&self) -> [u8; MERKLE_ROOT_SIZE] {
-        self.merkle_tree.root().unwrap()
+    pub fn commit(&self) -> Hash {
+        self.layers.last().unwrap()[0]
     }
 
+    /// Multi-leaf authentication path. `leaf_indices` must be sorted and
+    /// deduplicated (both callers guarantee this); the emitted sibling hashes
+    /// are ordered by ascending index per layer, which the verifier consumes in
+    /// the same order.
     pub fn open(&self, leaf_indices: &Vec<usize>) -> Vec<u8> {
-        self.merkle_tree.proof(leaf_indices).to_bytes()
+        let mut known = leaf_indices.clone();
+        known.sort_unstable();
+        known.dedup();
+        let mut proof: Vec<u8> = Vec::new();
+        for level in 0..self.layers.len() - 1 {
+            let layer = &self.layers[level];
+            let mut parents: Vec<usize> = Vec::with_capacity(known.len());
+            let mut i = 0;
+            while i < known.len() {
+                let idx = known[i];
+                if idx % 2 == 0 && i + 1 < known.len() && known[i + 1] == idx + 1 {
+                    i += 2;
+                } else if idx % 2 == 0 {
+                    proof.extend_from_slice(&layer[idx + 1]);
+                    i += 1;
+                } else {
+                    proof.extend_from_slice(&layer[idx - 1]);
+                    i += 1;
+                }
+                parents.push(idx / 2);
+            }
+            known = parents;
+        }
+        proof
     }
 }
 
 impl MerkleTreeVerifier {
-    pub fn new(leave_number: usize, merkle_root: &[u8; MERKLE_ROOT_SIZE]) -> Self {
+    pub fn new(leave_number: usize, merkle_root: &Hash) -> Self {
         Self {
             leave_number,
-            merkle_root: merkle_root.clone(),
+            merkle_root: *merkle_root,
         }
     }
 
+    /// Recompute the root from the queried `leaves` (hashed here) and the
+    /// authentication path, and compare against the committed root. Fails closed:
+    /// any extra/missing sibling bytes, or a recomputed root mismatch, returns
+    /// false. `indices` must be sorted/deduplicated and aligned with `leaves`.
     pub fn verify(
         &self,
         proof_bytes: Vec<u8>,
         indices: &Vec<usize>,
         leaves: &Vec<Vec<u8>>,
     ) -> bool {
-        let proof = MerkleProof::<Blake3Algorithm>::try_from(proof_bytes).unwrap();
-        let leaves_to_prove: Vec<[u8; MERKLE_ROOT_SIZE]> =
-            leaves.iter().map(|x| Blake3Algorithm::hash(x)).collect();
-        proof.verify(
-            self.merkle_root,
-            indices,
-            &leaves_to_prove,
-            self.leave_number,
-        )
+        if indices.len() != leaves.len() {
+            return false;
+        }
+        let padded = self.leave_number.next_power_of_two();
+        let depth = padded.trailing_zeros() as usize;
+        let mut known: Vec<(usize, Hash)> = indices
+            .iter()
+            .zip(leaves.iter())
+            .map(|(&idx, leaf)| (idx, Blake3Algorithm::hash(leaf)))
+            .collect();
+        known.sort_by_key(|(idx, _)| *idx);
+        known.dedup_by_key(|(idx, _)| *idx);
+        let mut pos = 0usize;
+        for _level in 0..depth {
+            let mut parents: Vec<(usize, Hash)> = Vec::with_capacity(known.len());
+            let mut i = 0;
+            while i < known.len() {
+                let (idx, h) = known[i];
+                let (left, right) = if idx % 2 == 0
+                    && i + 1 < known.len()
+                    && known[i + 1].0 == idx + 1
+                {
+                    let r = known[i + 1].1;
+                    i += 2;
+                    (h, r)
+                } else if idx % 2 == 0 {
+                    let r = match read_hash(&proof_bytes, &mut pos) {
+                        Some(x) => x,
+                        None => return false,
+                    };
+                    i += 1;
+                    (h, r)
+                } else {
+                    let l = match read_hash(&proof_bytes, &mut pos) {
+                        Some(x) => x,
+                        None => return false,
+                    };
+                    i += 1;
+                    (l, h)
+                };
+                parents.push((idx / 2, hash_pair(&left, &right)));
+            }
+            known = parents;
+        }
+        pos == proof_bytes.len() && known.len() == 1 && known[0].1 == self.merkle_root
     }
 }
 
@@ -84,12 +191,22 @@ impl MerkleRoot {
         index: usize,
         leaf: Vec<u8>,
         total_leaves_count: usize,
-    ) -> [u8; MERKLE_ROOT_SIZE] {
-        let proof = MerkleProof::<Blake3Algorithm>::try_from(proof_bytes).unwrap();
-        let leaf_hashes = vec![Blake3Algorithm::hash(&leaf)];
-        proof
-            .root(&vec![index], &leaf_hashes, total_leaves_count)
-            .unwrap()
+    ) -> Hash {
+        let padded = total_leaves_count.next_power_of_two();
+        let depth = padded.trailing_zeros() as usize;
+        let mut cur = Blake3Algorithm::hash(&leaf);
+        let mut cur_idx = index;
+        let mut pos = 0usize;
+        for _ in 0..depth {
+            let sib = read_hash(&proof_bytes, &mut pos).expect("merkle path too short");
+            cur = if cur_idx % 2 == 0 {
+                hash_pair(&cur, &sib)
+            } else {
+                hash_pair(&sib, &cur)
+            };
+            cur_idx /= 2;
+        }
+        cur
     }
 }
 
@@ -120,6 +237,33 @@ mod tests {
             as_bytes_vec(&[Mersenne61Ext::from_int(7), Mersenne61Ext::from_int(8)]),
         ];
         assert!(verifier.verify(proof_bytes, &leaf_indices, &open_values));
+    }
+
+    #[test]
+    fn rejects_tampered_leaf() {
+        let leaf_values: Vec<Vec<u8>> = (0..8)
+            .map(|i| as_bytes_vec(&[Mersenne61Ext::from_int(i as u64)]))
+            .collect();
+        let prover = MerkleTreeProver::new(leaf_values);
+        let root = prover.commit();
+        let verifier = MerkleTreeVerifier::new(8, &root);
+        let idx = vec![1, 4, 5];
+        let proof = prover.open(&idx);
+        let good: Vec<Vec<u8>> = [1u64, 4, 5]
+            .iter()
+            .map(|&i| as_bytes_vec(&[Mersenne61Ext::from_int(i)]))
+            .collect();
+        assert!(verifier.verify(proof.clone(), &idx, &good));
+        let mut bad = good.clone();
+        bad[1] = as_bytes_vec(&[Mersenne61Ext::from_int(999)]);
+        assert!(!verifier.verify(proof.clone(), &idx, &bad));
+        // truncated / extended proof must fail closed
+        let mut short = proof.clone();
+        short.pop();
+        assert!(!verifier.verify(short, &idx, &good));
+        let mut long = proof.clone();
+        long.push(0);
+        assert!(!verifier.verify(long, &idx, &good));
     }
 
     #[test]

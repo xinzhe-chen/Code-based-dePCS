@@ -1,5 +1,6 @@
 use super::{field::MyField, polynomial::Polynomial};
 use crate::batch_bit_reverse;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy)]
 struct Radix2Domain<T: MyField> {
@@ -71,15 +72,19 @@ fn _fft<T: MyField>(a: &mut Vec<T>, omega: T) {
     for _i in 0..log_n {
         let w_m = omega.pow(n >> (log_m + 1));
         let m = 1 << log_m;
-        for j in (0..n).step_by(m * 2) {
+        // Within one stage the butterfly blocks of size `2*m` are independent,
+        // so run them in parallel. Each block restarts its twiddle at `1`, so a
+        // chunk is self-contained; the result is bit-for-bit identical to the
+        // serial radix-2 loop.
+        a.par_chunks_mut(m * 2).for_each(|chunk| {
             let mut w = T::from_int(1);
             for k in 0..m {
-                let t = w * a[j + k + m];
-                a[j + k + m] = a[j + k] - t;
-                a[j + k] += t;
+                let t = w * chunk[k + m];
+                chunk[k + m] = chunk[k] - t;
+                chunk[k] += t;
                 w *= w_m;
             }
-        }
+        });
         log_m += 1;
     }
 }
