@@ -32,12 +32,11 @@
 //!   its own transcript-bound challenge and claims. The merge changes neither
 //!   proof semantics nor communication accounting.
 
-use std::sync::Arc;
 use std::time::Instant;
 
-use paper_util::random_oracle::RandomOracle;
 use rayon::prelude::*;
 
+use super::compact_codec;
 use super::pcs_backend::{open_polynomial, prepare_prover, verify_worker_opening};
 use super::protocol6_composition::{check_composed_claim, prove_composed_claim};
 use super::protocol7_merkle_commitments::{
@@ -49,10 +48,11 @@ use super::protocol9_f_commitments::{
     worker_coefficients as protocol9_worker_coefficients,
 };
 use super::protocol10_encoding::{
-    merge_relation_opening_batches, prove_protocol10_relation, verify_protocol10_relation,
+    merge_relation_opening_batches, protocol10_worker_contexts, prove_protocol10_relation,
+    verify_protocol10_relation,
 };
 use super::types::*;
-use super::utils::{digest_serialized, pad_values};
+use super::utils::pad_values;
 
 pub fn worker_coefficients(
     original_len: usize,
@@ -85,10 +85,13 @@ pub fn commit_worker_cached(
     // 2. Prepare the paper-backed PCS prover once and keep it in the cache.
     // 3. Publish the Protocol 7 leaf that binds row range, oracle, and PCS root.
     let layout = PaperLayout::new(original_len, workers)?;
-    let values = worker_coefficients(original_len, workers, worker_id)?;
-    let padded_values = pad_values(values.clone(), layout.artifact_nv);
-    let oracle = RandomOracle::new(layout.artifact_nv, config.query_count());
-    let prepared = prepare_prover(config, layout.artifact_nv, padded_values, &oracle);
+    let mut values = worker_coefficients(original_len, workers, worker_id)?;
+    values = pad_values(values, layout.artifact_nv);
+    let oracle_seed =
+        compact_codec::oracle_seed(original_len, workers, worker_id, config, layout.artifact_nv);
+    let oracle =
+        compact_codec::oracle_from_seed(oracle_seed, layout.artifact_nv, config.query_count());
+    let prepared = prepare_prover(config, layout.artifact_nv, values, &oracle);
     let commitment = prepared.commitment();
     let row_range = (
         worker_id * layout.shard_len,
@@ -97,7 +100,7 @@ pub fn commit_worker_cached(
     let worker = build_worker_commitment(Protocol7WorkerCommitmentInput {
         worker_id,
         row_range,
-        oracle,
+        oracle_seed,
         pcs_commitment: commitment,
     })?;
     Ok(PaperWorkerCache {
@@ -106,7 +109,6 @@ pub fn commit_worker_cached(
         worker_id,
         config,
         commitment: worker,
-        values: Arc::from(values),
         prepared,
     })
 }
@@ -138,19 +140,25 @@ pub fn open_worker(
     // Eval steps 4-8, worker side without cache: prepare the local Protocol 9
     // F-opening metadata, then ask the artifact PCS to prove the shard value.
     let input = prepare_worker_opening_input(commitment, worker_id, point)?;
+    let oracle = compact_codec::oracle_from_seed(
+        commitment.workers_commitments[worker_id].oracle_seed,
+        commitment.artifact_nv,
+        commitment.config.query_count(),
+    );
     let proof = open_polynomial(
         commitment.config,
         commitment.artifact_nv,
         pad_values(input.coefficients, commitment.artifact_nv),
         &input.opening.shard_point,
         &commitment.workers_commitments[worker_id].pcs_commitment,
-        &commitment.workers_commitments[worker_id].oracle,
+        &oracle,
     )?;
+    let (proof, value) = proof;
     Ok(PaperProtocol11WorkerOpening {
         worker_id: input.opening.worker_id,
         worker_weight: input.opening.worker_weight,
         shard_point: input.opening.shard_point,
-        value: input.opening.value,
+        value,
         proof,
     })
 }
@@ -165,12 +173,12 @@ pub fn open_worker_cached(
     // The cache is consumed so the prepared prover is moved (not cloned) into the
     // opening; each worker shard is opened at most once per commit.
     let input = prepare_cached_worker_opening_input(&cache, commitment, point)?;
-    let proof = cache.prepared.open(&input.shard_point, input.value)?;
+    let (proof, value) = cache.prepared.open(&input.shard_point)?;
     Ok(PaperProtocol11WorkerOpening {
         worker_id: input.worker_id,
         worker_weight: input.worker_weight,
         shard_point: input.shard_point,
-        value: input.value,
+        value,
         proof,
     })
 }
@@ -185,6 +193,7 @@ pub fn assemble_opening(
     // claim `v = sum_i beta^(i) v_F2^(i)`.
     let composition = prove_composed_claim(commitment, &point, &mut worker_openings)?;
     let claimed_value = composition.claimed_value;
+    let worker_contexts = protocol10_worker_contexts(commitment, &point, &worker_openings)?;
     // Protocol 11 step 9, first relation: prove E1 = Enc(F1).
     let e1 = prove_protocol10_relation(
         0,
@@ -192,6 +201,7 @@ pub fn assemble_opening(
         commitment,
         &point,
         &worker_openings,
+        &worker_contexts,
     )?;
     // Protocol 11 step 9, second relation: prove E2 = Enc(F2).
     let e2 = prove_protocol10_relation(
@@ -200,25 +210,28 @@ pub fn assemble_opening(
         commitment,
         &point,
         &worker_openings,
+        &worker_contexts,
     )?;
     // Semantics-preserving optimization: bind E1/E2 opening batches together
     // after each relation has already been transcript-bound and checked
     // independently. This preserves Protocol 10's relation order.
-    let opening_batch = merge_relation_opening_batches(&[&e1.opening_batch, &e2.opening_batch])?;
-    let opening_batch_digest = digest_serialized(&opening_batch)?;
+    let e1_batch = e1.opening_batch_summary();
+    let e2_batch = e2.opening_batch_summary();
+    let opening_batch = merge_relation_opening_batches(&[&e1_batch, &e2_batch])?;
+    let opening_batch_digest = opening_batch.source_digest;
     let encoding_batch = PaperProtocol10EncodingBatchProof {
         relation_challenges: vec![e1.challenge, e2.challenge],
         e1,
         e2,
         opening_batch_digest,
     };
-    let transcript_state = digest_serialized(&(
-        commitment.root,
+    let transcript_state = compact_codec::protocol11_transcript_state(
+        commitment,
         &point,
         claimed_value,
         &encoding_batch,
         &opening_batch,
-    ))?;
+    );
     let proof = PaperProtocol11Proof {
         config: commitment.config,
         point,
@@ -264,6 +277,8 @@ pub fn verify(
     // Protocol 11 step 10(b/c): validate worker metadata and compute the
     // aggregate claim before checking it against the advertised value.
     let composition_check = check_composed_claim(commitment, proof)?;
+    let worker_contexts =
+        protocol10_worker_contexts(commitment, &proof.point, &proof.worker_openings)?;
     let relation_verify_start = Instant::now();
     // Implementation optimization: verify independent worker PCS openings in
     // parallel. This is scheduling only, not an artifact batch-verify API.
@@ -271,12 +286,17 @@ pub fn verify(
         .into_par_iter()
         .map(|worker_id| {
             let worker_start = Instant::now();
+            let oracle = compact_codec::oracle_from_seed(
+                commitment.workers_commitments[worker_id].oracle_seed,
+                commitment.artifact_nv,
+                commitment.config.query_count(),
+            );
             verify_worker_opening(
                 commitment.config,
                 commitment.artifact_nv,
                 &commitment.workers_commitments[worker_id].pcs_commitment,
                 &proof.worker_openings[worker_id],
-                &commitment.workers_commitments[worker_id].oracle,
+                &oracle,
             )?;
             Ok(worker_start.elapsed().as_secs_f64() * 1000.0)
         })
@@ -292,6 +312,7 @@ pub fn verify(
         commitment,
         &proof.point,
         &proof.worker_openings,
+        &worker_contexts,
     )?;
     // Protocol 11 step 10(e): verify the relation proof for E2 = Enc(F2).
     verify_protocol10_relation(
@@ -301,32 +322,28 @@ pub fn verify(
         commitment,
         &proof.point,
         &proof.worker_openings,
+        &worker_contexts,
     )?;
-    let expected_opening_batch = merge_relation_opening_batches(&[
-        &proof.encoding_batch.e1.opening_batch,
-        &proof.encoding_batch.e2.opening_batch,
-    ])?;
-    if proof.opening_batch.claims != expected_opening_batch.claims
-        || proof.opening_batch.gammas != expected_opening_batch.gammas
-        || proof.opening_batch.reduction_point != expected_opening_batch.reduction_point
-        || proof.opening_batch.combined_value != expected_opening_batch.combined_value
-        || proof.opening_batch.source_digest != expected_opening_batch.source_digest
+    let expected_e1 = proof.encoding_batch.e1.opening_batch_summary();
+    let expected_e2 = proof.encoding_batch.e2.opening_batch_summary();
+    let expected_opening_batch = merge_relation_opening_batches(&[&expected_e1, &expected_e2])?;
+    if proof.opening_batch != expected_opening_batch
         || proof.encoding_batch.relation_challenges
             != vec![
                 proof.encoding_batch.e1.challenge,
                 proof.encoding_batch.e2.challenge,
             ]
-        || proof.encoding_batch.opening_batch_digest != digest_serialized(&proof.opening_batch)?
+        || proof.encoding_batch.opening_batch_digest != proof.opening_batch.source_digest
     {
         return Err(PaperDepcsError::InvalidProof);
     }
-    let expected_transcript = digest_serialized(&(
-        commitment.root,
+    let expected_transcript = compact_codec::protocol11_transcript_state(
+        commitment,
         &proof.point,
         proof.claimed_value,
         &proof.encoding_batch,
         &proof.opening_batch,
-    ))?;
+    );
     if proof.transcript_state != expected_transcript {
         return Err(PaperDepcsError::InvalidProof);
     }

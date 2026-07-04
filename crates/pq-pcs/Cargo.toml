@@ -13,7 +13,6 @@ pq-core = { path = "../pq-core" }
 rayon = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
-paper-basefold = { package = "basefold", path = "../../third_party/deepfold-bench-v0.1/basefold" }
 paper-deepfold = { package = "deepfold", path = "../../third_party/deepfold-bench-v0.1/deepfold" }
 paper-util = { package = "util", path = "../../third_party/deepfold-bench-v0.1/util" }
 

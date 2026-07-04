@@ -1,4 +1,5 @@
 use rayon::prelude::*;
+use std::sync::Arc;
 use util::{
     algebra::{
         coset::Coset,
@@ -16,7 +17,7 @@ use util::CODE_RATE;
 #[derive(Clone)]
 pub struct Prover<T: MyField> {
     total_round: usize,
-    interpolate_cosets: Vec<Coset<T>>,
+    interpolate_cosets: Arc<Vec<Coset<T>>>,
     interpolations: Vec<InterpolateValue<T>>,
     hypercube_interpolation: Vec<T>,
     deep_eval: Vec<DeepEval<T>>,
@@ -54,19 +55,40 @@ impl<T: MyField> Prover<T> {
         step: usize,
         code_rate: usize,
     ) -> Self {
+        Self::new_with_code_rate_shared(
+            total_round,
+            Arc::new(interpolate_cosets.clone()),
+            polynomial,
+            oracle,
+            step,
+            code_rate,
+        )
+    }
+
+    pub fn new_with_code_rate_shared(
+        total_round: usize,
+        interpolate_cosets: Arc<Vec<Coset<T>>>,
+        polynomial: MultilinearPolynomial<T>,
+        oracle: &RandomOracle<T>,
+        step: usize,
+        code_rate: usize,
+    ) -> Self {
         let point = std::iter::successors(Some(oracle.deep[0]), |&x| Some(x * x))
             .take(total_round)
             .collect::<Vec<_>>();
         let hypercube_interpolation = polynomial.evaluate_hypercube();
+        let mut scratch = Vec::new();
+        let initial_deep = DeepEval::new_from_slice(point, &hypercube_interpolation, &mut scratch);
+        let interpolation = InterpolateValue::new(
+            interpolate_cosets[0].fft(polynomial.into_coefficients()),
+            1 << step,
+        );
         Prover {
             total_round,
-            interpolate_cosets: interpolate_cosets.clone(),
-            interpolations: vec![InterpolateValue::new(
-                interpolate_cosets[0].fft(polynomial.coefficients().clone()),
-                1 << step,
-            )],
-            hypercube_interpolation: hypercube_interpolation.clone(),
-            deep_eval: vec![DeepEval::new(point.clone(), hypercube_interpolation)],
+            interpolate_cosets,
+            interpolations: vec![interpolation],
+            hypercube_interpolation,
+            deep_eval: vec![initial_deep],
             shuffle_eval: None,
             oracle: oracle.clone(),
             final_value: None,
@@ -83,7 +105,25 @@ impl<T: MyField> Prover<T> {
         }
     }
 
-    fn evaluation_next_domain(&self, round: usize, challenges: &Vec<T>) -> Vec<T> {
+    fn evaluation_next_domain(&self, round: usize, challenges: &[T]) -> Vec<T> {
+        if self.step == 1 {
+            let current = &self.interpolations[round].value;
+            if challenges.is_empty() {
+                return current.clone();
+            }
+            let len = self.interpolate_cosets[round].size();
+            let coset = &self.interpolate_cosets[round];
+            let challenge = challenges[0];
+            return (0..(len / 2))
+                .into_par_iter()
+                .map(|i| {
+                    let x = current[i];
+                    let nx = current[i + len / 2];
+                    let new_v = (x + nx) + challenge * (x - nx) * coset.element_inv_at(i);
+                    new_v * T::inverse_2()
+                })
+                .collect();
+        }
         let mut get_folding_value = self.interpolations[round].value.clone();
 
         for j in 0..self.step {
@@ -119,10 +159,12 @@ impl<T: MyField> Prover<T> {
     }
 
     pub fn prove(&mut self, point: Vec<T>) {
-        let mut hypercube_interpolation = self.hypercube_interpolation.clone();
-        self.shuffle_eval = Some(DeepEval::new(
+        let mut hypercube_interpolation = std::mem::take(&mut self.hypercube_interpolation);
+        let mut eval_scratch = Vec::with_capacity(hypercube_interpolation.len());
+        self.shuffle_eval = Some(DeepEval::new_from_slice(
             point.clone(),
-            hypercube_interpolation.clone(),
+            &hypercube_interpolation,
+            &mut eval_scratch,
         ));
         for i in 0..self.total_round / self.step + 1 {
             let mut challenges: Vec<T> = vec![];
@@ -140,9 +182,9 @@ impl<T: MyField> Prover<T> {
                 self.shuffle_eval
                     .as_mut()
                     .unwrap()
-                    .append_else_eval(hypercube_interpolation.clone());
+                    .append_else_eval_from_slice(&hypercube_interpolation, &mut eval_scratch);
                 for deep in &mut self.deep_eval {
-                    deep.append_else_eval(hypercube_interpolation.clone());
+                    deep.append_else_eval_from_slice(&hypercube_interpolation, &mut eval_scratch);
                 }
 
                 if i * self.step + j < self.total_round - 1 {
@@ -155,7 +197,11 @@ impl<T: MyField> Prover<T> {
                         )
                         .take(self.total_round - (i * self.step + j) - 1)
                         .collect::<Vec<_>>();
-                        DeepEval::new(deep_point.clone(), hypercube_interpolation.clone())
+                        DeepEval::new_from_slice(
+                            deep_point,
+                            &hypercube_interpolation,
+                            &mut eval_scratch,
+                        )
                     });
                 }
             }
@@ -187,11 +233,11 @@ impl<T: MyField> Prover<T> {
 
         for i in 0..self.total_round / self.step + 1 {
             let len = self.interpolate_cosets[i * self.step].size();
-            leaf_indices = leaf_indices
-                .iter_mut()
-                .map(|v| *v % (len >> self.step))
-                .collect();
-            leaf_indices.sort();
+            let leaf_domain_size = len >> self.step;
+            for idx in &mut leaf_indices {
+                *idx %= leaf_domain_size;
+            }
+            leaf_indices.sort_unstable();
             leaf_indices.dedup();
             res.push(self.interpolations[i].query(&leaf_indices));
         }
@@ -201,6 +247,8 @@ impl<T: MyField> Prover<T> {
     pub fn generate_proof(mut self, point: Vec<T>) -> Proof<T> {
         self.prove(point);
         let query_result = self.query();
+        let shuffle_eval = self.shuffle_eval.take().unwrap();
+        let evaluation = shuffle_eval.first_eval;
         Proof {
             merkle_root: (1..self.total_round / self.step)
                 .into_iter()
@@ -209,13 +257,13 @@ impl<T: MyField> Prover<T> {
             query_result,
             deep_evals: self
                 .deep_eval
-                .iter()
-                .map(|x| (x.first_eval, x.else_evals.clone()))
+                .into_iter()
+                .map(|x| (x.first_eval, x.else_evals))
                 .collect(),
-            shuffle_evals: self.shuffle_eval.as_ref().unwrap().else_evals.clone(),
+            shuffle_evals: shuffle_eval.else_evals,
             final_value: self.final_value.unwrap(),
             final_poly: self.final_poly.unwrap(),
-            evaluation: self.shuffle_eval.as_ref().unwrap().first_eval,
+            evaluation,
         }
     }
 }

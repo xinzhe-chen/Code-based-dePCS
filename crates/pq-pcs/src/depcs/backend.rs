@@ -1,6 +1,6 @@
 //! Paper-backed PCS backend descriptors for the artifact-backed dePCS path.
 //!
-//! These name the vendored BaseFold/DeepFold backend, its query policy, and the
+//! These name the vendored DeepFold backend, its query policy, and the
 //! source/security metadata the distributed dePCS commits to. (The older
 //! single-machine "paper-native" runner that used to live alongside these types
 //! was removed together with the non-distributed benchmark path.)
@@ -10,21 +10,18 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaperPcsBackend {
-    BaseFold,
     DeepFold,
 }
 
 impl PaperPcsBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::BaseFold => "basefold",
             Self::DeepFold => "deepfold",
         }
     }
 
     pub const fn scheme_name(self) -> &'static str {
         match self {
-            Self::BaseFold => "paper-depcs-basefold",
             Self::DeepFold => "paper-depcs-deepfold",
         }
     }
@@ -58,14 +55,10 @@ pub fn paper_query_count(backend: PaperPcsBackend) -> usize {
 
 pub fn paper_query_count_for_code_rate(backend: PaperPcsBackend, code_rate_log: usize) -> usize {
     match backend {
-        PaperPcsBackend::BaseFold => {
-            let denominator = (2.0 / (1.0 + 0.5_f32.powi(code_rate_log as i32))).log2();
-            (SECURITY_BITS as f32 / denominator).ceil() as usize
-        }
         PaperPcsBackend::DeepFold => SECURITY_BITS.div_ceil(code_rate_log.max(1)),
     }
 }
 
 pub fn paper_fair_query_count() -> usize {
-    paper_query_count(PaperPcsBackend::BaseFold).max(paper_query_count(PaperPcsBackend::DeepFold))
+    paper_query_count(PaperPcsBackend::DeepFold)
 }

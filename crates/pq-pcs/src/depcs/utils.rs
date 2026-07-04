@@ -4,14 +4,8 @@
 //! protocol steps and must not change transcript labels, serialization, or field
 //! encodings without an explicit benchmark-compatibility migration.
 
-use serde::Serialize;
-
-use paper_util::algebra::field::MyField;
-
 use paper_util::STEP;
-use paper_util::algebra::polynomial::MultilinearPolynomial;
-
-use crate::hash::sha256;
+use paper_util::algebra::field::MyField;
 
 use super::types::*;
 
@@ -40,23 +34,6 @@ pub(crate) fn artifact_point(point: &[PaperField], artifact_nv: usize) -> Vec<Pa
     let mut padded = point.to_vec();
     padded.resize(artifact_nv, PaperField::from_int(0));
     padded
-}
-
-pub(crate) fn evaluate_multilinear_slice(
-    values: &[PaperField],
-    point: &[PaperField],
-) -> PaperField {
-    MultilinearPolynomial::new(values.to_vec()).evaluate(&point.to_vec())
-}
-
-pub(crate) fn digest_serialized<T: Serialize>(value: &T) -> PaperDepcsResult<[u8; 32]> {
-    Ok(sha256(
-        &bincode::serialize(value).map_err(|_| PaperDepcsError::Serialization)?,
-    ))
-}
-
-pub(crate) fn serialized_size<T: Serialize>(value: &T) -> usize {
-    bincode::serialized_size(value).unwrap_or(0) as usize
 }
 
 pub(crate) fn panic_message(error: Box<dyn std::any::Any + Send>) -> String {

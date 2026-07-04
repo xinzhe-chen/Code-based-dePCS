@@ -75,8 +75,6 @@ SCHEME_COLORS = {
     "dsumcheck3": "\033[38;5;178m",     # gold
     "dsumcheck4": "\033[38;5;81m",      # teal
     "dhyperpianist": "\033[38;5;129m",  # purple
-    "dhyperfond": "\033[38;5;34m",      # green (different shade)
-    "dbasefold-pcs": "\033[38;5;112m",  # light green
     "dfrittata-pcs": "\033[38;5;214m",  # orange-yellow
 }
 COLOR_RESET = "\033[0m"
@@ -217,36 +215,6 @@ EXTERNAL_SCHEMES = {
         ),
         "run_cmd": lambda i, remote_dir, config_path, mu, iterations: (
             f"{remote_dir}/{EXTERNAL_SCHEMES['dhyperpianist']['binary']} {i} {remote_dir}/{config_path} --jellyfish {mu} -i {iterations} 2>&1"
-        ),
-    },
-    "dhyperfond": {
-        "display_name": "dHyperFond",
-        "local_dir": WORKSPACE / "external" / "HyperFond",
-        "remote_dir": "~/HyperFond",
-        "binary": "plonkish/target/release/examples/distributed_basefold_proof_system",
-        "config_path": "plonkish/deNetwork/data/network.conf",
-        "port": 28000,
-        "build_cmd": lambda mu: (
-            f"source ~/.cargo/env && cd plonkish && RUSTFLAGS='-Awarnings' "
-            f"cargo build --release --example distributed_basefold_proof_system"
-        ),
-        "run_cmd": lambda i, remote_dir, config_path, mu, iterations: (
-            f"cd {remote_dir}/plonkish/benchmark && mkdir -p ../data && RAYON_NUM_THREADS=1 {remote_dir}/{EXTERNAL_SCHEMES['dhyperfond']['binary']} {i} {remote_dir}/{config_path} {mu} -i {iterations} 2>&1"
-        ),
-    },
-    "dbasefold-pcs": {
-        "display_name": "dBasefold-PCS",
-        "local_dir": WORKSPACE / "external" / "HyperFond",
-        "remote_dir": "~/HyperFond",
-        "binary": "plonkish/target/release/examples/distributed_basefold_pcs",
-        "config_path": "plonkish/deNetwork/data/network.conf",
-        "port": 28000,
-        "build_cmd": lambda mu: (
-            f"source ~/.cargo/env && cd plonkish && RUSTFLAGS='-Awarnings' "
-            f"cargo build --release --example distributed_basefold_pcs"
-        ),
-        "run_cmd": lambda i, remote_dir, config_path, mu, iterations: (
-            f"RAYON_NUM_THREADS=1 {remote_dir}/{EXTERNAL_SCHEMES['dbasefold-pcs']['binary']} {i} {remote_dir}/{config_path} {mu} -i {iterations} 2>&1"
         ),
     },
     "dfrittata-pcs": {
@@ -1434,7 +1402,7 @@ def parse_duration_to_ms(duration_str: str) -> Optional[float]:
 
 
 def parse_external_output(output: str) -> dict:
-    """Parse output from external schemes (dpip-fri-pcs, dmkzg-pcs, dhyperfond, dbasefold-pcs, etc.)"""
+    """Parse output from external schemes (dpip-fri-pcs, dmkzg-pcs, etc.)"""
     result = {}
 
     # Standard patterns (machine-readable)
@@ -2377,7 +2345,6 @@ Commands:
                       Example: run -s ligesis -m 24            # single-thread
                       Example: run -s dligesis -m 28 --build   # distributed
                       Example: run -s dpip-fri-pcs -m 27 --sync --build  # external PCS
-                      Example: run -s dhyperfond -m 24 --sync --build    # external SNARK
 
   batch [-s <schemes>] [-m <mus>] [-i <iterations>] [--build] [--sync]
                       Run batch benchmarks
@@ -2385,8 +2352,8 @@ Commands:
                       Example: batch -s dligesis -m 27,28 -i 5 --build
                       Example: batch -s dpip-fri-pcs,dmkzg-pcs -m 24 --sync --build
 
-  External PCS: dpip-fri-pcs, dmkzg-pcs, ddory-pcs, dbasefold-pcs
-  External SNARK: dhyperpianist, dhyperfond
+  External PCS: dpip-fri-pcs, dmkzg-pcs, ddory-pcs
+  External SNARK: dhyperpianist
     --sync            Sync external code to servers before running
     --build           Build on remote servers before running
 

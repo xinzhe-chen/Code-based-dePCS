@@ -1,7 +1,6 @@
-use crate::algebra::field::{as_bytes_vec, MyField};
-use crate::merkle_tree::MerkleTreeVerifier;
+use crate::algebra::field::MyField;
+use crate::merkle_tree::{hash_field_leaf, MerkleTreeVerifier};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::mem::size_of;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -15,27 +14,27 @@ pub struct QueryResult<T: MyField> {
 }
 
 impl<T: MyField> QueryResult<T> {
-    /// Rebuild the `index -> value` map from canonical-order `proof_values`.
-    /// Fails closed (panics) unless exactly `leaf_indices.len() * leaf_size`
-    /// values are present, so tampered length / missing / extra values reject.
-    pub fn values_to_map(
-        &self,
-        leaf_indices: &[usize],
-        leaf_size: usize,
-        len: usize,
-    ) -> HashMap<usize, T> {
+    pub fn assert_canonical_len(&self, leaf_indices: &[usize], leaf_size: usize) {
         assert_eq!(
             self.proof_values.len(),
             leaf_indices.len() * leaf_size,
             "query proof_values length mismatch"
         );
-        let mut map = HashMap::with_capacity(self.proof_values.len());
-        for (p, idx) in leaf_indices.iter().enumerate() {
-            for j in 0..leaf_size {
-                map.insert(*idx + j * len, self.proof_values[p * leaf_size + j]);
-            }
-        }
-        map
+    }
+
+    /// Read a value keyed by the original interpolation index without
+    /// rebuilding a HashMap. The key must be of the form `idx + j * len`, where
+    /// `idx` is in the verifier's sorted/deduped leaf index list.
+    pub fn value_at(&self, leaf_indices: &[usize], leaf_size: usize, len: usize, key: usize) -> T {
+        self.assert_canonical_len(leaf_indices, leaf_size);
+        let idx = key % len;
+        let column = key / len;
+        assert!(column < leaf_size, "query value column out of range");
+        let row = match leaf_indices.binary_search(&idx) {
+            Ok(row) => row,
+            Err(_) => panic!("query value index missing"),
+        };
+        self.proof_values[row * leaf_size + column]
     }
 
     pub fn verify_merkle_tree(
@@ -45,18 +44,18 @@ impl<T: MyField> QueryResult<T> {
         merkle_verifier: &MerkleTreeVerifier,
     ) -> bool {
         let len = merkle_verifier.leave_number;
-        let values = self.values_to_map(leaf_indices, leaf_size, len);
-        let leaves: Vec<Vec<u8>> = leaf_indices
+        self.assert_canonical_len(leaf_indices, leaf_size);
+        let leaf_hashes = leaf_indices
             .iter()
             .map(|x| {
-                as_bytes_vec(
-                    &(0..leaf_size)
-                        .map(|j| values[&(*x + j * len)])
-                        .collect::<Vec<_>>(),
+                hash_field_leaf(
+                    (0..leaf_size)
+                        .map(|j| self.value_at(leaf_indices, leaf_size, len, *x + j * len)),
                 )
             })
-            .collect();
-        let res = merkle_verifier.verify(self.proof_bytes.clone(), leaf_indices, &leaves);
+            .collect::<Vec<_>>();
+        let res =
+            merkle_verifier.verify_with_leaf_hashes(&self.proof_bytes, leaf_indices, &leaf_hashes);
         assert!(res);
         res
     }

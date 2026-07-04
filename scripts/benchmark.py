@@ -17,6 +17,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -338,8 +339,8 @@ def parse_pcs_summary(run_dir: Path) -> list[MetricRow]:
             nv = int(record.get("nv", record.get("variable_count", record.get("nv_power", 0))))
             polynomial_length = int(record.get("polynomial_length", record.get("size", 0)))
             scheme = record.get("scheme", "pq_dSNARK dePCS")
-            backend = record.get("backend", "basefold")
-            backend_rate_inv = int(record.get("backend_rate_inv", 4 if backend == "basefold" else 0))
+            backend = record.get("backend", "deepfold")
+            backend_rate_inv = int(record.get("backend_rate_inv", 2 if backend == "deepfold" else 0))
             key = (scheme, record["runner"], record["opening"], int(record["workers"]), nv)
             worker_commit_ms = worker_commit_means.get(key)
             batch = batch_means.get(key, {})
@@ -721,16 +722,10 @@ def parse_backend_specs(value: str) -> list[tuple[str, int]]:
         backend, rate = part.split(":", 1)
         backend = backend.strip()
         rate_inv = int(rate.strip())
-        if (backend, rate_inv) not in {
-            ("basefold", 8),
-            ("deepfold", 2),
-            ("basefold", 4),
-            ("deepfold", 4),
-        }:
+        if (backend, rate_inv) not in {("deepfold", 2)}:
             raise SystemExit(
                 "unsupported dePCS backend spec "
-                f"'{part}', expected basefold:8/deepfold:2 for paper-backed protocol11 "
-                "or basefold:4/deepfold:4 for legacy runs"
+                f"'{part}', expected deepfold:2 for paper-backed protocol11"
             )
         specs.append((backend, rate_inv))
     if not specs:
@@ -907,6 +902,153 @@ def newest_pcs_run_after(out_dir: Path, before: set[Path], started_after: float)
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
 
+def parse_cpu_list(value: str) -> list[int]:
+    cpus: list[int] = []
+    for item in value.strip().split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_text, end_text = item.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            if end < start:
+                raise ValueError(f"invalid CPU range '{item}'")
+            cpus.extend(range(start, end + 1))
+        else:
+            cpus.append(int(item))
+    return sorted(dict.fromkeys(cpus))
+
+
+def format_cpu_list(cpus: Iterable[int]) -> str:
+    ordered = sorted(dict.fromkeys(int(cpu) for cpu in cpus))
+    if not ordered:
+        return ""
+    ranges: list[str] = []
+    start = prev = ordered[0]
+    for cpu in ordered[1:]:
+        if cpu == prev + 1:
+            prev = cpu
+            continue
+        ranges.append(f"{start}-{prev}" if start != prev else str(start))
+        start = prev = cpu
+    ranges.append(f"{start}-{prev}" if start != prev else str(start))
+    return ",".join(ranges)
+
+
+def linux_numa_cpu_nodes() -> list[list[int]]:
+    if not sys.platform.startswith("linux"):
+        return []
+    nodes: list[tuple[int, list[int]]] = []
+    node_root = Path("/sys/devices/system/node")
+    for path in sorted(node_root.glob("node[0-9]*/cpulist")):
+        match = re.search(r"node(\d+)", str(path.parent.name))
+        if match is None:
+            continue
+        try:
+            cpus = parse_cpu_list(path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if cpus:
+            nodes.append((int(match.group(1)), cpus))
+    return [cpus for _, cpus in sorted(nodes)]
+
+
+def allocate_worker_cpu_lists(
+    host_logical_cores: int,
+    workers: int,
+    cores_per_worker: int,
+    numa_nodes: list[list[int]],
+) -> list[list[int]]:
+    if workers <= 0 or cores_per_worker <= 0:
+        return []
+    if numa_nodes:
+        remaining_nodes = [list(node) for node in numa_nodes]
+        global_remaining = [cpu for node in remaining_nodes for cpu in node]
+    else:
+        remaining_nodes = []
+        global_remaining = list(range(max(0, host_logical_cores)))
+    allocations: list[list[int]] = []
+    used: set[int] = set()
+    for _ in range(workers):
+        selected: list[int] | None = None
+        for node in remaining_nodes:
+            available = [cpu for cpu in node if cpu not in used]
+            if len(available) >= cores_per_worker:
+                selected = available[:cores_per_worker]
+                break
+        if selected is None:
+            selected = [cpu for cpu in global_remaining if cpu not in used][:cores_per_worker]
+        if len(selected) < cores_per_worker:
+            raise RuntimeError(
+                f"insufficient CPUs for affinity allocation: workers={workers}, cores_per_worker={cores_per_worker}"
+            )
+        used.update(selected)
+        allocations.append(selected)
+    return allocations
+
+
+def affinity_plan_for_row(args: argparse.Namespace, workers: int) -> dict[str, str]:
+    cores_per_worker = fair_row_cores_per_worker(args, workers)
+    policy = "adaptive-affinity-per-row"
+    if not sys.platform.startswith("linux"):
+        return {
+            "thread_policy": policy,
+            "row_cpuset": "",
+            "worker_cpusets": "",
+            "numa_policy": "unsupported-noop",
+            "affinity_status": f"unsupported-noop:{sys.platform}",
+        }
+    numa_nodes = linux_numa_cpu_nodes()
+    worker_cpu_lists = allocate_worker_cpu_lists(
+        int(args.host_logical_cores), workers, cores_per_worker, numa_nodes
+    )
+    worker_cpusets = [format_cpu_list(cpus) for cpus in worker_cpu_lists]
+    row_cpuset = format_cpu_list(cpu for cpus in worker_cpu_lists for cpu in cpus)
+    taskset_status = "taskset-available" if shutil.which("taskset") else "taskset-missing-noop"
+    return {
+        "thread_policy": policy,
+        "row_cpuset": row_cpuset,
+        "worker_cpusets": ";".join(worker_cpusets),
+        "numa_policy": "local-node-if-available" if numa_nodes else "flat-contiguous-fallback",
+        "affinity_status": taskset_status,
+    }
+
+
+def wrap_with_row_affinity(cmd: list[str], row: dict) -> list[str]:
+    row_cpuset = str(row.get("row_cpuset") or "")
+    if (
+        sys.platform.startswith("linux")
+        and row_cpuset
+        and str(row.get("affinity_status") or "").startswith("taskset-available")
+    ):
+        return ["taskset", "-c", row_cpuset, *cmd]
+    return cmd
+
+
+def affinity_env_for_row(row: dict) -> dict[str, str]:
+    return {
+        "PQ_THREAD_POLICY": str(row.get("thread_policy") or "adaptive-affinity-per-row"),
+        "PQ_ROW_CPUSET": str(row.get("row_cpuset") or ""),
+        "PQ_WORKER_CPUSETS": str(row.get("worker_cpusets") or ""),
+        "PQ_NUMA_POLICY": str(row.get("numa_policy") or "unknown"),
+        "PQ_AFFINITY_STATUS": str(row.get("affinity_status") or "unknown"),
+    }
+
+
+def self_test_affinity() -> int:
+    assert parse_cpu_list("0-3,8,10-11") == [0, 1, 2, 3, 8, 10, 11]
+    assert format_cpu_list([0, 1, 2, 3, 8, 10, 11]) == "0-3,8,10-11"
+    flat = allocate_worker_cpu_lists(32, 4, 8, [])
+    assert [format_cpu_list(cpus) for cpus in flat] == ["0-7", "8-15", "16-23", "24-31"]
+    numa = allocate_worker_cpu_lists(16, 4, 4, [list(range(0, 8)), list(range(8, 16))])
+    assert [format_cpu_list(cpus) for cpus in numa] == ["0-3", "4-7", "8-11", "12-15"]
+    mixed = allocate_worker_cpu_lists(10, 3, 3, [list(range(0, 4)), list(range(4, 10))])
+    assert [format_cpu_list(cpus) for cpus in mixed] == ["0-2", "4-6", "7-9"]
+    print("affinity self-test passed")
+    return 0
+
+
 def build_fair_schedule(args: argparse.Namespace) -> list[dict]:
     depcs_nvs = parse_nv_range(args.depcs_nv_range)
     if args.ligesis_nvs != depcs_nvs:
@@ -918,9 +1060,7 @@ def build_fair_schedule(args: argparse.Namespace) -> list[dict]:
     index = 1
     fixed_scheme_order = [
         ("depcs", "depcs-deepfold-paper-protocol11", "deepfold", "protocol11"),
-        ("depcs", "depcs-basefold-paper-protocol11", "basefold", "protocol11"),
         ("depcs", "depcs-deepfold-paper-protocol11-batch", "deepfold", "protocol11-batch"),
-        ("depcs", "depcs-basefold-paper-protocol11-batch", "basefold", "protocol11-batch"),
         ("ligesis", "LigeSIS", None),
         ("external", "dFRIttata", "dfrittata-pcs"),
         ("external", "dPIP-FRI", "dpip-fri-pcs"),
@@ -938,6 +1078,8 @@ def build_fair_schedule(args: argparse.Namespace) -> list[dict]:
             continue
         for nv in depcs_nvs:
             for workers in args.depcs_worker_values:
+                cores_per_worker = fair_row_cores_per_worker(args, workers)
+                affinity_plan = affinity_plan_for_row(args, workers)
                 if kind == "ligesis":
                     query_semantics = "scheme-native-ligesis"
                     query_count = ""
@@ -959,8 +1101,9 @@ def build_fair_schedule(args: argparse.Namespace) -> list[dict]:
                         "workers": workers,
                         "query_count": query_count,
                         "query_count_semantics": query_semantics,
-                        "cores_per_worker": args.cores_per_worker,
-                        "total_thread_budget": workers * args.cores_per_worker,
+                        "cores_per_worker": cores_per_worker,
+                        "total_thread_budget": workers * cores_per_worker,
+                        **affinity_plan,
                         "status": "pending",
                         "command": "",
                         "failure_reason": "",
@@ -971,6 +1114,17 @@ def build_fair_schedule(args: argparse.Namespace) -> list[dict]:
                 )
                 index += 1
     return rows
+
+
+def fair_row_cores_per_worker(args: argparse.Namespace, workers: int) -> int:
+    return max(1, int(args.host_logical_cores) // max(1, int(workers)))
+
+
+def current_cores_per_worker(args: argparse.Namespace) -> int:
+    row = getattr(args, "current_schedule_row", None)
+    if row is not None:
+        return int(row.get("cores_per_worker") or args.cores_per_worker or 1)
+    return int(args.cores_per_worker or 1)
 
 
 def write_schedule_csv(path: Path, schedule: list[dict]) -> None:
@@ -987,6 +1141,11 @@ def write_schedule_csv(path: Path, schedule: list[dict]) -> None:
         "query_count_semantics",
         "cores_per_worker",
         "total_thread_budget",
+        "thread_policy",
+        "row_cpuset",
+        "worker_cpusets",
+        "numa_policy",
+        "affinity_status",
         "status",
         "command",
         "failure_reason",
@@ -1005,7 +1164,8 @@ def annotate_run_context(rows: list[MetricRow], args: argparse.Namespace) -> Non
     for row in rows:
         row.host_logical_cores = int(args.host_logical_cores)
         row.max_workers = int(args.max_workers)
-        row.cores_per_worker = int(args.cores_per_worker)
+        if not row.cores_per_worker:
+            row.cores_per_worker = int(args.cores_per_worker or 1)
         if not row.query_count_semantics:
             if row.scheme.startswith("LigeSIS"):
                 row.query_count_semantics = "scheme-native-ligesis"
@@ -1103,8 +1263,12 @@ def run_ligesis_local(
         log_m = compute_ligesis_log_m(mu, parties)
         base_mu = compute_ligesis_base_mu(mu, parties)
         child_env = os.environ.copy()
-        child_env["RAYON_NUM_THREADS"] = str(args.cores_per_worker)
-        child_env["PQ_CORES_PER_WORKER"] = str(args.cores_per_worker)
+        cores_per_worker = current_cores_per_worker(args)
+        child_env["RAYON_NUM_THREADS"] = str(cores_per_worker)
+        child_env["PQ_CORES_PER_WORKER"] = str(cores_per_worker)
+        row = getattr(args, "current_schedule_row", None)
+        if row is not None:
+            child_env.update(affinity_env_for_row(row))
         events: queue.Queue[tuple[int, str]] = queue.Queue()
         stdout_parts: list[list[str]] = []
         cpu_seconds: list[float | None] = []
@@ -1120,6 +1284,8 @@ def run_ligesis_local(
                 "--base-mu",
                 str(base_mu),
             ]
+            if row is not None:
+                cmd = wrap_with_row_affinity(cmd, row)
             proc = subprocess.Popen(
                 cmd,
                 cwd=project_dir,
@@ -1138,8 +1304,7 @@ def run_ligesis_local(
                 args=(party_id, proc, events),
                 daemon=True,
             ).start()
-        if getattr(args, "run_events_path", None) and getattr(args, "current_schedule_row", None):
-            row = args.current_schedule_row
+        if getattr(args, "run_events_path", None) and row is not None:
             write_jsonl_event(
                 Path(args.run_events_path),
                 {
@@ -1235,7 +1400,7 @@ def run_ligesis_local(
                 "--mu",
                 str(mu),
                 "--cores-per-worker",
-                str(args.cores_per_worker),
+                str(cores_per_worker),
             ],
             "\n".join(formatted_stdout),
             stderr,
@@ -1291,8 +1456,12 @@ def run_external_pcs_local(
     procs = []
     try:
         child_env = os.environ.copy()
-        child_env["RAYON_NUM_THREADS"] = str(args.cores_per_worker)
-        child_env["PQ_CORES_PER_WORKER"] = str(args.cores_per_worker)
+        cores_per_worker = current_cores_per_worker(args)
+        child_env["RAYON_NUM_THREADS"] = str(cores_per_worker)
+        child_env["PQ_CORES_PER_WORKER"] = str(cores_per_worker)
+        row = getattr(args, "current_schedule_row", None)
+        if row is not None:
+            child_env.update(affinity_env_for_row(row))
         events: queue.Queue[tuple[int, str]] = queue.Queue()
         stdout_parts: list[list[str]] = []
         cpu_seconds: list[float | None] = []
@@ -1302,6 +1471,8 @@ def run_external_pcs_local(
                 str(binary),
                 *spec["args"](party_id, config_path, nv, args.repeats, query_count),
             ]
+            if row is not None:
+                cmd = wrap_with_row_affinity(cmd, row)
             proc = subprocess.Popen(
                 cmd,
                 cwd=run_cwd,
@@ -1316,8 +1487,7 @@ def run_external_pcs_local(
             stdout_parts.append([])
             cpu_seconds.append(child_cpu_seconds(proc))
             threading.Thread(target=stream_reader, args=(party_id, proc, events), daemon=True).start()
-        if getattr(args, "run_events_path", None) and getattr(args, "current_schedule_row", None):
-            row = args.current_schedule_row
+        if getattr(args, "run_events_path", None) and row is not None:
             write_jsonl_event(
                 Path(args.run_events_path),
                 {
@@ -1411,7 +1581,7 @@ def run_external_pcs_local(
                 "--mu",
                 str(nv),
                 "--cores-per-worker",
-                str(args.cores_per_worker),
+                str(cores_per_worker),
                 *([] if query_count is None else ["--queries", str(query_count)]),
             ],
             "\n".join(formatted_stdout),
@@ -1605,7 +1775,6 @@ def failure_excerpt(output: str, returncode: int) -> str:
     if not output:
         return f"exit {returncode}"
     markers = [
-        "batch_unavailable_basefold_artifact_no_batch_api",
         "batch_unavailable_deepfold_artifact_native_batch_api_missing",
         "paper-backed Protocol 11 is not implemented yet: refusing to fall back to paper-native PCS core without pq_dSNARK Protocol10/11 network proof",
     ]
@@ -1902,8 +2071,6 @@ def write_speedup_svg(path: Path, rows: list[MetricRow]) -> None:
 def display_scheme(row: MetricRow) -> str:
     if row.scheme.startswith("depcs-deepfold"):
         return "dePCS_Deepfold"
-    if row.scheme.startswith("depcs-basefold"):
-        return "dePCS_Basefold"
     return row.scheme
 
 
@@ -2060,21 +2227,21 @@ def write_all_svgs(out_dir: Path, rows: list[MetricRow]) -> list[str]:
     charts = [
         (
             "comparison_prover_time.svg",
-            "dePCS BaseFold vs DeepFold vs external PCS prover time",
+            "dePCS DeepFold vs external PCS prover time",
             "Commit + open time by nv and node count; blocked external rows are omitted.",
             "ms",
             lambda row: row.prover_ms,
         ),
         (
             "comparison_verify_time.svg",
-            "dePCS BaseFold vs DeepFold vs external PCS verify time",
+            "dePCS DeepFold vs external PCS verify time",
             "Verifier time by nv and node count; blocked external rows are omitted.",
             "ms",
             lambda row: row.verify_ms,
         ),
         (
             "comparison_proof_size.svg",
-            "dePCS BaseFold vs DeepFold vs external PCS proof size",
+            "dePCS DeepFold vs external PCS proof size",
             "Verifier-received commitment plus PCS opening proof in KiB by nv and node count; blocked external rows are omitted.",
             "KiB",
             lambda row: row.proof_kib,
@@ -2434,8 +2601,8 @@ def write_report(
             "(scheme,nv,workers) runs alone with a per-row timeout, after release binaries are built."
         )
         scheduling = (
-            f"strict row order is depcs-deepfold, depcs-basefold"
-            f"{', depcs-deepfold-batch, depcs-basefold-batch' if getattr(args, 'include_depcs_batch', False) else ''}, "
+            f"strict row order is depcs-deepfold"
+            f"{', depcs-deepfold-batch' if getattr(args, 'include_depcs_batch', False) else ''}, "
             f"LigeSIS, dFRIttata, dPIP-FRI; "
             f"within each scheme rows run nv ascending then workers ascending. host_logical_cores="
             f"{args.host_logical_cores}, max_workers={args.max_workers}, cores_per_worker="
@@ -2455,16 +2622,17 @@ def write_report(
             "under the 15 minute deadline."
         )
         scheduling = (
-            "dePCS is run in one process per worker value with `RAYON_NUM_THREADS = workers * "
-            "cores_per_worker`; LigeSIS launches one process per party and sets each party process "
-            "to `RAYON_NUM_THREADS = cores_per_worker`."
+            "dePCS fair-sequential rows use adaptive per-row thread allocation: "
+            "`cores_per_worker = floor(host_logical_cores/workers)` and "
+            "`RAYON_NUM_THREADS = workers * cores_per_worker`; LigeSIS/external rows use "
+            "the same row-local per-party thread count."
         )
         timeout_policy = (
             f"parties=1 is recorded as blocked without spawning dLigesis; runnable LigeSIS rows use "
             f"idle timeout {args.ligesis_idle_timeout}s plus the global 15 minute deadline."
         )
     lines = [
-        "# dePCS BaseFold vs DeepFold vs External PCS Benchmark Report",
+        "# dePCS DeepFold vs External PCS Benchmark Report",
         "",
         f"- generated_at: {datetime.now().isoformat(timespec='seconds')}",
         f"- depcs_artifact_dirs: {depcs_dir_text}",
@@ -2472,7 +2640,7 @@ def write_report(
         "- size_semantics: nv is the number of multilinear polynomial variables; polynomial length is N=2^nv. These are PCS sizes, not circuit gate counts.",
         f"- scheduling: {scheduling}",
         f"- timeout_policy: {timeout_policy}",
-        "- query_count_semantics: dePCS BaseFold/DeepFold use the paper-backed backend query policy; dFRIttata, dPIP-FRI, and LigeSIS use their scheme-native query settings unless `--force-external-query-count` is explicitly set.",
+        "- query_count_semantics: dePCS DeepFold uses the paper-backed backend query policy; dFRIttata, dPIP-FRI, and LigeSIS use their scheme-native query settings unless `--force-external-query-count` is explicitly set.",
         "- proof_size_semantics: `proof KiB` is the verifier-received PCS commitment object plus PCS opening proof. It is not prover-local committed polynomial storage.",
         "- communication_semantics: `dePCS send+recv KiB` is only master/worker network sent plus received bytes from dePCS protocol11 rows. External and LigeSIS native communication is reported separately as `native comm KiB`; `communication_cost_kib` is a chart-only derived value with `communication_cost_basis`.",
         "- verifier_semantics: paper-backed dePCS uses parallel independent artifact PCS verification plus batched Protocol10/11 consistency checks; no unsupported artifact batch-verify API is assumed.",
@@ -2530,7 +2698,7 @@ def write_report(
 def fair_row_command(args: argparse.Namespace, row: dict, out_dir: Path) -> list[str]:
     if row["kind"] == "depcs":
         security_bits = depcs_security_bits_for_row(args, row)
-        return [
+        return wrap_with_row_affinity([
             "cargo",
             "run",
             "-p",
@@ -2557,36 +2725,36 @@ def fair_row_command(args: argparse.Namespace, row: dict, out_dir: Path) -> list
             "--repeats",
             str(args.repeats),
             "--cores-per-worker",
-            str(args.cores_per_worker),
+            str(row["cores_per_worker"]),
             "--no-pcs-warmup",
             "--out",
             str(out_dir),
-        ]
+        ], row)
     ligesis_root = (ROOT / args.ligesis_dir).resolve()
     if row["kind"] == "ligesis":
-        return [
+        return wrap_with_row_affinity([
             str(ligesis_binary_path(ligesis_root)),
             "--local-parties",
             str(row["workers"]),
             "--mu",
             str(row["nv"]),
             "--cores-per-worker",
-            str(args.cores_per_worker),
+            str(row["cores_per_worker"]),
             "--query-count-semantics",
             "scheme-native-ligesis",
-        ]
+        ], row)
     spec = EXTERNAL_PCS_SPECS[row["backend"]]
     query_count = external_query_count_arg(args)
-    return [
+    return wrap_with_row_affinity([
         str(external_binary_path(spec, ligesis_root)),
         "--local-parties",
         str(row["workers"]),
         "--mu",
         str(row["nv"]),
         "--cores-per-worker",
-        str(args.cores_per_worker),
+        str(row["cores_per_worker"]),
         *([] if query_count is None else ["--queries", str(query_count)]),
-    ]
+    ], row)
 
 
 def mark_schedule_row(
@@ -2656,11 +2824,11 @@ def blocked_metric_row(row: dict, args: argparse.Namespace, failure_reason: str)
         query_count_target=int(args.query_count),
         host_logical_cores=args.host_logical_cores,
         max_workers=args.max_workers,
-        cores_per_worker=args.cores_per_worker,
+        cores_per_worker=int(row.get("cores_per_worker") or args.cores_per_worker or 1),
         backend_source="deepfold-bench-v0.1-paper-artifact",
         field="Mersenne61Ext" if row.get("kind") == "depcs" else "",
         hash="Blake3" if row.get("kind") == "depcs" else "",
-        code_rate_log=3 if backend == "basefold" and rate_inv == 8 else (1 if backend == "deepfold" and rate_inv == 2 else 0),
+        code_rate_log=1 if backend == "deepfold" and rate_inv == 2 else 0,
         security_target_bits=security_bits,
         security_effective_bits=0,
         security_exact="false",
@@ -2670,10 +2838,7 @@ def blocked_metric_row(row: dict, args: argparse.Namespace, failure_reason: str)
 
 
 def depcs_security_bits_for_row(args: argparse.Namespace, row: dict) -> int:
-    if (row.get("backend"), int(row.get("rate_inv", 0) or 0)) in {
-        ("basefold", 8),
-        ("deepfold", 2),
-    }:
+    if (row.get("backend"), int(row.get("rate_inv", 0) or 0)) == ("deepfold", 2):
         return 100
     return int(args.security_bits)
 
@@ -2787,7 +2952,11 @@ def run_fair_sequential(args: argparse.Namespace) -> int:
         row["command"] = command_text(fair_row_command(args, row, (ROOT / args.out).resolve()))
     if args.dry_run:
         for row in schedule:
-            print(f"{row['index']},{row['scheme']},nv={row['nv']},workers={row['workers']}")
+            print(
+                f"{row['index']},{row['scheme']},nv={row['nv']},workers={row['workers']},"
+                f"thread_policy={row.get('thread_policy')},row_cpuset={row.get('row_cpuset')},"
+                f"worker_cpusets={row.get('worker_cpusets')},affinity_status={row.get('affinity_status')}"
+            )
         return 0
 
     out_dir = (ROOT / args.out).resolve()
@@ -2801,7 +2970,12 @@ def run_fair_sequential(args: argparse.Namespace) -> int:
         (
             f"- fair_sequential: one benchmark row at a time; host_logical_cores="
             f"{args.host_logical_cores}; max_workers={args.max_workers}; "
-            f"cores_per_worker={args.cores_per_worker}."
+            "cores_per_worker=adaptive floor(host_logical_cores/workers); "
+            "thread_policy=adaptive-affinity-per-row."
+        ),
+        (
+            "- affinity: Linux rows use taskset with NUMA-aware worker masks when available; "
+            "unsupported platforms or missing taskset are recorded as no-op metadata."
         ),
         (
             "- query_semantics: dePCS uses paper-backed backend query policy; "
@@ -2844,7 +3018,8 @@ def run_fair_sequential(args: argparse.Namespace) -> int:
                 args.depcs_timeout,
                 {
                     "RAYON_NUM_THREADS": str(row["total_thread_budget"]),
-                    "PQ_CORES_PER_WORKER": str(args.cores_per_worker),
+                    "PQ_CORES_PER_WORKER": str(row["cores_per_worker"]),
+                    **affinity_env_for_row(row),
                 },
                 events_path,
                 row,
@@ -2919,8 +3094,13 @@ def run_fair_sequential(args: argparse.Namespace) -> int:
                 metric.source = (
                     f"{depcs_dir}; pcs_queries_requested={args.query_count}; "
                     f"master_RAYON_NUM_THREADS={row['total_thread_budget']}; "
-                    f"worker_process_RAYON_NUM_THREADS={args.cores_per_worker}; "
-                    f"PQ_CORES_PER_WORKER={args.cores_per_worker}; "
+                    f"worker_process_RAYON_NUM_THREADS={row['cores_per_worker']}; "
+                    f"PQ_CORES_PER_WORKER={row['cores_per_worker']}; "
+                    f"thread_policy={row.get('thread_policy')}; "
+                    f"row_cpuset={row.get('row_cpuset')}; "
+                    f"worker_cpusets={row.get('worker_cpusets')}; "
+                    f"numa_policy={row.get('numa_policy')}; "
+                    f"affinity_status={row.get('affinity_status')}; "
                     f"query_count_semantics={metric.query_count_semantics or 'paper-backed-protocol11-artifact'}"
                 )
                 if (
@@ -2983,10 +3163,14 @@ def run_fair_sequential(args: argparse.Namespace) -> int:
                 )
                 continue
             parsed.source = (
-                f"local LigeSIS run; party_RAYON_NUM_THREADS={args.cores_per_worker}; "
+                f"local LigeSIS run; party_RAYON_NUM_THREADS={row['cores_per_worker']}; "
                 f"total_party_processes={row['workers']}; "
                 f"log_m={compute_ligesis_log_m(row['nv'], row['workers'])}; "
                 f"base_mu={compute_ligesis_base_mu(row['nv'], row['workers'])}; "
+                f"thread_policy={row.get('thread_policy')}; "
+                f"row_cpuset={row.get('row_cpuset')}; "
+                f"numa_policy={row.get('numa_policy')}; "
+                f"affinity_status={row.get('affinity_status')}; "
                 "query_count_semantics=scheme-native-ligesis"
             )
             rows.append(parsed)
@@ -3057,8 +3241,12 @@ def run_fair_sequential(args: argparse.Namespace) -> int:
                 f"query_count={parsed.effective_query_count}, expected {expected_external_queries}."
             )
         parsed.source = (
-            f"local {spec['scheme']} run; party_RAYON_NUM_THREADS={args.cores_per_worker}; "
+            f"local {spec['scheme']} run; party_RAYON_NUM_THREADS={row['cores_per_worker']}; "
             f"total_party_processes={row['workers']}; query_count={parsed.effective_query_count}; "
+            f"thread_policy={row.get('thread_policy')}; "
+            f"row_cpuset={row.get('row_cpuset')}; "
+            f"numa_policy={row.get('numa_policy')}; "
+            f"affinity_status={row.get('affinity_status')}; "
             f"query_count_semantics={parsed.query_count_semantics}"
         )
         rows.append(parsed)
@@ -3086,6 +3274,7 @@ def run_fair_sequential(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="results/depcs-ligesis-nv14-18-workers2-4-8-16")
+    parser.add_argument("--self-test-affinity", action="store_true")
     parser.add_argument("--fair-sequential", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--reuse-depcs-dir", default=None)
@@ -3112,7 +3301,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--depcs-backends",
-        default="basefold:4,deepfold:4",
+        default="deepfold:2",
         help="Comma-separated dePCS backend matrix as backend:rate_inv.",
     )
     parser.add_argument("--pcs-queries", type=int, default=1)
@@ -3169,6 +3358,8 @@ def main() -> int:
         help="Pass --queries to dFRIttata/dPIP-FRI instead of using their scheme-native defaults.",
     )
     args = parser.parse_args()
+    if args.self_test_affinity:
+        return self_test_affinity()
     if args.fair_sequential:
         args.experiment_deadline = math.inf
     else:
@@ -3198,14 +3389,12 @@ def main() -> int:
     args.host_logical_cores = os.cpu_count() or 1
     args.max_workers = max(args.depcs_worker_values)
     if args.fair_sequential:
-        computed_cores_per_worker = max(1, args.host_logical_cores // args.max_workers)
-        if args.cores_per_worker is not None and args.cores_per_worker != computed_cores_per_worker:
+        if args.cores_per_worker is not None:
             parser.error(
-                "--cores-per-worker must not override the fair sequential allocation; "
-                f"expected {computed_cores_per_worker} from floor("
-                f"{args.host_logical_cores}/{args.max_workers})"
+                "--cores-per-worker must not override the fair sequential adaptive allocation; "
+                "each row uses floor(host_logical_cores/workers)"
             )
-        args.cores_per_worker = computed_cores_per_worker
+        args.cores_per_worker = 1
         if args.query_count is None:
             args.query_count = args.pcs_queries
         args.pcs_queries = args.query_count

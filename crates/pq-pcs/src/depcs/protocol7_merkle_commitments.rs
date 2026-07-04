@@ -6,9 +6,9 @@
 //! the aggregate equations `e1 = sum_i e1^(i)`, `e2 = sum_i e2^(i)`.
 //!
 //! Artifact-backed mapping:
-//! - The vendored BaseFold/DeepFold PCS already contains its own oracle/root
+//! - The vendored DeepFold PCS already contains its own oracle/root
 //!   material, so this module records the Protocol 7 worker leaf as a digest of
-//!   `(worker_id, row_range, oracle, pcs_commitment)`.
+//!   `(worker_id, row_range, oracle_seed, pcs_commitment)`.
 //! - `aggregate_worker_commitments` is Protocol 7 commit phase step 2/3:
 //!   worker leaves are sorted by worker id and committed into the master root.
 //! - `verify_commitment_root` is the master/verifier side of Protocol 7 root
@@ -17,15 +17,13 @@
 //! Existing source-commitment coalescing is a semantics-preserving optimization:
 //! only linearly equivalent openings with the same source commitment are merged.
 
-use paper_util::random_oracle::RandomOracle;
-
+use super::compact_codec;
 use super::types::*;
-use super::utils::digest_serialized;
 
 pub(crate) struct Protocol7WorkerCommitmentInput {
     pub(crate) worker_id: usize,
     pub(crate) row_range: (usize, usize),
-    pub(crate) oracle: RandomOracle<PaperField>,
+    pub(crate) oracle_seed: [u8; 32],
     pub(crate) pcs_commitment: PaperPcsCommitment,
 }
 
@@ -40,12 +38,7 @@ pub(crate) fn worker_commitment_digest(
     // per-worker Merkle commitment root: it binds which worker produced the
     // leaf, which rows it owns, and the PCS oracle/commitment used later by
     // Protocol 8/9 openings.
-    digest_serialized(&(
-        commitment.worker_id,
-        commitment.row_range,
-        &commitment.oracle,
-        &commitment.pcs_commitment,
-    ))
+    Ok(compact_codec::worker_commitment_digest(commitment))
 }
 
 pub(crate) fn build_worker_commitment(
@@ -56,7 +49,7 @@ pub(crate) fn build_worker_commitment(
     let mut commitment = PaperProtocol11WorkerCommitment {
         worker_id: input.worker_id,
         row_range: input.row_range,
-        oracle: input.oracle,
+        oracle_seed: input.oracle_seed,
         pcs_commitment: input.pcs_commitment,
         leaf_digest: [0_u8; 32],
     };
@@ -101,7 +94,7 @@ pub(crate) fn aggregate_worker_commitments(
     for (worker_id, commitment) in worker_commitments.iter().enumerate() {
         validate_worker_commitment(layout, worker_id, commitment)?;
     }
-    let root = digest_serialized(&worker_commitments)?;
+    let root = compact_codec::worker_set_root(&worker_commitments);
     Ok(Protocol7CommitmentSet {
         commitment: PaperProtocol11Commitment {
             config,
@@ -123,7 +116,14 @@ pub(crate) fn verify_commitment_root(
 ) -> PaperDepcsResult<()> {
     // Protocol 7 verify phase, root consistency: recompute the master root from
     // the ordered worker leaves before accepting any later opening proof.
-    if commitment.root != digest_serialized(&commitment.workers_commitments)? {
+    let layout = PaperLayout::new(commitment.original_len, commitment.workers)?;
+    if commitment.workers_commitments.len() != commitment.workers {
+        return Err(PaperDepcsError::InvalidCommitment);
+    }
+    for (worker_id, worker_commitment) in commitment.workers_commitments.iter().enumerate() {
+        validate_worker_commitment(layout, worker_id, worker_commitment)?;
+    }
+    if commitment.root != compact_codec::worker_set_root(&commitment.workers_commitments) {
         return Err(PaperDepcsError::InvalidCommitment);
     }
     Ok(())

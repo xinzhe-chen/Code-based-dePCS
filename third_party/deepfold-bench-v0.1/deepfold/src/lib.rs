@@ -20,9 +20,19 @@ pub struct DeepEval<T: MyField> {
 
 impl<T: MyField> DeepEval<T> {
     pub fn new(point: Vec<T>, poly_hypercube: Vec<T>) -> Self {
+        let first_eval = Self::evaluatioin_at(point.clone(), poly_hypercube);
         DeepEval {
-            point: point.clone(),
-            first_eval: Self::evaluatioin_at(point, poly_hypercube),
+            point,
+            first_eval,
+            else_evals: vec![],
+        }
+    }
+
+    pub fn new_from_slice(point: Vec<T>, poly_hypercube: &[T], scratch: &mut Vec<T>) -> Self {
+        let first_eval = Self::evaluation_at_slice(&point, poly_hypercube, scratch);
+        DeepEval {
+            point,
+            first_eval,
             else_evals: vec![],
         }
     }
@@ -44,11 +54,37 @@ impl<T: MyField> DeepEval<T> {
         poly_hypercube[0]
     }
 
+    pub fn evaluation_at_slice(point: &[T], poly_hypercube: &[T], scratch: &mut Vec<T>) -> T {
+        scratch.clear();
+        scratch.extend_from_slice(poly_hypercube);
+        let mut len = scratch.len();
+        assert_eq!(len, 1 << point.len());
+        for v in point.iter().copied() {
+            len >>= 1;
+            let (left, rest) = scratch.split_at_mut(len);
+            let right = &rest[..len];
+            left.par_iter_mut()
+                .zip(right.par_iter())
+                .for_each(|(left, right)| {
+                    *left *= T::from_int(1) - v;
+                    *left += *right * v;
+                });
+        }
+        scratch[0]
+    }
+
     pub fn append_else_eval(&mut self, poly_hypercube: Vec<T>) {
         let mut point = self.point[self.else_evals.len()..].to_vec();
         point[0] += T::from_int(1);
         self.else_evals
             .push(Self::evaluatioin_at(point, poly_hypercube));
+    }
+
+    pub fn append_else_eval_from_slice(&mut self, poly_hypercube: &[T], scratch: &mut Vec<T>) {
+        let mut point = self.point[self.else_evals.len()..].to_vec();
+        point[0] += T::from_int(1);
+        self.else_evals
+            .push(Self::evaluation_at_slice(&point, poly_hypercube, scratch));
     }
 
     pub fn verify(&self, challenges: &Vec<T>) -> T {
@@ -101,8 +137,9 @@ impl<T: MyField> Proof<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{prover::Prover, verifier::Verifier};
+    use crate::{prover::Prover, verifier::Verifier, DeepEval};
     use csv::Writer;
+    use std::sync::Arc;
     use util::{
         algebra::{
             coset::Coset,
@@ -132,6 +169,67 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_deep_eval_matches_owned_eval() {
+        let point = vec![
+            M31ext::from_int(3),
+            M31ext::from_int(5),
+            M31ext::from_int(7),
+        ];
+        let poly_hypercube = (0..8)
+            .map(|i| M31ext::from_int(i as u64 + 11))
+            .collect::<Vec<_>>();
+        let owned = DeepEval::new(point.clone(), poly_hypercube.clone());
+        let mut scratch = Vec::new();
+        let borrowed = DeepEval::new_from_slice(point, &poly_hypercube, &mut scratch);
+        assert_eq!(owned.first_eval, borrowed.first_eval);
+    }
+
+    #[test]
+    fn shared_coset_constructor_matches_legacy_constructor() {
+        let variable_num = 6;
+        let polynomial = MultilinearPolynomial::random_polynomial(variable_num);
+        let mut interpolate_cosets = vec![Coset::new(
+            1 << (variable_num + CODE_RATE),
+            M31ext::from_int(1),
+        )];
+        for i in 1..variable_num + 1 {
+            interpolate_cosets.push(interpolate_cosets[i - 1].pow(2));
+        }
+        let oracle = RandomOracle::new(variable_num, SECURITY_BITS / CODE_RATE);
+        let legacy = Prover::new(
+            variable_num,
+            &interpolate_cosets,
+            polynomial.clone(),
+            &oracle,
+            STEP,
+        );
+        let shared = Prover::new_with_code_rate_shared(
+            variable_num,
+            Arc::new(interpolate_cosets.clone()),
+            polynomial,
+            &oracle,
+            STEP,
+            CODE_RATE,
+        );
+        assert_eq!(legacy.commit_polynomial(), shared.commit_polynomial());
+        let verifier = Verifier::new(
+            variable_num,
+            &interpolate_cosets,
+            legacy.commit_polynomial(),
+            &oracle,
+            STEP,
+        );
+        let point = verifier.get_open_point();
+        assert!(verifier.verify(shared.generate_proof(point)));
+    }
+
+    #[test]
+    fn test_small_roundtrip() {
+        assert!(output_proof_size::<M31ext>(6) > 0);
+    }
+
+    #[test]
+    #[ignore = "generates deepfold.csv up to SIZE and is a benchmark, not a unit test"]
     fn test_proof_size() {
         let mut wtr = Writer::from_path("deepfold.csv").unwrap();
         let range = 10..SIZE;

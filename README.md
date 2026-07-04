@@ -35,7 +35,7 @@ cargo check --workspace
 cargo test -p pq-core -p pq-pcs -p pq-experiments
 ```
 
-The vendored `third_party/deepfold-bench-v0.1` code is used by the PCS backend,
+The vendored `third_party/deepfold-bench-v0.1` code is used by the DeepFold PCS backend,
 but its full upstream benchmark-style tests are not part of the default test
 command above.
 
@@ -72,7 +72,6 @@ Menu options:
 The default five-way benchmark runs:
 
 - dePCS DeepFold
-- dePCS BaseFold
 - LigeSIS
 - dFRIttata
 - dPIP-FRI
@@ -91,7 +90,7 @@ Windows:
   --fair-sequential `
   --depcs-nv-range 18..24 `
   --depcs-workers 2,4 `
-  --depcs-backends basefold:8,deepfold:2 `
+  --depcs-backends deepfold:2 `
   --depcs-opening protocol11 `
   --ligesis-nvs 18,19,20,21,22,23,24 `
   --ligesis-parties-list 2,4 `
@@ -107,7 +106,7 @@ bash scripts/pcs-benchmark-linux.sh \
   --fair-sequential \
   --depcs-nv-range 18..24 \
   --depcs-workers 2,4 \
-  --depcs-backends basefold:8,deepfold:2 \
+  --depcs-backends deepfold:2 \
   --depcs-opening protocol11 \
   --ligesis-nvs 18,19,20,21,22,23,24 \
   --ligesis-parties-list 2,4 \

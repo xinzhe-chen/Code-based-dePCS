@@ -25,6 +25,10 @@ impl<T: MyField> Polynomial<T> {
         &self.coefficients
     }
 
+    pub fn into_coefficients(self) -> Vec<T> {
+        self.coefficients
+    }
+
     pub fn random_polynomial(degree: usize) -> Polynomial<T> {
         Polynomial {
             coefficients: (0..degree).map(|_| MyField::random_element()).collect(),
@@ -134,6 +138,10 @@ impl<T: MyField> Mul<T> for MultilinearPolynomial<T> {
 impl<T: MyField> MultilinearPolynomial<T> {
     pub fn coefficients(&self) -> &Vec<T> {
         &self.coefficients
+    }
+
+    pub fn into_coefficients(self) -> Vec<T> {
+        self.coefficients
     }
 
     pub fn evaluate_from_hypercube(point: Vec<T>, mut poly_hypercube: Vec<T>) -> T {

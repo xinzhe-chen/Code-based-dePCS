@@ -1,9 +1,6 @@
-use crate::merkle_tree::MERKLE_ROOT_SIZE;
+use crate::merkle_tree::{hash_field_leaf, MERKLE_ROOT_SIZE};
 use crate::query_result::QueryResult;
-use crate::{
-    algebra::field::{as_bytes_vec, MyField},
-    merkle_tree::MerkleTreeProver,
-};
+use crate::{algebra::field::MyField, merkle_tree::MerkleTreeProver};
 use rayon::prelude::*;
 
 #[derive(Clone)]
@@ -16,18 +13,11 @@ pub struct InterpolateValue<T: MyField> {
 impl<T: MyField> InterpolateValue<T> {
     pub fn new(value: Vec<T>, leaf_size: usize) -> Self {
         let len = value.len() / leaf_size;
-        let merkle_tree = MerkleTreeProver::new(
-            (0..len)
-                .into_par_iter()
-                .map(|i| {
-                    as_bytes_vec(
-                        &(0..leaf_size)
-                            .map(|j| value[i + len * j])
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect(),
-        );
+        let leaf_hashes = (0..len)
+            .into_par_iter()
+            .map(|i| hash_field_leaf((0..leaf_size).map(|j| value[i + len * j])))
+            .collect();
+        let merkle_tree = MerkleTreeProver::from_leaf_hashes(leaf_hashes, len);
         Self {
             value,
             leaf_size,
@@ -46,20 +36,12 @@ impl<T: MyField> InterpolateValue<T> {
     pub fn query(&self, leaf_indices: &Vec<usize>) -> QueryResult<T> {
         let len = self.merkle_tree.leave_num();
         assert_eq!(len * self.leaf_size, self.value.len());
-        let proof_chunks = leaf_indices
-            .par_iter()
-            .map(|j: &usize| {
-                (0..self.leaf_size)
-                    .map(|i| (j.clone() + len * i, self.value[j.clone() + len * i]))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        // Drop the (recomputable) index keys; keep values in canonical order.
-        let proof_values = proof_chunks
-            .into_iter()
-            .flatten()
-            .map(|(_idx, value)| value)
-            .collect();
+        let mut proof_values = Vec::with_capacity(leaf_indices.len() * self.leaf_size);
+        for &j in leaf_indices {
+            for i in 0..self.leaf_size {
+                proof_values.push(self.value[j + len * i]);
+            }
+        }
         let proof_bytes = self.merkle_tree.open(&leaf_indices);
         QueryResult {
             proof_bytes,

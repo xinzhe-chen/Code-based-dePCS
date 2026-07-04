@@ -3,9 +3,9 @@
 This repository is scoped to the transparent distributed PCS (dePCS). Two
 vendored trees are kept:
 
-- **`deepfold-bench-v0.1/`** — the BaseFold / DeepFold artifact backend. This is
+- **`deepfold-bench-v0.1/`** — the DeepFold artifact backend. This is
   the only vendored **workspace dependency**: `crates/pq-pcs` depends on its
-  `basefold`, `deepfold`, and `util` crates by path. Do not move or rename it
+  `deepfold` and `util` crates by path. Do not move or rename it
   without updating `crates/pq-pcs/Cargo.toml`.
 - **`ligesis-pcs-3447/`** — the three distributed-PCS comparison baselines the
   benchmark measures against. It is *not* a workspace dependency;
@@ -19,7 +19,7 @@ vendored trees are kept:
 
 Out of scope (removed): KZG/IPA/curve commitments and the earlier PIOP-frontend
 reference sources (Spartan2, HyperPlonk). Only transparent hash/Merkle +
-Brakedown/BaseFold-style code is on the dePCS path.
+Brakedown-style code is on the dePCS path.
 
 ## Hygiene
 

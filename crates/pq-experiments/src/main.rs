@@ -507,7 +507,7 @@ fn parse_pcs_benchmark_command(args: &[String]) -> Result<PcsBenchmarkCommand, C
     let mut security_bits_override: Option<usize> = None;
     let mut repeats = 1;
     let mut opening = PcsOpeningSelection::Protocol11;
-    let mut backend = PaperPcsBackend::BaseFold;
+    let mut backend = PaperPcsBackend::DeepFold;
     let mut backend_rate_inv: Option<usize> = None;
     let mut out_dir = PathBuf::from("results");
     let mut runner = "local-network".to_owned();
@@ -926,10 +926,7 @@ fn run_single_depcs_job(
     let network_open_bytes = network_run.network_open_bytes;
     let network_bytes = network_commit_bytes + network_open_bytes;
     let effective_queries = config.query_count();
-    let scheme = match paper_backend {
-        PaperPcsBackend::BaseFold => "depcs-basefold-paper-protocol11",
-        PaperPcsBackend::DeepFold => "depcs-deepfold-paper-protocol11",
-    };
+    let scheme = "depcs-deepfold-paper-protocol11";
     let record = PcsMetricRecord {
         scheme: scheme.to_owned(),
         backend: paper_backend.as_str().to_owned(),
@@ -939,7 +936,7 @@ fn run_single_depcs_job(
         pcs_query_count: network_run.verify_profile.pcs_query_count,
         query_security_bits: network_run.verify_profile.query_security_bits,
         algebraic_security_bits: network_run.verify_profile.algebraic_security_bits,
-        batch_claim_count: network_run.proof.opening_batch.claims.len(),
+        batch_claim_count: network_run.proof.opening_batch.claim_count,
         batch_open_ms: network_run.open_ms,
         batch_verify_ms: network_run.verify_ms,
         batch_proof_bytes: opening_proof_bytes,
@@ -1019,7 +1016,7 @@ fn run_single_depcs_job(
         proof_protocol10_e2_bytes: proof_size_breakdown.protocol10_e2_bytes,
         proof_transcript_overhead_bytes: proof_size_breakdown.transcript_overhead_bytes,
         proof_p10_e1_commitments_bytes: 0,
-        proof_p10_e1_public_scalars_bytes: proof_size_breakdown.point_query_public_bytes / 2,
+        proof_p10_e1_public_scalars_bytes: 0,
         proof_p10_e1_opening_batch_bytes: proof_size_breakdown.protocol10_e1_bytes,
         proof_p10_e1_hu_opening_bytes: 0,
         proof_p10_e1_sumcheck_bytes: 0,
@@ -1027,9 +1024,7 @@ fn run_single_depcs_job(
         proof_p10_e1_f_at_u_prime_openings_bytes: 0,
         proof_p10_e1_e_systematic_openings_bytes: 0,
         proof_p10_e2_commitments_bytes: 0,
-        proof_p10_e2_public_scalars_bytes: proof_size_breakdown
-            .point_query_public_bytes
-            .saturating_sub(proof_size_breakdown.point_query_public_bytes / 2),
+        proof_p10_e2_public_scalars_bytes: 0,
         proof_p10_e2_opening_batch_bytes: proof_size_breakdown.protocol10_e2_bytes,
         proof_p10_e2_hu_opening_bytes: 0,
         proof_p10_e2_sumcheck_bytes: 0,
@@ -1085,14 +1080,7 @@ fn run_single_depcs_job(
 fn run_single_depcs_batch_job(
     job: PcsBenchmarkJob,
 ) -> Result<(PcsMetricRecord, Vec<PhaseTimingRecord>), CliError> {
-    let reason = match job.backend {
-        PaperPcsBackend::BaseFold => {
-            "batch_unavailable_basefold_artifact_no_batch_api: BaseFold artifact exposes only single-polynomial prove/verify; refusing to emulate batch with individual worker proofs"
-        }
-        PaperPcsBackend::DeepFold => {
-            "batch_unavailable_deepfold_artifact_native_batch_api_missing: LigeSIS batch/multi-open requires ark_ff::PrimeField + HasQuadraticExtension, while paper dePCS uses DeepFold artifact Mersenne61Ext/RandomOracle/Merkle; refusing to swap backend or use digest-only Protocol10/11 placeholders"
-        }
-    };
+    let reason = "batch_unavailable_deepfold_artifact_native_batch_api_missing: LigeSIS batch/multi-open requires ark_ff::PrimeField + HasQuadraticExtension, while paper dePCS uses DeepFold artifact Mersenne61Ext/RandomOracle/Merkle; refusing to swap backend or use digest-only Protocol10/11 placeholders";
     Err(CliError(format!(
         "paper-backed protocol11-batch unavailable for backend={} nv={} workers={}: {reason}",
         job.backend.as_str(),
@@ -2432,22 +2420,20 @@ fn parse_opening(value: &str) -> Result<PcsOpeningSelection, CliError> {
 
 fn parse_backend_kind(value: &str) -> Result<PaperPcsBackend, CliError> {
     match value {
-        "basefold" => Ok(PaperPcsBackend::BaseFold),
         "deepfold" => Ok(PaperPcsBackend::DeepFold),
         other => Err(CliError(format!(
-            "unsupported --backend '{other}', expected basefold or deepfold"
+            "unsupported --backend '{other}', expected deepfold"
         ))),
     }
 }
 
-/// Resolve the paper-backend code rate, defaulting to the artifact rate for each
-/// backend (BaseFold `1/8`, DeepFold `1/2`) when `--backend-rate-inv` is unset.
+/// Resolve the paper-backend code rate, defaulting to the DeepFold artifact rate
+/// (`1/2`) when `--backend-rate-inv` is unset.
 fn resolve_backend_rate_inv(
     backend: PaperPcsBackend,
     rate_inv: Option<usize>,
 ) -> Result<usize, CliError> {
     let default_rate = match backend {
-        PaperPcsBackend::BaseFold => 8,
         PaperPcsBackend::DeepFold => 2,
     };
     let rate_inv = rate_inv.unwrap_or(default_rate);
@@ -2496,10 +2482,37 @@ fn env_cores_per_worker() -> usize {
 }
 
 fn core_affinity_label(workers: usize, cores_per_worker: usize) -> String {
-    let requested_threads = workers.saturating_mul(cores_per_worker);
     let rayon_threads = env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "unset".to_owned());
+    let policy = env::var("PQ_THREAD_POLICY").unwrap_or_else(|_| "fixed-per-worker".to_owned());
+    let row_cpuset = env::var("PQ_ROW_CPUSET").unwrap_or_else(|_| "unset".to_owned());
+    let worker_cpusets = env::var("PQ_WORKER_CPUSETS").unwrap_or_else(|_| "unset".to_owned());
+    let numa_policy = env::var("PQ_NUMA_POLICY").unwrap_or_else(|_| "unset".to_owned());
+    let affinity_status = env::var("PQ_AFFINITY_STATUS").unwrap_or_else(|_| "unset".to_owned());
+    core_affinity_label_from_parts(
+        workers,
+        cores_per_worker,
+        &rayon_threads,
+        &policy,
+        &row_cpuset,
+        &worker_cpusets,
+        &numa_policy,
+        &affinity_status,
+    )
+}
+
+fn core_affinity_label_from_parts(
+    workers: usize,
+    cores_per_worker: usize,
+    rayon_threads: &str,
+    policy: &str,
+    row_cpuset: &str,
+    worker_cpusets: &str,
+    numa_policy: &str,
+    affinity_status: &str,
+) -> String {
+    let requested_threads = workers.saturating_mul(cores_per_worker);
     format!(
-        "fixed-per-worker;worker_process_threads={cores_per_worker};master_requested_threads={requested_threads};master_rayon_threads={rayon_threads}"
+        "{policy};worker_process_threads={cores_per_worker};master_requested_threads={requested_threads};master_rayon_threads={rayon_threads};row_cpuset={row_cpuset};worker_cpusets={worker_cpusets};numa_policy={numa_policy};affinity_status={affinity_status}"
     )
 }
 
@@ -2670,7 +2683,7 @@ fn write_text_file(path: &Path, contents: &str) -> Result<(), CliError> {
 
 fn usage() -> String {
     "usage:
-  cargo run -p pq-experiments -- pcs-benchmark [--opening protocol11|protocol11-batch] [--backend basefold|deepfold] [--backend-rate-inv N] [--sizes 256,512,1024 | --size-range 256..1024 | --nv-values/--variable-counts 8,9,10 | --nv-range/--variable-range 8..10] [--workers 1,2,4] [--cores-per-worker N] [--pcs-queries N] [--security-bits N] [--repeats N] [--no-pcs-warmup] [--out DIR]
+  cargo run -p pq-experiments -- pcs-benchmark [--opening protocol11|protocol11-batch] [--backend deepfold] [--backend-rate-inv N] [--sizes 256,512,1024 | --size-range 256..1024 | --nv-values/--variable-counts 8,9,10 | --nv-range/--variable-range 8..10] [--workers 1,2,4] [--cores-per-worker N] [--pcs-queries N] [--security-bits N] [--repeats N] [--no-pcs-warmup] [--out DIR]
   cargo run -p pq-experiments -- verify-pcs-results --dir results/pcs-bench-... [--format json|csv]"
         .to_owned()
 }
@@ -2700,12 +2713,30 @@ mod tests {
 
     #[test]
     fn protocol11_paper_backend_config_is_accepted() {
-        let config = PaperDepcsConfig::new(PaperPcsBackend::BaseFold, 8).expect("basefold");
-        assert_eq!(config.code_rate_log(), 3);
-        assert!(PaperDepcsConfig::new(PaperPcsBackend::BaseFold, 2).is_err());
         let config = PaperDepcsConfig::new(PaperPcsBackend::DeepFold, 2).expect("deepfold");
         assert_eq!(config.code_rate_log(), 1);
         assert!(PaperDepcsConfig::new(PaperPcsBackend::DeepFold, 8).is_err());
+    }
+
+    #[test]
+    fn core_affinity_label_records_affinity_metadata() {
+        let label = core_affinity_label_from_parts(
+            4,
+            8,
+            "32",
+            "adaptive-affinity-per-row",
+            "0-31",
+            "0-7;8-15;16-23;24-31",
+            "local-node-if-available",
+            "taskset-available",
+        );
+        assert!(label.contains("adaptive-affinity-per-row"));
+        assert!(label.contains("master_requested_threads=32"));
+        assert!(label.contains("master_rayon_threads=32"));
+        assert!(label.contains("row_cpuset=0-31"));
+        assert!(label.contains("worker_cpusets=0-7;8-15;16-23;24-31"));
+        assert!(label.contains("numa_policy=local-node-if-available"));
+        assert!(label.contains("affinity_status=taskset-available"));
     }
 
     #[test]
@@ -2714,28 +2745,15 @@ mod tests {
             parse_opening("protocol11-batch").expect("batch opening"),
             PcsOpeningSelection::Protocol11Batch
         );
-        let basefold_job = PcsBenchmarkJob {
+        let deepfold_job = PcsBenchmarkJob {
             size: 1 << 10,
             workers: 2,
             opening: PcsOpeningVariant::Protocol11Batch,
             trial: 1,
             pcs_queries: 1,
-            backend: PaperPcsBackend::BaseFold,
-            backend_rate_inv: 8,
-            cores_per_worker: 1,
-        };
-        let error = run_single_depcs_batch_job(basefold_job)
-            .expect_err("basefold batch must not fall back");
-        assert!(
-            error
-                .0
-                .contains("batch_unavailable_basefold_artifact_no_batch_api")
-        );
-
-        let deepfold_job = PcsBenchmarkJob {
             backend: PaperPcsBackend::DeepFold,
             backend_rate_inv: 2,
-            ..basefold_job
+            cores_per_worker: 1,
         };
         let error = run_single_depcs_batch_job(deepfold_job)
             .expect_err("deepfold batch must not swap backend");
@@ -2876,9 +2894,9 @@ mod tests {
     #[test]
     fn source_csv_verifier_accepts_generated_row() {
         let record = PcsMetricRecord {
-            scheme: "depcs-basefold-batch".to_owned(),
-            backend: "basefold".to_owned(),
-            backend_rate_inv: 4,
+            scheme: "depcs-deepfold-paper-protocol11".to_owned(),
+            backend: "deepfold".to_owned(),
+            backend_rate_inv: 2,
             effective_query_count: 1,
             column_query_count: 1,
             pcs_query_count: 1,
@@ -2887,7 +2905,7 @@ mod tests {
             batch_claim_count: 7,
             batch_open_ms: 2.0,
             batch_verify_ms: 3.0,
-            batch_proof_bytes: 100,
+            batch_proof_bytes: 160,
             runner: "local-network".to_owned(),
             opening: "protocol11".to_owned(),
             trial: 1,
@@ -2951,22 +2969,22 @@ mod tests {
             proof_protocol10_e1_bytes: 30,
             proof_protocol10_e2_bytes: 30,
             proof_transcript_overhead_bytes: 30,
-            proof_p10_e1_commitments_bytes: 3,
-            proof_p10_e1_public_scalars_bytes: 4,
-            proof_p10_e1_opening_batch_bytes: 17,
-            proof_p10_e1_hu_opening_bytes: 5,
-            proof_p10_e1_sumcheck_bytes: 6,
-            proof_p10_e1_e_at_r_openings_bytes: 4,
-            proof_p10_e1_f_at_u_prime_openings_bytes: 4,
-            proof_p10_e1_e_systematic_openings_bytes: 4,
-            proof_p10_e2_commitments_bytes: 3,
-            proof_p10_e2_public_scalars_bytes: 4,
-            proof_p10_e2_opening_batch_bytes: 17,
-            proof_p10_e2_hu_opening_bytes: 5,
-            proof_p10_e2_sumcheck_bytes: 6,
-            proof_p10_e2_e_at_r_openings_bytes: 4,
-            proof_p10_e2_f_at_u_prime_openings_bytes: 4,
-            proof_p10_e2_e_systematic_openings_bytes: 4,
+            proof_p10_e1_commitments_bytes: 0,
+            proof_p10_e1_public_scalars_bytes: 0,
+            proof_p10_e1_opening_batch_bytes: 30,
+            proof_p10_e1_hu_opening_bytes: 0,
+            proof_p10_e1_sumcheck_bytes: 0,
+            proof_p10_e1_e_at_r_openings_bytes: 0,
+            proof_p10_e1_f_at_u_prime_openings_bytes: 0,
+            proof_p10_e1_e_systematic_openings_bytes: 0,
+            proof_p10_e2_commitments_bytes: 0,
+            proof_p10_e2_public_scalars_bytes: 0,
+            proof_p10_e2_opening_batch_bytes: 30,
+            proof_p10_e2_hu_opening_bytes: 0,
+            proof_p10_e2_sumcheck_bytes: 0,
+            proof_p10_e2_e_at_r_openings_bytes: 0,
+            proof_p10_e2_f_at_u_prime_openings_bytes: 0,
+            proof_p10_e2_e_systematic_openings_bytes: 0,
             proof_bytes: 180,
             communication_bytes: 180,
             verifier_communication_bytes: 180,
@@ -2990,6 +3008,28 @@ mod tests {
             verified: true,
             failure_reason: String::new(),
         };
+        let compact_opening_bytes = record.proof_point_query_public_bytes
+            + record.proof_eval_commitments_bytes
+            + record.proof_merkle_roots_bytes
+            + record.proof_column_openings_bytes
+            + record.proof_f2_openings_bytes
+            + record.proof_protocol10_e1_bytes
+            + record.proof_protocol10_e2_bytes
+            + record.proof_transcript_overhead_bytes;
+        assert_eq!(record.batch_proof_bytes, compact_opening_bytes);
+        assert_eq!(
+            record.proof_bytes,
+            record.proof_commitment_object_bytes + compact_opening_bytes
+        );
+        assert_eq!(record.verifier_communication_bytes, record.proof_bytes);
+        assert_eq!(
+            record.proof_p10_e1_opening_batch_bytes,
+            record.proof_protocol10_e1_bytes
+        );
+        assert_eq!(
+            record.proof_p10_e2_opening_batch_bytes,
+            record.proof_protocol10_e2_bytes
+        );
         let dir = env::temp_dir().join(format!("depcs_csv_test_{}", unix_millis().expect("time")));
         fs::create_dir_all(&dir).expect("dir");
         write_text_file(&dir.join("source.csv"), &pcs_records_to_csv(&[record])).expect("write");

@@ -7,6 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -107,13 +108,16 @@ pub(crate) fn spawn_pcs_network_workers(
 ) -> Result<Vec<PcsNetworkWorkerClient>, CliError> {
     let exe = std::env::current_exe()
         .map_err(|error| CliError(format!("resolve current executable failed: {error}")))?;
+    let worker_cpusets = worker_cpusets_for(workers);
     let mut clients = Vec::with_capacity(workers);
-    for _worker_id in 0..workers {
+    for worker_id in 0..workers {
         let addr = reserve_loopback_addr()?;
-        let mut child = Command::new(&exe)
-            .arg("pcs-network-worker")
-            .arg("--addr")
-            .arg(&addr)
+        let cpuset = worker_cpusets
+            .as_ref()
+            .and_then(|cpusets| cpusets.get(worker_id))
+            .map(String::as_str);
+        let mut command = worker_process_command(&exe, &addr, cpuset);
+        let mut child = command
             .env("RAYON_NUM_THREADS", cores_per_worker.to_string())
             .env("PQ_CORES_PER_WORKER", cores_per_worker.to_string())
             .stdin(Stdio::null())
@@ -133,6 +137,57 @@ pub(crate) fn spawn_pcs_network_workers(
         });
     }
     Ok(clients)
+}
+
+fn worker_process_command(exe: &Path, addr: &str, cpuset: Option<&str>) -> Command {
+    if cfg!(target_os = "linux")
+        && let Some(cpuset) = cpuset.filter(|value| !value.is_empty())
+        && taskset_available()
+    {
+        let mut command = Command::new("taskset");
+        command
+            .arg("-c")
+            .arg(cpuset)
+            .arg(exe)
+            .arg("pcs-network-worker")
+            .arg("--addr")
+            .arg(addr);
+        return command;
+    }
+    let mut command = Command::new(exe);
+    command.arg("pcs-network-worker").arg("--addr").arg(addr);
+    command
+}
+
+fn worker_cpusets_for(workers: usize) -> Option<Vec<String>> {
+    if !cfg!(target_os = "linux") || !taskset_available() {
+        return None;
+    }
+    let value = std::env::var("PQ_WORKER_CPUSETS").ok()?;
+    parse_worker_cpusets(&value, workers)
+}
+
+fn parse_worker_cpusets(value: &str, workers: usize) -> Option<Vec<String>> {
+    let cpusets = value
+        .split(';')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (cpusets.len() >= workers).then_some(cpusets)
+}
+
+fn taskset_available() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate: PathBuf = dir.join("taskset");
+        candidate.is_file()
+    })
 }
 
 pub(crate) fn send_worker_request(
@@ -214,5 +269,24 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> Result<TcpStream, CliErr
             }
             Err(error) => return Err(CliError(format!("connect PCS worker failed: {error}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_worker_cpusets_when_enough_masks_are_present() {
+        assert_eq!(
+            parse_worker_cpusets("0-3;4-7;8-11", 2),
+            Some(vec!["0-3".to_owned(), "4-7".to_owned(), "8-11".to_owned()])
+        );
+    }
+
+    #[test]
+    fn worker_cpusets_parser_fails_closed_when_masks_are_missing() {
+        assert_eq!(parse_worker_cpusets("0-3", 2), None);
+        assert_eq!(parse_worker_cpusets("", 1), None);
     }
 }

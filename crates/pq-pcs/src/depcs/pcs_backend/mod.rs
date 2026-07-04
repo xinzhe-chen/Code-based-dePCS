@@ -1,9 +1,8 @@
 //! Artifact-backed PCS backend dispatch used by dePCS workers.
 //!
 //! Protocol 6-11 should treat this module as the backend boundary. The concrete
-//! BaseFold/DeepFold artifact calls live in `basefold.rs` and `deepfold.rs`;
-//! this file only dispatches by `PaperPcsBackend` and converts artifact panics
-//! into fail-closed dePCS errors.
+//! DeepFold artifact calls live in `deepfold.rs`; this file converts artifact
+//! panics into fail-closed dePCS errors.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -17,13 +16,11 @@ use crate::depcs::backend::PaperPcsBackend;
 use super::types::*;
 use super::utils::panic_message;
 
-mod basefold;
 mod deepfold;
 
 impl PreparedPaperProver {
     pub(crate) fn commitment(&self) -> PaperPcsCommitment {
         match self {
-            Self::BaseFold(prover) => PaperPcsCommitment::BaseFold(prover.commit_polynomial()),
             Self::DeepFold(prover) => PaperPcsCommitment::DeepFold(prover.commit_polynomial()),
         }
     }
@@ -31,14 +28,12 @@ impl PreparedPaperProver {
     pub(crate) fn open(
         self,
         point: &[PaperField],
-        evaluation: PaperField,
-    ) -> PaperDepcsResult<PaperPcsOpeningProof> {
+    ) -> PaperDepcsResult<(PaperPcsOpeningProof, PaperField)> {
         // Consume the prepared prover: `prove`/`generate_proof` mutate/consume it,
         // and the worker cache is opened at most once, so taking ownership here
         // avoids the O(domain) deep clone of the codeword + Merkle tree per open.
         match self {
-            Self::BaseFold(prover) => Ok(basefold::open_prepared(prover, point, evaluation)),
-            Self::DeepFold(prover) => deepfold::open_prepared(prover, point, evaluation),
+            Self::DeepFold(prover) => deepfold::open_prepared(prover, point),
         }
     }
 }
@@ -50,12 +45,6 @@ pub(crate) fn prepare_prover(
     oracle: &RandomOracle<PaperField>,
 ) -> PreparedPaperProver {
     match config.backend {
-        PaperPcsBackend::BaseFold => PreparedPaperProver::BaseFold(basefold::prepare_prover(
-            nv,
-            values,
-            oracle,
-            config.code_rate_log(),
-        )),
         PaperPcsBackend::DeepFold => PreparedPaperProver::DeepFold(deepfold::prepare_prover(
             nv,
             values,
@@ -72,15 +61,17 @@ pub(crate) fn open_polynomial(
     point: &[PaperField],
     commitment: &PaperPcsCommitment,
     oracle: &RandomOracle<PaperField>,
-) -> PaperDepcsResult<PaperPcsOpeningProof> {
-    match (config.backend, commitment) {
-        (PaperPcsBackend::BaseFold, PaperPcsCommitment::BaseFold(root)) => {
-            basefold::open_polynomial(nv, values, point, root, oracle, config.code_rate_log())
-        }
-        (PaperPcsBackend::DeepFold, PaperPcsCommitment::DeepFold(_expected)) => Ok(
-            deepfold::open_polynomial(nv, values, point, oracle, config.code_rate_log()),
-        ),
-        _ => Err(PaperDepcsError::InvalidBackend),
+) -> PaperDepcsResult<(PaperPcsOpeningProof, PaperField)> {
+    match config.backend {
+        PaperPcsBackend::DeepFold => match commitment {
+            PaperPcsCommitment::DeepFold(_expected) => Ok(deepfold::open_polynomial(
+                nv,
+                values,
+                point,
+                oracle,
+                config.code_rate_log(),
+            )),
+        },
     }
 }
 
@@ -92,9 +83,6 @@ pub(crate) fn verify_worker_opening(
     oracle: &RandomOracle<PaperField>,
 ) -> PaperDepcsResult<()> {
     let result = catch_unwind(AssertUnwindSafe(|| match (&opening.proof, commitment) {
-        (PaperPcsOpeningProof::BaseFold(proof), PaperPcsCommitment::BaseFold(root)) => {
-            basefold::verify_opening(nv, root, opening, proof, oracle, config.code_rate_log())
-        }
         (PaperPcsOpeningProof::DeepFold(proof), PaperPcsCommitment::DeepFold(commitment)) => {
             deepfold::verify_opening(
                 nv,
@@ -105,7 +93,6 @@ pub(crate) fn verify_worker_opening(
                 config.code_rate_log(),
             )
         }
-        _ => false,
     }));
     match result {
         Ok(true) => Ok(()),

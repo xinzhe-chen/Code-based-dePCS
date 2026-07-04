@@ -9,7 +9,7 @@
 //! Code mapping:
 //! - `worker_weight` computes the paper's `beta^(i)`.
 //! - `prepare_*_worker_opening_input` computes the local `F2^(i)(s2)` value and
-//!   the artifact point used by BaseFold/DeepFold.
+//!   the artifact point used by DeepFold.
 //! - `f_pad_systematic_claim` is Protocol 10 step 5's `F(u')` claim, paired
 //!   with Protocol 8's `E(u', 0^log c)` claim.
 
@@ -17,8 +17,9 @@ use paper_util::algebra::field::MyField;
 
 use super::protocol7_merkle_commitments::worker_commitment_digest;
 use super::types::*;
-use super::utils::{artifact_point, deterministic_value, evaluate_multilinear_slice};
+use super::utils::{artifact_point, deterministic_value};
 
+#[allow(dead_code)]
 pub(crate) struct Protocol9FClaim {
     pub(crate) opening_claim: PaperProtocol10OpeningClaim,
 }
@@ -27,7 +28,6 @@ pub(crate) struct Protocol9WorkerOpeningInput {
     pub(crate) worker_id: usize,
     pub(crate) worker_weight: PaperField,
     pub(crate) shard_point: Vec<PaperField>,
-    pub(crate) value: PaperField,
 }
 
 pub(crate) struct Protocol9UncachedWorkerOpeningInput {
@@ -82,18 +82,18 @@ pub(crate) fn prepare_worker_opening_input(
     point: &[PaperField],
 ) -> PaperDepcsResult<Protocol9UncachedWorkerOpeningInput> {
     // Protocol 9 eval phase, non-cached worker path: materialize the worker's
-    // shard, evaluate it at `s2`, and return the metadata later carried in the
-    // Protocol 11 worker opening.
+    // shard for the backend PCS proof and return the public opening metadata.
+    // The opened value is read back from the artifact proof evaluation, avoiding
+    // a second multilinear evaluation before proving.
     if point.len() != commitment.nv || worker_id >= commitment.workers {
         return Err(PaperDepcsError::InvalidProof);
     }
     let coefficients = worker_coefficients(commitment.original_len, commitment.workers, worker_id)?;
-    let opening = worker_opening_input_from_values(
+    let opening = worker_opening_input_from_point(
         worker_id,
         commitment.worker_bits,
         commitment.artifact_nv,
         point,
-        &coefficients,
     )?;
     Ok(Protocol9UncachedWorkerOpeningInput {
         opening,
@@ -127,12 +127,11 @@ pub(crate) fn prepare_cached_worker_opening_input(
     {
         return Err(PaperDepcsError::InvalidCommitment);
     }
-    worker_opening_input_from_values(
+    worker_opening_input_from_point(
         cache.worker_id,
         commitment.worker_bits,
         commitment.artifact_nv,
         point,
-        &cache.values,
     )
 }
 
@@ -155,6 +154,7 @@ pub(crate) fn validate_worker_opening_metadata(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn f_pad_systematic_claim(
     opening: &PaperProtocol11WorkerOpening,
     source_digest: [u8; 32],
@@ -174,25 +174,22 @@ pub(crate) fn f_pad_systematic_claim(
     }
 }
 
-fn worker_opening_input_from_values(
+fn worker_opening_input_from_point(
     worker_id: usize,
     worker_bits: usize,
     artifact_nv: usize,
     point: &[PaperField],
-    values: &[PaperField],
 ) -> PaperDepcsResult<Protocol9WorkerOpeningInput> {
-    // Split `s=s1||s2`, compute beta=eq(s1, worker_id), then evaluate the
-    // worker-local multilinear polynomial on `s2`. `artifact_point` pads `s2`
-    // to the vendored PCS arity without changing the logical claim.
+    // Split `s=s1||s2`, compute beta=eq(s1, worker_id), and pad `s2` to the
+    // vendored PCS arity without changing the logical claim. The opened value
+    // is filled from DeepFold's returned evaluation after proof generation.
     let worker_weight = worker_weight(worker_id, worker_bits, point)?;
     let shard_point = point[worker_bits..].to_vec();
-    let value = evaluate_multilinear_slice(values, &shard_point);
     let shard_point = artifact_point(&shard_point, artifact_nv);
     Ok(Protocol9WorkerOpeningInput {
         worker_id,
         worker_weight,
         shard_point,
-        value,
     })
 }
 

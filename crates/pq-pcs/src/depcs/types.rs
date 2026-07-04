@@ -1,13 +1,5 @@
-use std::sync::Arc;
-
-use paper_basefold::prover as basefold_prover;
 use paper_deepfold::{self, prover as deepfold_prover};
-use paper_util::{
-    algebra::{field::mersenne61_ext::Mersenne61Ext, polynomial::Polynomial},
-    merkle_tree::MERKLE_ROOT_SIZE,
-    query_result::QueryResult,
-    random_oracle::RandomOracle,
-};
+use paper_util::algebra::field::mersenne61_ext::Mersenne61Ext;
 use serde::{Deserialize, Serialize};
 
 use crate::depcs::backend::{
@@ -42,7 +34,6 @@ pub struct PaperDepcsConfig {
 impl PaperDepcsConfig {
     pub fn new(backend: PaperPcsBackend, rate_inv: usize) -> PaperDepcsResult<Self> {
         let expected = match backend {
-            PaperPcsBackend::BaseFold => 8,
             PaperPcsBackend::DeepFold => 2,
         };
         if rate_inv != expected || !rate_inv.is_power_of_two() {
@@ -82,14 +73,13 @@ pub struct PaperProtocol11Commitment {
 pub struct PaperProtocol11WorkerCommitment {
     pub worker_id: usize,
     pub row_range: (usize, usize),
-    pub oracle: RandomOracle<PaperField>,
+    pub oracle_seed: [u8; 32],
     pub pcs_commitment: PaperPcsCommitment,
     pub leaf_digest: [u8; 32],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PaperPcsCommitment {
-    BaseFold([u8; MERKLE_ROOT_SIZE]),
     DeepFold(paper_deepfold::Commit<PaperField>),
 }
 
@@ -116,17 +106,7 @@ pub struct PaperProtocol11WorkerOpening {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PaperPcsOpeningProof {
-    BaseFold(PaperBaseFoldProof),
     DeepFold(paper_deepfold::Proof<PaperField>),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PaperBaseFoldProof {
-    pub evaluation: PaperField,
-    pub folding_roots: Vec<(usize, [u8; MERKLE_ROOT_SIZE])>,
-    pub sumcheck_values: Vec<(PaperField, PaperField, PaperField)>,
-    pub final_poly: Polynomial<PaperField>,
-    pub query_results: Vec<QueryResult<PaperField>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,9 +119,8 @@ pub struct PaperProtocol10EncodingBatchProof {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaperProtocol10OpeningBatchProof {
-    pub claims: Vec<PaperProtocol10OpeningClaim>,
-    pub gammas: Vec<PaperField>,
-    pub reduction_point: Vec<PaperField>,
+    pub claim_count: usize,
+    pub reduction_point_len: usize,
     pub combined_value: PaperField,
     pub source_digest: [u8; 32],
 }
@@ -151,8 +130,21 @@ pub struct PaperProtocol10RelationProof {
     pub relation_index: usize,
     pub relation_kind: PaperProtocol10RelationKind,
     pub challenge: PaperField,
-    pub opening_batch: PaperProtocol10OpeningBatchProof,
+    pub opening_batch_digest: [u8; 32],
+    pub claim_count: usize,
+    pub reduction_point_len: usize,
     pub relation_value: PaperField,
+}
+
+impl PaperProtocol10RelationProof {
+    pub(crate) fn opening_batch_summary(&self) -> PaperProtocol10OpeningBatchProof {
+        PaperProtocol10OpeningBatchProof {
+            claim_count: self.claim_count,
+            reduction_point_len: self.reduction_point_len,
+            combined_value: self.relation_value,
+            source_digest: self.opening_batch_digest,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,13 +216,11 @@ pub struct PaperWorkerCache {
     pub worker_id: usize,
     pub config: PaperDepcsConfig,
     pub commitment: PaperProtocol11WorkerCommitment,
-    pub(crate) values: Arc<[PaperField]>,
     pub(crate) prepared: PreparedPaperProver,
 }
 
 #[derive(Clone)]
 pub(crate) enum PreparedPaperProver {
-    BaseFold(basefold_prover::Prover<PaperField>),
     DeepFold(deepfold_prover::Prover<PaperField>),
 }
 

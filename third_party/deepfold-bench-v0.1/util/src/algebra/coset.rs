@@ -104,13 +104,15 @@ fn coset_powers<T: MyField>(shift: T, base: T, order: usize) -> Vec<T> {
     let threads = rayon::current_num_threads().max(1);
     let chunk = order.div_ceil(threads * 4).max(1);
     let mut out = vec![shift; order];
-    out.par_chunks_mut(chunk).enumerate().for_each(|(c, slice)| {
-        let mut cur = shift * base.pow(c * chunk);
-        for x in slice.iter_mut() {
-            *x = cur;
-            cur *= base;
-        }
-    });
+    out.par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(c, slice)| {
+            let mut cur = shift * base.pow(c * chunk);
+            for x in slice.iter_mut() {
+                *x = cur;
+                cur *= base;
+            }
+        });
     out
 }
 

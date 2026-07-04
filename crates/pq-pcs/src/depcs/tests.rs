@@ -1,3 +1,8 @@
+use super::protocol7_merkle_commitments::worker_commitment_digest;
+use super::protocol10_encoding::{
+    protocol10_worker_contexts, relation_challenge, relation_challenge_with_statement_digests,
+    relation_challenge_with_worker_contexts, worker_statement_digests,
+};
 use super::*;
 use crate::depcs::backend::PaperPcsBackend;
 use paper_util::algebra::field::MyField;
@@ -24,11 +29,6 @@ fn roundtrip(
 }
 
 #[test]
-fn paper_depcs_basefold_roundtrip() {
-    roundtrip(PaperPcsBackend::BaseFold, 8);
-}
-
-#[test]
 fn paper_depcs_deepfold_roundtrip() {
     roundtrip(PaperPcsBackend::DeepFold, 2);
 }
@@ -42,35 +42,84 @@ fn paper_depcs_rejects_wrong_value() {
 
 #[test]
 fn paper_depcs_rejects_tampered_protocol10_batch() {
-    let (commitment, mut proof) = roundtrip(PaperPcsBackend::BaseFold, 8);
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
     proof.opening_batch.source_digest[0] ^= 1;
     assert!(verify(&commitment, &proof).is_err());
 }
 
 #[test]
-fn paper_depcs_rejects_tampered_protocol10_relation_claim() {
+fn paper_depcs_rejects_tampered_protocol10_relation_digest() {
     let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
-    proof.encoding_batch.e1.opening_batch.claims[0].claimed_value += PaperField::from_int(1);
+    proof.encoding_batch.e1.opening_batch_digest[0] ^= 1;
     assert!(verify(&commitment, &proof).is_err());
 }
 
 #[test]
 fn paper_depcs_rejects_tampered_protocol10_reduction_value() {
     let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
-    proof.encoding_batch.e2.opening_batch.combined_value += PaperField::from_int(1);
+    proof.encoding_batch.e2.relation_value += PaperField::from_int(1);
+    assert!(verify(&commitment, &proof).is_err());
+}
+
+#[test]
+fn paper_depcs_rejects_tampered_protocol10_claim_count() {
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    proof.encoding_batch.e1.claim_count += 1;
+    assert!(verify(&commitment, &proof).is_err());
+}
+
+#[test]
+fn paper_depcs_rejects_tampered_protocol10_reduction_point_len() {
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    proof.encoding_batch.e2.reduction_point_len += 1;
     assert!(verify(&commitment, &proof).is_err());
 }
 
 #[test]
 fn paper_depcs_rejects_tampered_worker_weight() {
-    let (commitment, mut proof) = roundtrip(PaperPcsBackend::BaseFold, 8);
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
     proof.worker_openings[0].worker_weight += PaperField::from_int(1);
     assert!(verify(&commitment, &proof).is_err());
 }
 
 #[test]
+fn paper_depcs_rejects_tampered_shard_point() {
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    proof.worker_openings[0].shard_point[0] += PaperField::from_int(1);
+    assert!(verify(&commitment, &proof).is_err());
+}
+
+#[test]
+fn paper_depcs_rejects_tampered_global_point() {
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    proof.point[0] += PaperField::from_int(1);
+    assert!(verify(&commitment, &proof).is_err());
+}
+
+#[test]
+fn paper_depcs_rejects_reordered_workers() {
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    proof.worker_openings.swap(0, 1);
+    assert!(verify(&commitment, &proof).is_err());
+}
+
+#[test]
+fn paper_depcs_rejects_tampered_worker_leaf_digest() {
+    let (mut commitment, proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    commitment.workers_commitments[0].leaf_digest[0] ^= 1;
+    commitment.root = compact_codec::worker_set_root(&commitment.workers_commitments);
+    assert!(verify(&commitment, &proof).is_err());
+}
+
+#[test]
+fn paper_depcs_rejects_tampered_oracle_seed() {
+    let (mut commitment, proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    commitment.workers_commitments[0].oracle_seed[0] ^= 1;
+    assert!(verify(&commitment, &proof).is_err());
+}
+
+#[test]
 fn paper_depcs_rejects_wrong_rate() {
-    assert!(PaperDepcsConfig::new(PaperPcsBackend::BaseFold, 2).is_err());
     assert!(PaperDepcsConfig::new(PaperPcsBackend::DeepFold, 8).is_err());
 }
 
@@ -116,24 +165,174 @@ fn paper_depcs_cached_worker_open_rejects_wrong_commitment() {
 
 // --- A1: canonical-order query value encoding must be fail-closed ---
 
-fn first_worker_basefold_values(proof: &mut PaperProtocol11Proof) -> &mut Vec<PaperField> {
+fn first_worker_deepfold_values(proof: &mut PaperProtocol11Proof) -> &mut Vec<PaperField> {
     match &mut proof.worker_openings[0].proof {
-        PaperPcsOpeningProof::BaseFold(bf) => &mut bf.query_results[0].proof_values,
-        PaperPcsOpeningProof::DeepFold(_) => panic!("expected a BaseFold worker proof"),
+        PaperPcsOpeningProof::DeepFold(df) => &mut df.query_result[0].proof_values,
+    }
+}
+
+fn tamper_first_worker_deepfold_root(proof: &mut PaperProtocol11Proof) {
+    match &mut proof.worker_openings[0].proof {
+        PaperPcsOpeningProof::DeepFold(df) => df.merkle_root[0][0] ^= 1,
     }
 }
 
 #[test]
+fn paper_depcs_relation_challenge_excludes_deepfold_proof_bytes() {
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    let statement_before = compact_codec::worker_opening_statement_digest(
+        &commitment,
+        &proof.point,
+        &proof.worker_openings[0],
+    )
+    .unwrap();
+    let challenge_before = relation_challenge(
+        0,
+        PaperProtocol10RelationKind::E1,
+        &commitment,
+        &proof.point,
+        &proof.worker_openings,
+    )
+    .unwrap();
+
+    tamper_first_worker_deepfold_root(&mut proof);
+
+    let statement_after = compact_codec::worker_opening_statement_digest(
+        &commitment,
+        &proof.point,
+        &proof.worker_openings[0],
+    )
+    .unwrap();
+    let challenge_after = relation_challenge(
+        0,
+        PaperProtocol10RelationKind::E1,
+        &commitment,
+        &proof.point,
+        &proof.worker_openings,
+    )
+    .unwrap();
+    assert_eq!(statement_before, statement_after);
+    assert_eq!(challenge_before, challenge_after);
+    assert!(verify(&commitment, &proof).is_err());
+}
+
+#[test]
+fn paper_depcs_cached_statement_digest_challenge_matches_direct() {
+    let (commitment, proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    let direct = relation_challenge(
+        0,
+        PaperProtocol10RelationKind::E1,
+        &commitment,
+        &proof.point,
+        &proof.worker_openings,
+    )
+    .unwrap();
+    let statement_digests =
+        worker_statement_digests(&commitment, &proof.point, &proof.worker_openings).unwrap();
+    let cached = relation_challenge_with_statement_digests(
+        0,
+        PaperProtocol10RelationKind::E1,
+        &commitment,
+        &proof.point,
+        &statement_digests,
+    )
+    .unwrap();
+    let worker_contexts =
+        protocol10_worker_contexts(&commitment, &proof.point, &proof.worker_openings).unwrap();
+    let context_cached = relation_challenge_with_worker_contexts(
+        0,
+        PaperProtocol10RelationKind::E1,
+        &commitment,
+        &proof.point,
+        &worker_contexts,
+    )
+    .unwrap();
+    assert_eq!(direct, cached);
+    assert_eq!(direct, context_cached);
+}
+
+#[test]
+fn paper_depcs_cached_worker_commitment_digest_matches_canonical() {
+    let (commitment, proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    let worker_contexts =
+        protocol10_worker_contexts(&commitment, &proof.point, &proof.worker_openings).unwrap();
+    for (opening, ctx) in proof.worker_openings.iter().zip(worker_contexts.iter()) {
+        assert_eq!(opening.worker_id, ctx.worker_id);
+        let canonical =
+            worker_commitment_digest(&commitment.workers_commitments[opening.worker_id]).unwrap();
+        assert_eq!(canonical, ctx.source_digest);
+        let direct_statement =
+            compact_codec::worker_opening_statement_digest(&commitment, &proof.point, opening)
+                .unwrap();
+        assert_eq!(direct_statement, ctx.statement_digest);
+    }
+}
+
+#[test]
+fn paper_depcs_seeded_oracle_expansion_is_deterministic() {
+    let config = PaperDepcsConfig::new(PaperPcsBackend::DeepFold, 2).unwrap();
+    let seed = compact_codec::oracle_seed(1 << 6, 2, 0, config, 5);
+    let oracle_a = compact_codec::oracle_from_seed(seed, 5, config.query_count());
+    let oracle_b = compact_codec::oracle_from_seed(seed, 5, config.query_count());
+    assert_eq!(oracle_a.beta, oracle_b.beta);
+    assert_eq!(oracle_a.rlc, oracle_b.rlc);
+    assert_eq!(oracle_a.folding_challenges, oracle_b.folding_challenges);
+    assert_eq!(oracle_a.deep, oracle_b.deep);
+    assert_eq!(oracle_a.alpha, oracle_b.alpha);
+    assert_eq!(oracle_a.query_list, oracle_b.query_list);
+
+    let mut other_seed = seed;
+    other_seed[0] ^= 1;
+    let oracle_c = compact_codec::oracle_from_seed(other_seed, 5, config.query_count());
+    assert_ne!(oracle_a.beta, oracle_c.beta);
+}
+
+#[test]
+fn paper_depcs_compact_proof_breakdown_sums_to_total() {
+    let (_, proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    let breakdown = proof_size_breakdown(&proof);
+    let relation_proof_bytes = 8 + 1 + 16 + 32 + 8 + 8 + 16;
+    let component_sum = breakdown.point_query_public_bytes
+        + breakdown.eval_commitments_bytes
+        + breakdown.merkle_roots_bytes
+        + breakdown.column_openings_bytes
+        + breakdown.f2_openings_bytes
+        + breakdown.protocol10_e1_bytes
+        + breakdown.protocol10_e2_bytes
+        + breakdown.transcript_overhead_bytes;
+    assert_eq!(component_sum, breakdown.total_bytes);
+    assert_eq!(breakdown.total_bytes, proof_size_bytes(&proof));
+    assert_eq!(breakdown.protocol10_e1_bytes, relation_proof_bytes);
+    assert_eq!(breakdown.protocol10_e2_bytes, relation_proof_bytes);
+}
+
+#[test]
+fn paper_depcs_compact_commitment_size_matches_canonical_rule() {
+    let (commitment, _) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    let public_bytes = 3 * 8 + 7 * 8 + 32;
+    let worker_vec_len_bytes = 8;
+    let worker_bytes = commitment
+        .workers_commitments
+        .iter()
+        .map(compact_codec::worker_commitment_size)
+        .sum::<usize>();
+    assert_eq!(
+        commitment_size_bytes(&commitment),
+        public_bytes + worker_vec_len_bytes + worker_bytes
+    );
+}
+
+#[test]
 fn paper_depcs_rejects_tampered_query_value() {
-    let (commitment, mut proof) = roundtrip(PaperPcsBackend::BaseFold, 8);
-    first_worker_basefold_values(&mut proof)[0] += PaperField::from_int(1);
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    first_worker_deepfold_values(&mut proof)[0] += PaperField::from_int(1);
     assert!(verify(&commitment, &proof).is_err());
 }
 
 #[test]
 fn paper_depcs_rejects_reordered_query_values() {
-    let (commitment, mut proof) = roundtrip(PaperPcsBackend::BaseFold, 8);
-    let values = first_worker_basefold_values(&mut proof);
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    let values = first_worker_deepfold_values(&mut proof);
     let n = values.len();
     assert!(n >= 2, "need at least two query values to reorder");
     values.swap(0, n - 1);
@@ -142,14 +341,14 @@ fn paper_depcs_rejects_reordered_query_values() {
 
 #[test]
 fn paper_depcs_rejects_missing_query_value() {
-    let (commitment, mut proof) = roundtrip(PaperPcsBackend::BaseFold, 8);
-    first_worker_basefold_values(&mut proof).pop();
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    first_worker_deepfold_values(&mut proof).pop();
     assert!(verify(&commitment, &proof).is_err());
 }
 
 #[test]
 fn paper_depcs_rejects_extra_query_value() {
-    let (commitment, mut proof) = roundtrip(PaperPcsBackend::BaseFold, 8);
-    first_worker_basefold_values(&mut proof).push(PaperField::from_int(0));
+    let (commitment, mut proof) = roundtrip(PaperPcsBackend::DeepFold, 2);
+    first_worker_deepfold_values(&mut proof).push(PaperField::from_int(0));
     assert!(verify(&commitment, &proof).is_err());
 }

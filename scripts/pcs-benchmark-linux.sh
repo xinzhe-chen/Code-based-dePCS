@@ -15,7 +15,7 @@ default_args=(
   --fair-sequential
   --depcs-nv-range 18..24
   --depcs-workers 2,4
-  --depcs-backends basefold:8,deepfold:2
+  --depcs-backends deepfold:2
   --depcs-opening protocol11
   --ligesis-nvs 18,19,20,21,22,23,24
   --ligesis-parties-list 2,4

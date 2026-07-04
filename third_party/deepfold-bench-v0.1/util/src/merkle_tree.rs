@@ -1,7 +1,8 @@
+use crate::algebra::field::MyField;
 use rayon::prelude::*;
 
 pub const MERKLE_ROOT_SIZE: usize = 32;
-type Hash = [u8; MERKLE_ROOT_SIZE];
+pub type Hash = [u8; MERKLE_ROOT_SIZE];
 
 #[derive(Debug, Clone)]
 pub struct Blake3Algorithm {}
@@ -10,6 +11,14 @@ impl Blake3Algorithm {
     pub fn hash(data: &[u8]) -> Hash {
         blake3::hash(data).into()
     }
+}
+
+pub fn hash_field_leaf<T: MyField>(values: impl IntoIterator<Item = T>) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    for value in values {
+        hasher.update(&value.to_bytes());
+    }
+    hasher.finalize().into()
 }
 
 #[inline]
@@ -66,16 +75,20 @@ pub struct MerkleTreeVerifier {
 }
 
 impl MerkleTreeProver {
+    pub fn from_leaf_hashes(leaves: Vec<Hash>, leave_num: usize) -> Self {
+        Self {
+            layers: build_layers(leaves),
+            leave_num,
+        }
+    }
+
     pub fn new(leaf_values: Vec<Vec<u8>>) -> Self {
         let leave_num = leaf_values.len();
         let leaves: Vec<Hash> = leaf_values
             .par_iter()
             .map(|x| Blake3Algorithm::hash(x))
             .collect();
-        Self {
-            layers: build_layers(leaves),
-            leave_num,
-        }
+        Self::from_leaf_hashes(leaves, leave_num)
     }
 
     pub fn leave_num(&self) -> usize {
@@ -90,14 +103,15 @@ impl MerkleTreeProver {
     /// deduplicated (both callers guarantee this); the emitted sibling hashes
     /// are ordered by ascending index per layer, which the verifier consumes in
     /// the same order.
-    pub fn open(&self, leaf_indices: &Vec<usize>) -> Vec<u8> {
-        let mut known = leaf_indices.clone();
+    pub fn open(&self, leaf_indices: &[usize]) -> Vec<u8> {
+        let mut known = leaf_indices.to_vec();
         known.sort_unstable();
         known.dedup();
         let mut proof: Vec<u8> = Vec::new();
+        let mut parents: Vec<usize> = Vec::with_capacity(known.len());
         for level in 0..self.layers.len() - 1 {
             let layer = &self.layers[level];
-            let mut parents: Vec<usize> = Vec::with_capacity(known.len());
+            parents.clear();
             let mut i = 0;
             while i < known.len() {
                 let idx = known[i];
@@ -112,7 +126,7 @@ impl MerkleTreeProver {
                 }
                 parents.push(idx / 2);
             }
-            known = parents;
+            std::mem::swap(&mut known, &mut parents);
         }
         proof
     }
@@ -130,13 +144,24 @@ impl MerkleTreeVerifier {
     /// authentication path, and compare against the committed root. Fails closed:
     /// any extra/missing sibling bytes, or a recomputed root mismatch, returns
     /// false. `indices` must be sorted/deduplicated and aligned with `leaves`.
-    pub fn verify(
-        &self,
-        proof_bytes: Vec<u8>,
-        indices: &Vec<usize>,
-        leaves: &Vec<Vec<u8>>,
-    ) -> bool {
+    pub fn verify(&self, proof_bytes: &[u8], indices: &Vec<usize>, leaves: &Vec<Vec<u8>>) -> bool {
         if indices.len() != leaves.len() {
+            return false;
+        }
+        let leaf_hashes: Vec<Hash> = leaves
+            .iter()
+            .map(|leaf| Blake3Algorithm::hash(leaf))
+            .collect();
+        self.verify_with_leaf_hashes(proof_bytes, indices, &leaf_hashes)
+    }
+
+    pub fn verify_with_leaf_hashes(
+        &self,
+        proof_bytes: &[u8],
+        indices: &[usize],
+        leaf_hashes: &[Hash],
+    ) -> bool {
+        if indices.len() != leaf_hashes.len() {
             return false;
         }
         // Fail-closed: reject out-of-range indices (instead of authenticating a
@@ -148,8 +173,8 @@ impl MerkleTreeVerifier {
         let depth = padded.trailing_zeros() as usize;
         let mut known: Vec<(usize, Hash)> = indices
             .iter()
-            .zip(leaves.iter())
-            .map(|(&idx, leaf)| (idx, Blake3Algorithm::hash(leaf)))
+            .zip(leaf_hashes.iter())
+            .map(|(&idx, &leaf_hash)| (idx, leaf_hash))
             .collect();
         known.sort_by_key(|(idx, _)| *idx);
         if known.windows(2).any(|w| w[0].0 == w[1].0) {
@@ -161,28 +186,26 @@ impl MerkleTreeVerifier {
             let mut i = 0;
             while i < known.len() {
                 let (idx, h) = known[i];
-                let (left, right) = if idx % 2 == 0
-                    && i + 1 < known.len()
-                    && known[i + 1].0 == idx + 1
-                {
-                    let r = known[i + 1].1;
-                    i += 2;
-                    (h, r)
-                } else if idx % 2 == 0 {
-                    let r = match read_hash(&proof_bytes, &mut pos) {
-                        Some(x) => x,
-                        None => return false,
+                let (left, right) =
+                    if idx % 2 == 0 && i + 1 < known.len() && known[i + 1].0 == idx + 1 {
+                        let r = known[i + 1].1;
+                        i += 2;
+                        (h, r)
+                    } else if idx % 2 == 0 {
+                        let r = match read_hash(&proof_bytes, &mut pos) {
+                            Some(x) => x,
+                            None => return false,
+                        };
+                        i += 1;
+                        (h, r)
+                    } else {
+                        let l = match read_hash(&proof_bytes, &mut pos) {
+                            Some(x) => x,
+                            None => return false,
+                        };
+                        i += 1;
+                        (l, h)
                     };
-                    i += 1;
-                    (h, r)
-                } else {
-                    let l = match read_hash(&proof_bytes, &mut pos) {
-                        Some(x) => x,
-                        None => return false,
-                    };
-                    i += 1;
-                    (l, h)
-                };
                 parents.push((idx / 2, hash_pair(&left, &right)));
             }
             known = parents;
@@ -210,14 +233,33 @@ mod tests {
         let leave_number = leaf_values.len();
         let prover = MerkleTreeProver::new(leaf_values);
         let root = prover.commit();
+        let hashed_prover = MerkleTreeProver::from_leaf_hashes(
+            vec![
+                hash_field_leaf([Mersenne61Ext::from_int(1), Mersenne61Ext::from_int(2)]),
+                hash_field_leaf([Mersenne61Ext::from_int(3), Mersenne61Ext::from_int(4)]),
+                hash_field_leaf([Mersenne61Ext::from_int(5), Mersenne61Ext::from_int(6)]),
+                hash_field_leaf([Mersenne61Ext::from_int(7), Mersenne61Ext::from_int(8)]),
+                hash_field_leaf([Mersenne61Ext::from_int(9), Mersenne61Ext::from_int(10)]),
+                hash_field_leaf([Mersenne61Ext::from_int(11), Mersenne61Ext::from_int(12)]),
+                hash_field_leaf([Mersenne61Ext::from_int(13), Mersenne61Ext::from_int(14)]),
+            ],
+            leave_number,
+        );
+        assert_eq!(root, hashed_prover.commit());
         let verifier = MerkleTreeVerifier::new(leave_number, &root);
         let leaf_indices = vec![2, 3];
         let proof_bytes = prover.open(&leaf_indices);
+        assert_eq!(proof_bytes, hashed_prover.open(&leaf_indices));
         let open_values = vec![
             as_bytes_vec(&[Mersenne61Ext::from_int(5), Mersenne61Ext::from_int(6)]),
             as_bytes_vec(&[Mersenne61Ext::from_int(7), Mersenne61Ext::from_int(8)]),
         ];
-        assert!(verifier.verify(proof_bytes, &leaf_indices, &open_values));
+        assert!(verifier.verify(&proof_bytes, &leaf_indices, &open_values));
+        let leaf_hashes = open_values
+            .iter()
+            .map(|leaf| Blake3Algorithm::hash(leaf))
+            .collect::<Vec<_>>();
+        assert!(verifier.verify_with_leaf_hashes(&proof_bytes, &leaf_indices, &leaf_hashes));
     }
 
     #[test]
@@ -234,17 +276,17 @@ mod tests {
             .iter()
             .map(|&i| as_bytes_vec(&[Mersenne61Ext::from_int(i)]))
             .collect();
-        assert!(verifier.verify(proof.clone(), &idx, &good));
+        assert!(verifier.verify(&proof, &idx, &good));
         let mut bad = good.clone();
         bad[1] = as_bytes_vec(&[Mersenne61Ext::from_int(999)]);
-        assert!(!verifier.verify(proof.clone(), &idx, &bad));
+        assert!(!verifier.verify(&proof, &idx, &bad));
         // truncated / extended proof must fail closed
         let mut short = proof.clone();
         short.pop();
-        assert!(!verifier.verify(short, &idx, &good));
+        assert!(!verifier.verify(&short, &idx, &good));
         let mut long = proof.clone();
         long.push(0);
-        assert!(!verifier.verify(long, &idx, &good));
+        assert!(!verifier.verify(&long, &idx, &good));
     }
 
     #[test]
@@ -261,12 +303,12 @@ mod tests {
             .iter()
             .map(|&i| as_bytes_vec(&[Mersenne61Ext::from_int(i)]))
             .collect();
-        assert!(verifier.verify(proof.clone(), &idx, &leaves));
+        assert!(verifier.verify(&proof, &idx, &leaves));
         // out-of-range index (>= leave_number) must be rejected, not authenticated
         // against a padded slot
-        assert!(!verifier.verify(proof.clone(), &vec![1, 8], &leaves));
+        assert!(!verifier.verify(&proof, &vec![1, 8], &leaves));
         // duplicate index must be rejected, not silently deduplicated
-        assert!(!verifier.verify(proof, &vec![1, 1], &leaves));
+        assert!(!verifier.verify(&proof, &vec![1, 1], &leaves));
     }
 
     #[test]

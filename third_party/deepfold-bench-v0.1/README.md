@@ -13,7 +13,6 @@ DeepFold is implemented using $\mathbb{F}_{p^2}$, with $p = 2^{61} - 1$ as the b
   - **DeepFold**: The multi-linear FRI-based polynomial commitment scheme proposed in paper. Find this mainly in the `deepfold/` directory.
   - **Batch Variant of DeepFold**: The Batch evaluation version of DeepFold proposed in paper. Find this in the `batch/` directory.
   - **Other FRI-based Multi-linears**:
-    - BaseFold in `basefold/` directory
     - DEEP-FRI in `fri/` directory
     - PolyFRIM in `polyfrim/` directory
     - Virgo in `virgo/` directory
@@ -43,12 +42,12 @@ DeepFold is implemented using $\mathbb{F}_{p^2}$, with $p = 2^{61} - 1$ as the b
 cargo bench
 ```
 
--- **Benchmark a Specific Protocol**: Choose from `deepfold`, `basefold`, `fri`, `matmult` `polyfrim`, `virgo` or `zeromorph`
+-- **Benchmark a Specific Protocol**: Choose from `deepfold`, `fri`, `matmult` `polyfrim`, `virgo` or `zeromorph`
 ```bash
 cargo bench -p <scheme>
 ```
 
--- **Output Proof Size**: Choose from `deepfold`, `basefold`, `fri`, `matmult`, `polyfrim`, `virgo` or `zeromorph`
+-- **Output Proof Size**: Choose from `deepfold`, `fri`, `matmult`, `polyfrim`, `virgo` or `zeromorph`
 ```bash
 cargo test --release -p <scheme>
 ```

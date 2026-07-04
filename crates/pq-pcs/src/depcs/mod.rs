@@ -6,6 +6,7 @@
 //! and communication accounting stay unchanged.
 
 pub mod backend;
+mod compact_codec;
 mod pcs_backend;
 mod proof_size;
 mod protocol10_encoding;

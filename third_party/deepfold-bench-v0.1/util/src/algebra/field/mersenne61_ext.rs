@@ -1,4 +1,5 @@
 use super::MyField;
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::_mulx_u64;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -69,9 +70,17 @@ impl std::ops::SubAssign for Mersenne61Ext {
 
 #[inline]
 fn my_mult(x: u64, y: u64) -> u64 {
-    let mut hi = 0;
-    let lo = unsafe { _mulx_u64(x, y, &mut hi) };
-    ((hi << 3) | (lo >> 61)) + (lo & MOD)
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut hi = 0;
+        let lo = unsafe { _mulx_u64(x, y, &mut hi) };
+        ((hi << 3) | (lo >> 61)) + (lo & MOD)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let product = x as u128 * y as u128;
+        ((product >> 61) as u64) + ((product as u64) & MOD)
+    }
 }
 
 #[inline]
