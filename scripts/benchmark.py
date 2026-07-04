@@ -856,6 +856,7 @@ def active_benchmark_processes() -> list[dict[str, str]]:
         "de_pip_fri.exe",
         "dligesis.exe",
     }
+    target_stems = {name.replace(".exe", "") for name in target_names}
     if os.name == "nt":
         proc = subprocess.run(
             ["tasklist", "/fo", "csv", "/nh"],
@@ -882,9 +883,20 @@ def active_benchmark_processes() -> list[dict[str, str]]:
         capture_output=True,
     )
     active = []
+    current_pid = os.getpid()
     for line in proc.stdout.splitlines():
-        lowered = line.lower()
-        if any(name.replace(".exe", "") in lowered for name in target_names):
+        parts = line.strip().split(maxsplit=2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        comm = parts[1].lower()
+        argv0 = Path(parts[2].split(maxsplit=1)[0]).name.lower() if len(parts) > 2 else ""
+        if comm in target_stems or argv0 in target_stems:
             active.append({"process": line.strip()})
     return active
 
