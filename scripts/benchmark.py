@@ -3277,6 +3277,12 @@ def main() -> int:
     parser.add_argument("--self-test-affinity", action="store_true")
     parser.add_argument("--fair-sequential", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--host-logical-cores",
+        type=int,
+        default=None,
+        help="Override detected logical CPU count for fair-sequential scheduling.",
+    )
     parser.add_argument("--reuse-depcs-dir", default=None)
     parser.add_argument(
         "--baseline-dir",
@@ -3386,7 +3392,9 @@ def main() -> int:
         if scheme.strip()
     ]
     args.depcs_backend_specs = parse_backend_specs(args.depcs_backends)
-    args.host_logical_cores = os.cpu_count() or 1
+    args.host_logical_cores = args.host_logical_cores or os.cpu_count() or 1
+    if args.host_logical_cores <= 0:
+        parser.error("--host-logical-cores must be positive")
     args.max_workers = max(args.depcs_worker_values)
     if args.fair_sequential:
         if args.cores_per_worker is not None:
