@@ -1002,7 +1002,7 @@ def allocate_worker_cpu_lists(
 
 def affinity_plan_for_row(args: argparse.Namespace, workers: int) -> dict[str, str]:
     cores_per_worker = fair_row_cores_per_worker(args, workers)
-    policy = "adaptive-affinity-per-row"
+    policy = "fixed-affinity-per-worker"
     if not sys.platform.startswith("linux"):
         return {
             "thread_policy": policy,
@@ -1040,7 +1040,7 @@ def wrap_with_row_affinity(cmd: list[str], row: dict) -> list[str]:
 
 def affinity_env_for_row(row: dict) -> dict[str, str]:
     return {
-        "PQ_THREAD_POLICY": str(row.get("thread_policy") or "adaptive-affinity-per-row"),
+        "PQ_THREAD_POLICY": str(row.get("thread_policy") or "fixed-affinity-per-worker"),
         "PQ_ROW_CPUSET": str(row.get("row_cpuset") or ""),
         "PQ_WORKER_CPUSETS": str(row.get("worker_cpusets") or ""),
         "PQ_NUMA_POLICY": str(row.get("numa_policy") or "unknown"),
@@ -1129,7 +1129,13 @@ def build_fair_schedule(args: argparse.Namespace) -> list[dict]:
 
 
 def fair_row_cores_per_worker(args: argparse.Namespace, workers: int) -> int:
-    return max(1, int(args.host_logical_cores) // max(1, int(workers)))
+    return max(
+        1,
+        int(
+            args.cores_per_worker
+            or (int(args.host_logical_cores) // max(1, int(args.max_workers)))
+        ),
+    )
 
 
 def current_cores_per_worker(args: argparse.Namespace) -> int:
@@ -2982,8 +2988,8 @@ def run_fair_sequential(args: argparse.Namespace) -> int:
         (
             f"- fair_sequential: one benchmark row at a time; host_logical_cores="
             f"{args.host_logical_cores}; max_workers={args.max_workers}; "
-            "cores_per_worker=adaptive floor(host_logical_cores/workers); "
-            "thread_policy=adaptive-affinity-per-row."
+            "cores_per_worker=fixed floor(host_logical_cores/max_workers); "
+            "thread_policy=fixed-affinity-per-worker."
         ),
         (
             "- affinity: Linux rows use taskset with NUMA-aware worker masks when available; "
@@ -3409,12 +3415,17 @@ def main() -> int:
         parser.error("--host-logical-cores must be positive")
     args.max_workers = max(args.depcs_worker_values)
     if args.fair_sequential:
-        if args.cores_per_worker is not None:
+        computed_cores_per_worker = max(1, args.host_logical_cores // args.max_workers)
+        if (
+            args.cores_per_worker is not None
+            and args.cores_per_worker != computed_cores_per_worker
+        ):
             parser.error(
-                "--cores-per-worker must not override the fair sequential adaptive allocation; "
-                "each row uses floor(host_logical_cores/workers)"
+                "--cores-per-worker must not override the fair sequential fixed allocation; "
+                f"expected {computed_cores_per_worker} from floor("
+                f"{args.host_logical_cores}/{args.max_workers})"
             )
-        args.cores_per_worker = 1
+        args.cores_per_worker = computed_cores_per_worker
         if args.query_count is None:
             args.query_count = args.pcs_queries
         args.pcs_queries = args.query_count
