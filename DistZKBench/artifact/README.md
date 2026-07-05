@@ -8,6 +8,16 @@ DistZKBench has two artifact paths:
 Run toy smoke tests first. Linux strict runs must fail closed when requested
 features such as cgroup v2, resctrl, netns/tc, or perf are unavailable.
 
+For first-time users, start with the interactive entrypoint:
+
+```bash
+cargo build --release --locked
+./target/release/dzb interactive
+```
+
+It can run a local toy self-check and write a starter config under
+`configs/generated/` for an SDK or black-box adapter.
+
 Remote Linux validation uses environment variables instead of committed secrets:
 
 ```bash

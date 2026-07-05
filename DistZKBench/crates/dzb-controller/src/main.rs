@@ -1,10 +1,14 @@
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
-use dzb_core::{Platform, PlatformBackendName, load_config, resolve_config, write_json_pretty};
+use dzb_core::{
+    Config, Platform, PlatformBackendName, TopologyKind, load_config, resolve_config,
+    write_json_pretty,
+};
 use dzb_metrics::{ExperimentOutput, write_outputs};
 use dzb_platform::{PlatformBackend, standard_thread_budget_env};
 use dzb_platform_darwin::DarwinBackend;
@@ -28,9 +32,209 @@ fn run() -> Result<(), String> {
         Some("sweep") => cmd_sweep(&args[1..]),
         Some("report") => cmd_report(&args[1..]),
         Some("cleanup") => cmd_cleanup(&args[1..]),
+        Some("interactive") | Some("ui") | Some("wizard") => cmd_interactive(&args[1..]),
         Some(other) => Err(format!("unknown dzb command '{other}'")),
         None => Err(usage()),
     }
+}
+
+fn cmd_interactive(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{}", interactive_usage());
+        return Ok(());
+    }
+    println!("DistZKBench interactive");
+    println!("1) Run local toy self-check now");
+    println!("2) Generate a protocol adapter config");
+    println!("3) Print next-step checklist");
+    let choice = prompt("Select action", "1")?;
+    match choice.trim() {
+        "1" => interactive_toy_self_check(),
+        "2" => interactive_adapter_config(),
+        "3" => {
+            print_next_steps();
+            Ok(())
+        }
+        other => Err(format!("unknown interactive choice '{other}'")),
+    }
+}
+
+fn interactive_toy_self_check() -> Result<(), String> {
+    let shape = prompt("Toy shape [star/full-mesh/pingpong]", "star")?;
+    let ranks_default = if shape.trim() == "pingpong" { "2" } else { "4" };
+    let ranks = prompt_usize("Prover ranks", ranks_default)?;
+    let message_bytes = prompt_usize("Message bytes per sender", "1024")?;
+    let output_dir = prompt("Output directory", "results")?;
+    let run_now = prompt("Run after writing config? [yes/no]", "yes")?;
+    let mut config = Config::default();
+    let shape = shape.trim();
+    config.experiment.name = format!("interactive_toy_{}", slugify(shape));
+    config.experiment.run_id = "auto".to_owned();
+    config.experiment.output_dir = output_dir;
+    config.roles.prover_ranks = ranks;
+    config.roles.master_rank = 0;
+    config.resources.worker_threads = 1;
+    config.resources.verifier_threads = "same_as_worker".to_owned();
+    config.memory.per_rank_limit = "1GiB".to_owned();
+    config.cache.mode = "none".to_owned();
+    config.network.mode = "loopback".to_owned();
+    config.network.base_port = 39000;
+    config.protocol.mode = "sdk-binary".to_owned();
+    config.protocol.toy.message_bytes = message_bytes;
+    match shape {
+        "full-mesh" | "fullmesh" | "alltoall" => {
+            config.topology.kind = TopologyKind::FullMesh;
+            config.protocol.adapter = "toy-alltoall".to_owned();
+        }
+        "pingpong" | "ping-pong" => {
+            config.topology.kind = TopologyKind::FullMesh;
+            config.roles.prover_ranks = ranks.max(2);
+            config.protocol.adapter = "toy-pingpong".to_owned();
+        }
+        "star" | "" => {
+            config.topology.kind = TopologyKind::Star;
+            config.topology.worker_to_worker = "forbidden".to_owned();
+            config.protocol.adapter = "toy-star-aggregate".to_owned();
+        }
+        other => return Err(format!("unknown toy shape '{other}'")),
+    }
+    let path = write_generated_config(&config, &config.experiment.name)?;
+    println!("Wrote {}", path.display());
+    if is_yes(&run_now) {
+        println!("Running preflight...");
+        cmd_preflight(&["--config".to_owned(), path.to_string_lossy().into_owned()])?;
+        println!("Running toy self-check...");
+        cmd_run(&[path.to_string_lossy().into_owned()])?;
+    } else {
+        println!("Next: ./target/release/dzb run {}", path.display());
+    }
+    Ok(())
+}
+
+fn interactive_adapter_config() -> Result<(), String> {
+    let name = prompt("Experiment name", "my_protocol_smoke")?;
+    let adapter = prompt("Adapter name or binary path", "my-adapter")?;
+    let mode = prompt("Adapter mode [sdk-binary/black-box]", "sdk-binary")?;
+    let topology = prompt("Topology [star/full-mesh]", "star")?;
+    let ranks = prompt_usize("Prover ranks", "4")?;
+    let worker_threads = prompt_usize("Worker threads per rank", "1")?;
+    let memory_limit = prompt("Memory limit per rank", "8GiB")?;
+    let output_dir = prompt("Output directory", "results")?;
+    let mut config = Config::default();
+    config.experiment.name = slugify(&name);
+    config.experiment.run_id = "auto".to_owned();
+    config.experiment.output_dir = output_dir;
+    config.roles.prover_ranks = ranks;
+    config.roles.master_rank = 0;
+    config.resources.worker_threads = worker_threads;
+    config.resources.verifier_threads = "same_as_worker".to_owned();
+    config.memory.per_rank_limit = memory_limit;
+    config.cache.mode = "none".to_owned();
+    config.network.mode = "loopback".to_owned();
+    config.network.base_port = 39000;
+    config.protocol.adapter = adapter.clone();
+    config.protocol.mode = mode.clone();
+    if mode == "black-box" {
+        config.protocol.command = adapter;
+    }
+    match topology.trim() {
+        "full-mesh" | "fullmesh" => config.topology.kind = TopologyKind::FullMesh,
+        "star" | "" => {
+            config.topology.kind = TopologyKind::Star;
+            config.topology.worker_to_worker = "forbidden".to_owned();
+        }
+        other => return Err(format!("unknown topology '{other}'")),
+    }
+    let path = write_generated_config(&config, &config.experiment.name)?;
+    println!("Wrote {}", path.display());
+    println!("Next commands:");
+    println!(
+        "  ./target/release/dzb preflight --config {}",
+        path.display()
+    );
+    println!("  ./target/release/dzb run {}", path.display());
+    if mode == "sdk-binary" {
+        println!(
+            "Note: sdk-binary is the artifact-quality path; wire protocol messages through the DistZKBench SDK transport before using this for final communication metrics."
+        );
+    } else {
+        println!(
+            "Note: black-box mode can smoke-test legacy binaries, but reports communication_precision=unavailable."
+        );
+    }
+    Ok(())
+}
+
+fn write_generated_config(config: &Config, name: &str) -> Result<PathBuf, String> {
+    let dir = PathBuf::from("configs/generated");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("create configs/generated failed: {error}"))?;
+    let path = dir.join(format!("{}.yaml", slugify(name)));
+    let text =
+        serde_yaml::to_string(config).map_err(|error| format!("serialize yaml failed: {error}"))?;
+    fs::write(&path, text).map_err(|error| format!("write generated config failed: {error}"))?;
+    Ok(path)
+}
+
+fn prompt(label: &str, default: &str) -> Result<String, String> {
+    print!("{label} [{default}]: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("flush stdout failed: {error}"))?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|error| format!("read stdin failed: {error}"))?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        Ok(default.to_owned())
+    } else {
+        Ok(trimmed.to_owned())
+    }
+}
+
+fn prompt_usize(label: &str, default: &str) -> Result<usize, String> {
+    let value = prompt(label, default)?;
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid integer for {label}: '{value}'"))
+}
+
+fn is_yes(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn slugify(value: &str) -> String {
+    let mut out = String::new();
+    let mut previous_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            previous_dash = false;
+        } else if !previous_dash && !out.is_empty() {
+            out.push('_');
+            previous_dash = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "distzkbench_experiment".to_owned()
+    } else {
+        out
+    }
+}
+
+fn print_next_steps() {
+    println!("Recommended workflow:");
+    println!("  1. Build: cargo build --release --locked");
+    println!("  2. Run this wizard: ./target/release/dzb interactive");
+    println!("  3. Start with toy star/full-mesh self-check.");
+    println!("  4. Generate an adapter config.");
+    println!(
+        "  5. Use sdk-binary for final communication metrics; use black-box only for legacy smoke tests."
+    );
 }
 
 fn cmd_preflight(args: &[String]) -> Result<(), String> {
@@ -430,5 +634,9 @@ fn value_after(args: &[String], key: &str) -> Option<String> {
 }
 
 fn usage() -> String {
-    "usage: dzb preflight --config <yaml> | dzb run <yaml> | dzb report <results_dir> | dzb cleanup --run-id <id>".to_owned()
+    "usage: dzb interactive | dzb preflight --config <yaml> | dzb run <yaml> | dzb report <results_dir> | dzb cleanup --run-id <id>".to_owned()
+}
+
+fn interactive_usage() -> String {
+    "usage: dzb interactive\n\nStarts a prompt-driven workflow for local toy self-checks and adapter config generation.".to_owned()
 }

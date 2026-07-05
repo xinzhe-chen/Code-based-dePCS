@@ -1,5 +1,18 @@
 # DistZKBench Linux Quickstart
 
+Interactive entrypoint:
+
+```bash
+cargo build --release --locked
+./target/release/dzb interactive
+```
+
+The interactive entrypoint can run a local toy self-check and generate a starter
+config for an SDK or black-box protocol adapter. Use it before wiring a real
+distributed PCS or zkSNARK.
+
+Manual toy smoke:
+
 ```bash
 cargo build --release --locked
 ./target/release/dzb preflight --config configs/examples/toy_star_4.yaml

@@ -2139,6 +2139,25 @@ Artifact-quality baseline comparison 应尽量使用 instrumented mode。
 
 # 14. CLI 设计
 
+## 14.0 Interactive entrypoint
+
+外部用户第一次接入时不应必须手写 YAML。提供交互式入口：
+
+```bash
+dzb interactive
+```
+
+该入口用于：
+
+```text
+1. 选择并运行本机 toy self-check。
+2. 生成 SDK adapter 或 black-box adapter starter config。
+3. 打印下一步 preflight / run / report 命令。
+```
+
+`dzb interactive` 是易用入口；artifact evaluation 仍使用显式 YAML 配置，
+以保证实验可复现、可审计。
+
 ## 14.1 Preflight
 
 ```bash
