@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use dzb_core::{
     Config, Platform, PlatformBackendName, TopologyKind, load_config, resolve_config,
@@ -46,15 +46,12 @@ fn cmd_interactive(args: &[String]) -> Result<(), String> {
     println!("DistZKBench interactive");
     println!("1) Run local toy self-check now");
     println!("2) Generate a protocol adapter config");
-    println!("3) Print next-step checklist");
+    println!("3) Open latest report");
     let choice = prompt("Select action", "1")?;
     match choice.trim() {
         "1" => interactive_toy_self_check(),
         "2" => interactive_adapter_config(),
-        "3" => {
-            print_next_steps();
-            Ok(())
-        }
+        "3" => interactive_open_latest_report(),
         other => Err(format!("unknown interactive choice '{other}'")),
     }
 }
@@ -165,6 +162,67 @@ fn interactive_adapter_config() -> Result<(), String> {
     Ok(())
 }
 
+fn interactive_open_latest_report() -> Result<(), String> {
+    let mut reports = Vec::new();
+    collect_reports(Path::new("results"), &mut reports)?;
+    let Some((_, path)) = reports.into_iter().max_by_key(|(modified, _)| *modified) else {
+        return Err("no report.html found under results/. Run a toy self-check first.".to_owned());
+    };
+    println!("Opening {}", path.display());
+    open_path(&path)
+}
+
+fn collect_reports(dir: &Path, reports: &mut Vec<(SystemTime, PathBuf)>) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in
+        fs::read_dir(dir).map_err(|error| format!("read {} failed: {error}", dir.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read dir entry failed: {error}"))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("read file type failed: {error}"))?;
+        if file_type.is_dir() {
+            collect_reports(&path, reports)?;
+        } else if file_type.is_file() && path.file_name().is_some_and(|name| name == "report.html")
+        {
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            reports.push((modified, path));
+        }
+    }
+    Ok(())
+}
+
+fn open_path(path: &Path) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "linux") {
+        "xdg-open"
+    } else {
+        return Err(format!(
+            "automatic report opening is unsupported on this OS; open {} manually",
+            path.display()
+        ));
+    };
+    let status = Command::new(opener)
+        .arg(path)
+        .status()
+        .map_err(|error| format!("failed to launch {opener}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{opener} exited with status {status}; open {} manually",
+            path.display()
+        ))
+    }
+}
+
 fn write_generated_config(config: &Config, name: &str) -> Result<PathBuf, String> {
     let dir = PathBuf::from("configs/generated");
     fs::create_dir_all(&dir)
@@ -224,17 +282,6 @@ fn slugify(value: &str) -> String {
     } else {
         out
     }
-}
-
-fn print_next_steps() {
-    println!("Recommended workflow:");
-    println!("  1. Build: cargo build --release --locked");
-    println!("  2. Run this wizard: ./target/release/dzb interactive");
-    println!("  3. Start with toy star/full-mesh self-check.");
-    println!("  4. Generate an adapter config.");
-    println!(
-        "  5. Use sdk-binary for final communication metrics; use black-box only for legacy smoke tests."
-    );
 }
 
 fn cmd_preflight(args: &[String]) -> Result<(), String> {
