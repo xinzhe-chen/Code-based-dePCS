@@ -3178,6 +3178,34 @@ Remote calibration note:
   A two-host local-vs-remote calibration experiment was not run.
 ```
 
+Two-host calibration note:
+
+```text
+Validated on 2026-07-05 with two temporary GCP Ubuntu 24.04 VMs:
+project=zkmamba-browser-192-20260705
+zone=us-central1-a
+machine=c4-highcpu-8
+kernel=Linux 6.17.0-1020-gcp x86_64
+
+host map:
+  rank 0: distzkbench-cal-a-20260705, internal_ip=10.128.0.5
+  rank 1: distzkbench-cal-b-20260705, internal_ip=10.128.0.6
+
+Passed evidence:
+  artifact/main-linux/scripts/remote_two_host_calibration.sh
+  local loopback baseline on host A
+  two-host remote TCP toy-alltoall over private VPC IPs
+  verifier proof hash check
+
+Observed calibration fields:
+  run_id=twohost-gcp-20260705b
+  mode=two_host_remote_tcp
+  local_loopback_total_protocol_bytes=2097152
+  two_host_total_protocol_bytes=2097152
+  two_host_proof_sha256=fc89029076a154682636e6179f022bead9ed9e004a8a8f5ce5cedd8dad11fea1
+  communication_precision=exact_tcp_frame_payload
+```
+
 实现完成前逐项检查：
 
 ```text
@@ -3223,7 +3251,7 @@ Remote calibration note:
 [x] artifact README
 [x] full reproduction script
 [x] cleanup script
-[ ] local-vs-remote calibration experiment
+[x] local-vs-remote calibration experiment
 ```
 
 ---

@@ -20,6 +20,21 @@ artifact/main-linux/scripts/remote_preflight.sh
 artifact/main-linux/scripts/remote_run_toy.sh
 ```
 
+Two-host local-vs-remote calibration:
+
+```bash
+export DZB_LINUX_SSH_A=user@host-a
+export DZB_LINUX_SSH_B=user@host-b
+export DZB_LINUX_IP_A=10.x.x.a
+export DZB_LINUX_IP_B=10.x.x.b
+export DZB_LINUX_KEY=/path/to/key        # optional
+artifact/main-linux/scripts/remote_two_host_calibration.sh
+```
+
+The two-host script first runs a local loopback two-rank all-to-all baseline on
+host A, then runs one rank per host over private TCP and writes a calibration
+summary under `results/twohost_calibration/<run-id>/`.
+
 Strict preflight config:
 
 ```bash
