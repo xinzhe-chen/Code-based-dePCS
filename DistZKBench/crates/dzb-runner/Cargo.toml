@@ -1,0 +1,20 @@
+[package]
+name = "dzb-runner"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dzb-core = { path = "../dzb-core" }
+dzb-sdk = { path = "../dzb-sdk" }
+dzb-transport = { path = "../dzb-transport" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+mio = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "dzb-runner"
+path = "src/main.rs"

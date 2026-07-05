@@ -1,0 +1,31 @@
+experiment:
+  name: remote_toy_calibration
+  run_id: auto
+  output_dir: results
+
+platform:
+  backend: linux
+
+roles:
+  prover_ranks: 2
+  master_rank: 0
+  verifier_enabled: true
+
+topology:
+  type: full-mesh
+  enforce_topology: true
+
+resources:
+  worker_threads: 1
+  verifier_threads: same_as_worker
+
+network:
+  transport: tcp
+  mode: remote_tcp
+  base_port: 39400
+
+protocol:
+  adapter: toy-alltoall
+  mode: sdk-binary
+  toy:
+    message_bytes: 1024

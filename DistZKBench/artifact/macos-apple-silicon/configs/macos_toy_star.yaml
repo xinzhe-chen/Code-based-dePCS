@@ -1,0 +1,50 @@
+experiment:
+  name: toy_macos_star
+  run_id: auto
+  output_dir: results
+  random_seed: 12345
+
+platform:
+  backend: darwin
+
+roles:
+  prover_ranks: 4
+  master_rank: 0
+  verifier_enabled: true
+
+topology:
+  type: star
+  worker_to_worker: forbidden
+  enforce_topology: true
+
+resources:
+  worker_threads: 1
+  verifier_threads: same_as_worker
+  no_overcommit: true
+  check_extra_threads: true
+
+memory:
+  macos_sampling: phase_boundary
+  per_rank_limit: 1GiB
+  macos_enforcement: watchdog
+
+cache:
+  mode: none
+
+network:
+  transport: tcp
+  mode: loopback
+  base_port: 39000
+
+metrics:
+  phase_tracing: true
+  communication_breakdown: true
+  chrome_trace: true
+  collect_perf: false
+
+protocol:
+  adapter: toy-star-aggregate
+  mode: sdk-binary
+  toy:
+    message_bytes: 1024
+

@@ -1,0 +1,34 @@
+experiment:
+  name: toy_linux_star
+  run_id: auto
+  output_dir: results
+  random_seed: 12345
+
+platform:
+  backend: linux
+
+roles:
+  prover_ranks: 4
+  master_rank: 0
+  verifier_enabled: true
+
+topology:
+  type: star
+  worker_to_worker: forbidden
+  enforce_topology: true
+
+resources:
+  worker_threads: 1
+  verifier_threads: same_as_worker
+
+network:
+  transport: tcp
+  mode: loopback
+  base_port: 39000
+
+protocol:
+  adapter: toy-star-aggregate
+  mode: sdk-binary
+  toy:
+    message_bytes: 1024
+

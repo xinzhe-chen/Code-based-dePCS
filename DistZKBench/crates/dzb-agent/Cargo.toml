@@ -1,0 +1,12 @@
+[package]
+name = "dzb-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dzb-platform = { path = "../dzb-platform" }
+
+[lints]
+workspace = true
+
