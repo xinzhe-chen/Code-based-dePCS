@@ -4,14 +4,17 @@ set -euo pipefail
 : "${DZB_LINUX_SSH:?set DZB_LINUX_SSH=user@host}"
 : "${DZB_LINUX_WORKDIR:=/tmp/distzkbench-${USER}}"
 
-SSH_ARGS=()
+SSH_ARGS=(-o StrictHostKeyChecking=accept-new)
 if [[ -n "${DZB_LINUX_KEY:-}" ]]; then
-  SSH_ARGS=(-i "${DZB_LINUX_KEY}")
+  SSH_ARGS+=(-i "${DZB_LINUX_KEY}")
 fi
 
 ssh "${SSH_ARGS[@]}" "${DZB_LINUX_SSH}" "mkdir -p '${DZB_LINUX_WORKDIR}'"
 ssh "${SSH_ARGS[@]}" "${DZB_LINUX_SSH}" 'bash -s' <<'REMOTE'
 set -euo pipefail
+if [[ -f "$HOME/.cargo/env" ]]; then
+  . "$HOME/.cargo/env"
+fi
 echo "kernel=$(uname -srmo)"
 echo "arch=$(uname -m)"
 command -v rustc >/dev/null && rustc --version || true

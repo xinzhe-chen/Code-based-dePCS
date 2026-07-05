@@ -106,7 +106,7 @@ pub fn linux_capability_report() -> CapabilityReport {
     let procfs = is_linux && Path::new("/proc").exists();
     let netns = is_linux && command_available("ip");
     let tc = is_linux && command_available("tc");
-    let perf = is_linux && Path::new("/proc/sys/kernel/perf_event_paranoid").exists();
+    let perf = is_linux && perf_event_open_available();
 
     let mut unsupported = Vec::new();
     if !cgroup_v2 {
@@ -199,6 +199,16 @@ fn command_available(command: &str) -> bool {
         return false;
     };
     std::env::split_paths(&path).any(|dir| dir.join(command).is_file())
+}
+
+fn perf_event_open_available() -> bool {
+    let Ok(text) = fs::read_to_string("/proc/sys/kernel/perf_event_paranoid") else {
+        return false;
+    };
+    let Ok(value) = text.trim().parse::<i32>() else {
+        return false;
+    };
+    value <= 2
 }
 
 fn sample_proc_status(pid: Pid) -> PlatformResult<ProcessSample> {

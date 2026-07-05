@@ -3137,25 +3137,66 @@ The framework records prover time, verifier time, proof size, per-rank peak memo
 
 # 29. 最终 artifact-quality checklist
 
+Linux validation note:
+
+```text
+Validated on 2026-07-05 with a temporary GCP Ubuntu 24.04 VM:
+project=zkmamba-browser-192-20260705
+instance=distzkbench-mvp3-linux-20260705
+zone=us-central1-a
+machine=c4-highcpu-24
+kernel=Linux 6.17.0-1020-gcp x86_64
+
+Passed evidence:
+  cargo fmt --check
+  cargo test --workspace
+  cargo clippy --workspace --all-targets -- -D warnings
+  cargo build --workspace --release --locked
+  dzb preflight --config artifact/main-linux/configs/strict_core.yaml
+  dzb run artifact/main-linux/configs/strict_core.yaml
+  artifact/main-linux/scripts/linux_strict_smoke.sh
+  artifact/main-linux/scripts/remote_preflight.sh with localhost SSH loopback
+  artifact/main-linux/scripts/remote_run_toy.sh with localhost SSH loopback
+  artifact/main-linux/scripts/check_results.py results/linux_strict_core/...
+
+Observed strict smoke fields:
+  cgroup_v2=ok
+  cgroup_memory_max=ok
+  cgroup_memory_peak=67108864
+  taskset_affinity=ok Cpus_allowed_list: 0
+  cpuset_cgroup=ok Cpus_allowed_list: 0
+  smt_sibling_avoidance_set=0,1,2,3,4,5,6,7,8,9,10,11
+  numa_plan=ok
+  netns_veth_tc=ok
+
+Unsupported on this VM and intentionally left unchecked:
+  resctrl_cat=unsupported
+  perf_event_open=unsupported paranoid=4
+
+Remote calibration note:
+  SSH remote plumbing was validated through localhost SSH loopback on the Linux VM.
+  A two-host local-vs-remote calibration experiment was not run.
+```
+
 实现完成前逐项检查：
 
 ```text
 [x] platform capability matrix
-[ ] Linux strict preflight
+[x] Linux strict preflight
 [x] macOS Apple Silicon best-effort preflight
 [x] controller / agent / rank / verifier process separation
-[ ] cgroup v2 memory isolation
-[ ] CPU affinity and cpuset enforcement
-[ ] SMT sibling avoidance
+[x] cgroup v2 memory isolation
+[x] CPU affinity and cpuset enforcement
+[x] SMT sibling avoidance
 [ ] optional resctrl CAT strict LLC isolation
-[ ] NUMA compact/spread placement
-[ ] netns/veth/tc network emulation
+[x] NUMA compact/spread placement
+[x] netns/veth/tc network emulation
 [x] Darwin QoS setting
 [x] Darwin Mach task_info memory sampling
 [x] Darwin watchdog memory enforcement
 [x] Darwin thermal state reporting
 [x] user-space network shaper
-[ ] SSH remote cluster mode
+[x] SSH remote cluster mode
 [x] star topology
 [x] full-mesh topology
 [x] topology violation detection
@@ -3168,7 +3209,7 @@ The framework records prover time, verifier time, proof size, per-rank peak memo
 [x] proof publishing and exact proof size
 [x] verifier isolated process
 [x] verifier same thread/core budget as worker
-[ ] cgroup memory peak
+[x] cgroup memory peak
 [x] procfs memory sampling
 [ ] optional perf counters
 [x] Chrome trace output

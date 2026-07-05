@@ -1,0 +1,40 @@
+experiment:
+  name: linux_strict_core
+  run_id: auto
+  output_dir: results
+
+platform:
+  backend: linux
+
+roles:
+  prover_ranks: 2
+  master_rank: 0
+
+topology:
+  type: star
+  enforce_topology: true
+
+resources:
+  worker_threads: 1
+  verifier_threads: same_as_worker
+
+memory:
+  cgroup: true
+  per_rank_limit: 256MiB
+
+cache:
+  mode: none
+
+network:
+  transport: tcp
+  mode: loopback
+  base_port: 39300
+
+metrics:
+  collect_perf: false
+
+protocol:
+  adapter: toy-star-aggregate
+  mode: sdk-binary
+  toy:
+    message_bytes: 1024
