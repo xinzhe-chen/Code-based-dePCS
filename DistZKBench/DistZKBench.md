@@ -2267,6 +2267,12 @@ Artifact-quality baseline comparison 应尽量使用 instrumented mode。
 ./console/run_console.sh
 ```
 
+macOS 用户也可以直接双击 DistZKBench 顶层入口：
+
+```text
+Open DistZKBench Console.command
+```
+
 默认行为：
 
 ```text
