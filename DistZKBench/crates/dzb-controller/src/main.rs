@@ -17,6 +17,8 @@ use dzb_runner::{RankRuntimeOutput, rank_runtime_config_from_resolved};
 use dzb_sdk::{ProofArtifact, sha256_hex};
 use dzb_transport::CommunicationCounters;
 
+mod ui;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -32,7 +34,8 @@ fn run() -> Result<(), String> {
         Some("sweep") => cmd_sweep(&args[1..]),
         Some("report") => cmd_report(&args[1..]),
         Some("cleanup") => cmd_cleanup(&args[1..]),
-        Some("interactive") | Some("ui") | Some("wizard") => cmd_interactive(&args[1..]),
+        Some("ui") => ui::cmd_ui(&args[1..]),
+        Some("interactive") | Some("wizard") => cmd_interactive(&args[1..]),
         Some(other) => Err(format!("unknown dzb command '{other}'")),
         None => Err(usage()),
     }
@@ -705,7 +708,7 @@ fn value_after(args: &[String], key: &str) -> Option<String> {
 }
 
 fn usage() -> String {
-    "usage: dzb interactive | dzb preflight --config <yaml> | dzb run <yaml> | dzb report <results_dir> | dzb cleanup --run-id <id>".to_owned()
+    "usage: dzb ui | dzb interactive | dzb preflight --config <yaml> | dzb run <yaml> | dzb report <results_dir> | dzb cleanup --run-id <id>".to_owned()
 }
 
 fn interactive_usage() -> String {

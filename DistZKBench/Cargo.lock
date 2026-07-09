@@ -66,6 +66,7 @@ dependencies = [
  "dzb-runner",
  "dzb-sdk",
  "dzb-transport",
+ "serde",
  "serde_json",
  "serde_yaml",
 ]

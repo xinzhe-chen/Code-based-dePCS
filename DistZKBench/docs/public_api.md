@@ -68,6 +68,15 @@ Before connecting a real protocol, run:
 
 ```bash
 cargo build --workspace --release --locked
+./target/release/dzb ui
+```
+
+The browser console can generate toy YAML, run preflight, run the toy adapter,
+show terminal logs, visualize active TCP edges, and open the latest report.
+
+The CLI-only equivalent is:
+
+```bash
 ./target/release/dzb run configs/examples/toy_star_4.yaml
 ./target/release/dzb report results/toy_star_4/<run_id>
 ```

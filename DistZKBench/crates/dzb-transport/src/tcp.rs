@@ -227,24 +227,34 @@ pub fn mio_accept(listener: &mut TcpListener, timeout: Duration) -> Result<TcpSt
     poll.registry()
         .register(listener, LISTENER, Interest::READABLE)
         .map_err(|error| format!("register listener failed: {error}"))?;
-    let mut events = Events::with_capacity(8);
-    let started = Instant::now();
-    loop {
-        let remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err("mio accept timed out".to_owned());
-        }
-        poll.poll(&mut events, Some(remaining))
-            .map_err(|error| format!("poll accept failed: {error}"))?;
-        for event in &events {
-            if event.token() == LISTENER && event.is_readable() {
-                match listener.accept() {
-                    Ok((stream, _)) => return Ok(stream),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(format!("mio accept failed: {error}")),
+    let result = (|| {
+        let mut events = Events::with_capacity(8);
+        let started = Instant::now();
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err("mio accept timed out".to_owned());
+            }
+            poll.poll(&mut events, Some(remaining))
+                .map_err(|error| format!("poll accept failed: {error}"))?;
+            for event in &events {
+                if event.token() == LISTENER && event.is_readable() {
+                    match listener.accept() {
+                        Ok((stream, _)) => return Ok(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => return Err(format!("mio accept failed: {error}")),
+                    }
                 }
             }
         }
+    })();
+    let deregister = poll
+        .registry()
+        .deregister(listener)
+        .map_err(|error| format!("deregister listener failed: {error}"));
+    match (result, deregister) {
+        (Ok(stream), Ok(())) => Ok(stream),
+        (Err(error), _) | (_, Err(error)) => Err(error),
     }
 }
 

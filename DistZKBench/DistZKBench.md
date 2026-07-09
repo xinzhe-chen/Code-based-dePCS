@@ -2259,7 +2259,37 @@ Artifact-quality baseline comparison 应尽量使用 instrumented mode。
 
 # 14. CLI 设计
 
-## 14.0 Interactive entrypoint
+## 14.0 HTML integrated terminal / visual self-check
+
+本地开发和 adapter 接入前提供浏览器控制台：
+
+```bash
+dzb ui
+```
+
+默认行为：
+
+```text
+1. 只监听 127.0.0.1。
+2. 默认端口 38999；端口占用时自动尝试后续端口。
+3. 自动打开浏览器；CI/smoke test 可使用 --no-open。
+```
+
+UI 能做：
+
+```text
+1. 生成 toy star / full-mesh / pingpong YAML。
+2. 运行 preflight。
+3. 运行 toy self-check。
+4. 显示集成终端日志，包括实际 dzb 命令、stdout/stderr、退出码。
+5. 用拓扑图展示 rank 和 TCP edge 是否导通。
+6. 从 run.json / comm_matrix.csv / per_rank.csv / verifier.json 判断协议是否可行。
+7. 打开最新 report.html。
+```
+
+`dzb ui` 是本机调试入口，不替代 artifact evaluation 的显式 YAML 流程。
+
+## 14.1 Interactive entrypoint
 
 外部用户第一次接入时不应必须手写 YAML。提供交互式入口：
 
@@ -2278,7 +2308,7 @@ dzb interactive
 `dzb interactive` 是易用入口；artifact evaluation 仍使用显式 YAML 配置，
 以保证实验可复现、可审计。
 
-## 14.1 Preflight
+## 14.2 Preflight
 
 ```bash
 dzb preflight --config configs/artifact/local_netns_10g.yaml
@@ -2300,19 +2330,19 @@ dzb preflight --config configs/artifact/local_netns_10g.yaml
 
 如果 `fail_on_warning=true`，任何 requested feature 不可用即 fail。
 
-## 14.2 Run
+## 14.3 Run
 
 ```bash
 dzb run configs/artifact/local_fullmesh.yaml
 ```
 
-## 14.3 Sweep
+## 14.4 Sweep
 
 ```bash
 dzb sweep configs/artifact/ours_scaling.yaml
 ```
 
-## 14.4 Report
+## 14.5 Report
 
 ```bash
 dzb report results/ours_scaling/
@@ -2333,7 +2363,7 @@ chrome_trace.json
 report.html
 ```
 
-## 14.5 Cleanup
+## 14.6 Cleanup
 
 ```bash
 dzb cleanup --run-id <run_id>
@@ -3381,6 +3411,11 @@ Observed calibration fields:
 [ ] optional perf counters
 [x] Chrome trace output
 [x] JSON/CSV/HTML reports
+[x] HTML integrated terminal UI
+[x] network visualizer
+[x] integrated terminal logs
+[x] toy self-check UI
+[x] latest report viewer
 [x] toy-pingpong
 [x] toy-alltoall
 [x] toy-star-aggregate

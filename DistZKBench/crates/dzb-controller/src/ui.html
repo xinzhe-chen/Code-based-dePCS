@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DistZKBench Console</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --ink: #17202a;
+      --muted: #67717f;
+      --line: #d7dce2;
+      --panel: #ffffff;
+      --accent: #0b7285;
+      --good: #12805c;
+      --bad: #b42318;
+      --warn: #a15c00;
+      --term: #0f1720;
+      --term-ink: #d8e2ef;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+    header { height: 56px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
+    h1 { font-size: 17px; margin: 0; font-weight: 650; }
+    main { display: grid; grid-template-columns: 320px minmax(360px, 1fr) 430px; gap: 12px; padding: 12px; min-height: calc(100vh - 56px); }
+    section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+    .panel-head { padding: 12px 14px; border-bottom: 1px solid var(--line); font-weight: 650; }
+    .panel-body { padding: 14px; }
+    label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 5px; }
+    input, select { width: 100%; height: 34px; border: 1px solid var(--line); border-radius: 6px; padding: 0 9px; background: #fff; color: var(--ink); }
+    button { height: 34px; border: 1px solid var(--accent); border-radius: 6px; background: var(--accent); color: white; padding: 0 12px; font-weight: 650; cursor: pointer; }
+    button.secondary { background: white; color: var(--accent); }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+    .terminal { height: 420px; overflow: auto; background: var(--term); color: var(--term-ink); padding: 12px; border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; }
+    .status-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .status { border: 1px solid var(--line); border-radius: 7px; padding: 9px; min-height: 58px; }
+    .status b { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .ok { color: var(--good); }
+    .bad { color: var(--bad); }
+    .warn { color: var(--warn); }
+    .topology { width: 100%; height: 360px; border: 1px solid var(--line); border-radius: 8px; background: #fbfcfd; }
+    .edge-ok { stroke: var(--good); stroke-width: 3; }
+    .edge-idle { stroke: #aab3bd; stroke-width: 2; stroke-dasharray: 5 5; }
+    .edge-bad { stroke: var(--bad); stroke-width: 3; }
+    .node { fill: #ffffff; stroke: #30404f; stroke-width: 2; }
+    .node-master { fill: #e7f6f8; stroke: var(--accent); }
+    .node-text { font-size: 12px; text-anchor: middle; dominant-baseline: central; fill: var(--ink); font-weight: 650; }
+    .edge-label { font-size: 10px; fill: var(--muted); text-anchor: middle; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 6px; }
+    a { color: var(--accent); }
+    @media (max-width: 1100px) { main { grid-template-columns: 1fr; } .terminal { height: 320px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>DistZKBench Integrated Console</h1>
+    <span id="serverState">local UI</span>
+  </header>
+  <main>
+    <section>
+      <div class="panel-head">Experiment</div>
+      <div class="panel-body">
+        <label>Toy shape</label>
+        <select id="shape">
+          <option value="star">star aggregate</option>
+          <option value="full-mesh">full mesh all-to-all</option>
+          <option value="pingpong">pingpong</option>
+        </select>
+        <div class="row">
+          <div><label>Ranks</label><input id="ranks" type="number" min="1" value="4"></div>
+          <div><label>Message bytes</label><input id="messageBytes" type="number" min="1" value="1024"></div>
+        </div>
+        <div class="row">
+          <div><label>Base port</label><input id="basePort" type="number" min="1024" value="39000"></div>
+          <div><label>Worker threads</label><input id="threads" type="number" min="1" value="1"></div>
+        </div>
+        <div class="row">
+          <div><label>Latency</label><input id="latency" value="0ms"></div>
+          <div><label>Bandwidth</label><input id="bandwidth" value="0"></div>
+        </div>
+        <label>Adapter command</label>
+        <input id="adapterCommand" placeholder="empty uses dzb-toy-adapter">
+        <label>Adapter mode</label>
+        <select id="mode">
+          <option value="sdk-binary">sdk-binary</option>
+          <option value="black-box">black-box</option>
+        </select>
+        <div class="actions">
+          <button id="writeConfig">Write YAML</button>
+          <button id="preflight" class="secondary" disabled>Preflight</button>
+          <button id="run" disabled>Run</button>
+          <button id="refresh" class="secondary">Refresh latest</button>
+        </div>
+        <p id="configPath"></p>
+      </div>
+    </section>
+    <section>
+      <div class="panel-head">Network and Feasibility</div>
+      <div class="panel-body">
+        <svg id="topology" class="topology" viewBox="0 0 640 360" role="img"></svg>
+        <div class="status-grid" style="margin-top: 12px;">
+          <div class="status"><b>Preflight</b><span id="preflightState">not run</span></div>
+          <div class="status"><b>Run</b><span id="runState">not run</span></div>
+          <div class="status"><b>Network</b><span id="networkState">no data</span></div>
+          <div class="status"><b>Protocol</b><span id="protocolState">no data</span></div>
+        </div>
+        <div style="margin-top: 12px;">
+          <table id="edgeTable"><thead><tr><th>edge</th><th>payload</th><th>messages</th><th>state</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </section>
+    <section>
+      <div class="panel-head">Integrated Terminal</div>
+      <div class="panel-body">
+        <div class="terminal" id="terminal">Ready. Write a YAML config or refresh latest report.</div>
+        <div class="actions">
+          <button id="openReport" class="secondary" disabled>Open report</button>
+        </div>
+        <p id="latestPath"></p>
+      </div>
+    </section>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    let configPath = null;
+    let latestReportUrl = null;
+    let currentJob = null;
+
+    function payload() {
+      return {
+        shape: $('shape').value,
+        ranks: Number($('ranks').value),
+        message_bytes: Number($('messageBytes').value),
+        base_port: Number($('basePort').value),
+        worker_threads: Number($('threads').value),
+        latency: $('latency').value,
+        bandwidth: $('bandwidth').value,
+        adapter_command: $('adapterCommand').value,
+        mode: $('mode').value
+      };
+    }
+    function log(text) {
+      $('terminal').textContent = text || '';
+      $('terminal').scrollTop = $('terminal').scrollHeight;
+    }
+    async function post(url, body) {
+      const res = await fetch(url, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
+      const text = await res.text();
+      if (!res.ok) throw new Error(text);
+      return JSON.parse(text);
+    }
+    async function getJson(url) {
+      const res = await fetch(url);
+      const text = await res.text();
+      if (!res.ok) throw new Error(text);
+      return JSON.parse(text);
+    }
+    function setStatus(id, text, cls) {
+      const el = $(id);
+      el.className = cls || '';
+      el.textContent = text;
+    }
+    function drawTopology(summary) {
+      const shape = $('shape').value;
+      const ranks = Math.max(1, Number($('ranks').value || 1));
+      const edges = new Map((summary?.edges || []).map(e => [`${e.src}-${e.dst}`, e]));
+      const svg = $('topology');
+      svg.innerHTML = '';
+      const pts = [];
+      if (shape === 'pingpong') {
+        pts.push([180, 180], [460, 180]);
+      } else if (shape === 'star') {
+        pts.push([320, 180]);
+        const workers = ranks - 1;
+        for (let i = 0; i < workers; i++) {
+          const a = -Math.PI / 2 + (Math.PI * 2 * i / Math.max(1, workers));
+          pts.push([320 + 190 * Math.cos(a), 180 + 130 * Math.sin(a)]);
+        }
+      } else {
+        for (let i = 0; i < ranks; i++) {
+          const a = -Math.PI / 2 + (Math.PI * 2 * i / ranks);
+          pts.push([320 + 210 * Math.cos(a), 180 + 130 * Math.sin(a)]);
+        }
+      }
+      function line(src, dst) {
+        const e = edges.get(`${src}-${dst}`);
+        const cls = e ? (e.messages > 0 ? 'edge-ok' : 'edge-idle') : 'edge-idle';
+        const [x1,y1] = pts[src], [x2,y2] = pts[dst];
+        svg.insertAdjacentHTML('beforeend', `<line class="${cls}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"></line>`);
+        if (e && e.messages > 0) {
+          svg.insertAdjacentHTML('beforeend', `<text class="edge-label" x="${(x1+x2)/2}" y="${(y1+y2)/2 - 6}">${e.payload_bytes} B</text>`);
+        }
+      }
+      if (summary?.edges?.length) {
+        summary.edges.forEach(e => line(e.src, e.dst));
+      } else if (shape === 'star') {
+        for (let i=1;i<ranks;i++) line(i, 0);
+      } else if (shape === 'pingpong') {
+        line(0, 1); line(1, 0);
+      } else {
+        for (let i=0;i<ranks;i++) for (let j=0;j<ranks;j++) if (i!==j) line(i,j);
+      }
+      pts.forEach((p, i) => {
+        svg.insertAdjacentHTML('beforeend', `<circle class="node ${i===0?'node-master':''}" cx="${p[0]}" cy="${p[1]}" r="26"></circle><text class="node-text" x="${p[0]}" y="${p[1]}">r${i}</text>`);
+      });
+    }
+    function renderSummary(summary) {
+      if (!summary || !summary.found) {
+        drawTopology(null);
+        setStatus('networkState', 'no run found', 'warn');
+        setStatus('protocolState', 'no run found', 'warn');
+        return;
+      }
+      latestReportUrl = summary.report_url;
+      $('openReport').disabled = !latestReportUrl;
+      $('latestPath').textContent = summary.result_dir || '';
+      setStatus('runState', summary.status || 'unknown', summary.status === 'ok' ? 'ok' : 'bad');
+      if (summary.communication_precision === 'unavailable') {
+        setStatus('networkState', 'communication unavailable', 'warn');
+      } else {
+        setStatus('networkState', summary.network_ok ? 'TCP edges active' : 'no protocol traffic', summary.network_ok ? 'ok' : 'warn');
+      }
+      setStatus('protocolState', summary.feasible ? 'adapter feasible' : summary.reason, summary.feasible ? 'ok' : 'bad');
+      const tbody = $('edgeTable').querySelector('tbody');
+      tbody.innerHTML = '';
+      (summary.edges || []).forEach(e => {
+        const state = e.messages > 0 ? '<span class="ok">active</span>' : '<span class="warn">idle</span>';
+        tbody.insertAdjacentHTML('beforeend', `<tr><td>${e.src} -> ${e.dst}</td><td>${e.payload_bytes}</td><td>${e.messages}</td><td>${state}</td></tr>`);
+      });
+      drawTopology(summary);
+    }
+    async function pollJob(id) {
+      currentJob = id;
+      for (;;) {
+        const job = await getJson(`/api/jobs/${id}`);
+        log(job.log);
+        if (job.status !== 'running') {
+          if (job.kind === 'preflight') setStatus('preflightState', job.exit_code === 0 ? 'ok' : 'failed', job.exit_code === 0 ? 'ok' : 'bad');
+          if (job.kind === 'run') {
+            await refreshLatest();
+          }
+          return job;
+        }
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+    async function refreshLatest() {
+      try {
+        renderSummary(await getJson('/api/runs/latest'));
+      } catch (err) {
+        log(String(err));
+      }
+    }
+    $('writeConfig').onclick = async () => {
+      try {
+        const data = await post('/api/toy-config', payload());
+        configPath = data.config_path;
+        $('configPath').textContent = configPath;
+        $('preflight').disabled = false;
+        $('run').disabled = false;
+        log(data.yaml);
+        drawTopology(null);
+      } catch (err) { log(String(err)); }
+    };
+    $('preflight').onclick = async () => {
+      if (!configPath) return;
+      const job = await post('/api/preflight', {config_path: configPath});
+      await pollJob(job.job_id);
+    };
+    $('run').onclick = async () => {
+      if (!configPath) return;
+      const job = await post('/api/run', {config_path: configPath});
+      await pollJob(job.job_id);
+    };
+    $('refresh').onclick = refreshLatest;
+    $('openReport').onclick = () => { if (latestReportUrl) window.open(latestReportUrl, '_blank'); };
+    drawTopology(null);
+    refreshLatest();
+  </script>
+</body>
+</html>
