@@ -131,9 +131,7 @@ fn interactive_adapter_config() -> Result<(), String> {
     config.network.base_port = 39000;
     config.protocol.adapter = adapter.clone();
     config.protocol.mode = mode.clone();
-    if mode == "black-box" {
-        config.protocol.command = adapter;
-    }
+    config.protocol.command = adapter;
     match topology.trim() {
         "full-mesh" | "fullmesh" => config.topology.kind = TopologyKind::FullMesh,
         "star" | "" => {
@@ -310,7 +308,12 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         run_black_box(&resolved, start)?
     } else {
         let rank_run = spawn_rank_processes(&resolved)?;
-        let verifier = spawn_verifier_process(&resolved, &rank_run.proof)?;
+        let verifier =
+            if resolved.original.roles.verifier_enabled && !rank_run.proof.bytes.is_empty() {
+                Some(spawn_verifier_process(&resolved, &rank_run.proof)?)
+            } else {
+                None
+            };
         ExperimentOutput {
             phases: rank_run
                 .ranks
@@ -321,10 +324,14 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             communication: rank_run.communication,
             prover_wall_controller_ms: start.elapsed().as_secs_f64() * 1000.0,
             prover_critical_path_ms: rank_run.prover_critical_path_ms,
-            verifier_ms: verifier.elapsed_ms,
+            verifier_ms: verifier
+                .as_ref()
+                .map_or(0.0, |verifier| verifier.elapsed_ms),
             ranks: rank_run.ranks,
-            verifier_pid: Some(verifier.pid),
-            verifier_report: Some(verifier.report),
+            verifier_pid: verifier.as_ref().map(|verifier| verifier.pid),
+            verifier_report: verifier.map(|verifier| verifier.report).or_else(|| {
+                Some(serde_json::json!({"verified": null, "mode": "not_requested_or_no_artifact"}))
+            }),
             communication_precision: "exact_tcp_frame_payload".to_owned(),
             platform_evidence: platform_evidence(&resolved, None),
         }
@@ -402,6 +409,7 @@ fn run_black_box(
         thermal_start: "unavailable".to_owned(),
         thermal_end: "unavailable".to_owned(),
         thermal_source: "black_box_external_unavailable".to_owned(),
+        custom_metrics: Vec::new(),
     };
     Ok(ExperimentOutput {
         phases: Vec::new(),
@@ -422,13 +430,13 @@ fn spawn_verifier_process(
     config: &dzb_core::ResolvedConfig,
     proof: &ProofArtifact,
 ) -> Result<VerifierProcessOutput, String> {
-    let runner = runner_executable()?;
+    let command_path = adapter_command(config)?;
     let logs = Path::new(&config.result_dir).join("logs");
     std::fs::create_dir_all(&logs).map_err(|error| error.to_string())?;
     let proof_path = Path::new(&config.result_dir).join("proof.bin");
     let out = logs.join("verifier_process.json");
     let started = Instant::now();
-    let mut command = Command::new(&runner);
+    let mut command = Command::new(&command_path);
     command
         .arg("verify")
         .arg("--proof")
@@ -437,6 +445,7 @@ fn spawn_verifier_process(
         .arg(&proof.sha256)
         .arg("--out")
         .arg(&out);
+    command.args(&config.original.protocol.args);
     for (key, value) in standard_thread_budget_env(config.verifier_threads) {
         command.env(key, value);
     }
@@ -481,7 +490,7 @@ struct VerifierProcessOutput {
 }
 
 fn spawn_rank_processes(config: &dzb_core::ResolvedConfig) -> Result<RankRunOutput, String> {
-    let runner = runner_executable()?;
+    let command_path = adapter_command(config)?;
     let result_dir = Path::new(&config.result_dir);
     let logs = result_dir.join("logs");
     let tmp = result_dir.join("tmp");
@@ -513,11 +522,13 @@ fn spawn_rank_processes(config: &dzb_core::ResolvedConfig) -> Result<RankRunOutp
             .map_err(|error| error.to_string())?;
         let stderr = File::create(logs.join(format!("rank_{rank}.stderr.log")))
             .map_err(|error| error.to_string())?;
-        let mut command = Command::new(&runner);
+        let mut command = Command::new(&command_path);
         command
             .arg("prove")
             .arg("--config")
             .arg(&rank_config_path)
+            .args(&config.original.protocol.args)
+            .env("DZB_RANK_CONFIG", &rank_config_path)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         for (key, value) in standard_thread_budget_env(config.original.resources.worker_threads) {
@@ -528,7 +539,7 @@ fn spawn_rank_processes(config: &dzb_core::ResolvedConfig) -> Result<RankRunOutp
         }
         let child = command
             .spawn()
-            .map_err(|error| format!("spawn dzb-runner rank {rank} failed: {error}"))?;
+            .map_err(|error| format!("spawn adapter rank {rank} failed: {error}"))?;
         children.push((rank, child));
     }
     wait_for_ranks(children)?;
@@ -545,8 +556,11 @@ fn spawn_rank_processes(config: &dzb_core::ResolvedConfig) -> Result<RankRunOutp
         critical_path = critical_path.max(output.total_time_ms);
         rank_outputs.push(output);
     }
-    let proof_bytes =
-        std::fs::read(&proof_path).map_err(|error| format!("read master proof failed: {error}"))?;
+    let proof_bytes = if proof_path.exists() {
+        std::fs::read(&proof_path).map_err(|error| format!("read master proof failed: {error}"))?
+    } else {
+        Vec::new()
+    };
     let proof = ProofArtifact {
         sha256: sha256_hex(&proof_bytes),
         bytes: proof_bytes,
@@ -603,20 +617,30 @@ fn wait_for_ranks(mut children: Vec<(usize, Child)>) -> Result<(), String> {
     }
 }
 
-fn runner_executable() -> Result<PathBuf, String> {
-    if let Ok(path) = env::var("DZB_RUNNER") {
-        return Ok(PathBuf::from(path));
+fn adapter_command(config: &dzb_core::ResolvedConfig) -> Result<PathBuf, String> {
+    if !config.original.protocol.command.is_empty() {
+        return Ok(PathBuf::from(&config.original.protocol.command));
     }
+    if config.original.protocol.adapter.starts_with("toy-") {
+        return sibling_executable("dzb-toy-adapter");
+    }
+    Err(format!(
+        "protocol.mode=sdk-binary requires protocol.command for adapter '{}'",
+        config.original.protocol.adapter
+    ))
+}
+
+fn sibling_executable(name: &str) -> Result<PathBuf, String> {
     let current = env::current_exe().map_err(|error| error.to_string())?;
     let Some(dir) = current.parent() else {
         return Err("cannot resolve current executable directory".to_owned());
     };
-    let candidate = dir.join("dzb-runner");
+    let candidate = dir.join(name);
     if candidate.is_file() {
         Ok(candidate)
     } else {
         Err(format!(
-            "dzb-runner not found next to {}; build the workspace or set DZB_RUNNER",
+            "{name} not found next to {}; build the workspace or set protocol.command",
             current.display()
         ))
     }

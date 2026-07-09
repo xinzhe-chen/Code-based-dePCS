@@ -44,6 +44,7 @@ pub fn write_outputs(
     )?;
     write_events(result_dir, &output.phases)?;
     write_phase_csv(result_dir, &output.phases)?;
+    write_custom_metrics(result_dir, output)?;
     write_rank_csv(result_dir, config, output)?;
     write_comm_matrix(result_dir, &output.communication)?;
     write_memory_csv(result_dir, config, output)?;
@@ -109,6 +110,21 @@ fn write_phase_csv(result_dir: &Path, phases: &[PhaseEvent]) -> std::io::Result<
             "{},{:.3},{:.3}",
             phase.name, phase.start_ms, phase.duration_ms
         )?;
+    }
+    Ok(())
+}
+
+fn write_custom_metrics(result_dir: &Path, output: &ExperimentOutput) -> std::io::Result<()> {
+    let mut file = File::create(result_dir.join("custom_metrics.csv"))?;
+    writeln!(file, "rank,kind,name,value")?;
+    for rank in &output.ranks {
+        for metric in &rank.custom_metrics {
+            writeln!(
+                file,
+                "{},{},{},{}",
+                rank.rank, metric.kind, metric.name, metric.value
+            )?;
+        }
     }
     Ok(())
 }

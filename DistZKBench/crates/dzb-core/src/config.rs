@@ -217,6 +217,7 @@ pub struct ShaperConfig {
     pub jitter: String,
     pub loss: String,
     pub per_edge: bool,
+    pub edges: Vec<EdgeShaperConfig>,
 }
 
 impl Default for ShaperConfig {
@@ -227,6 +228,31 @@ impl Default for ShaperConfig {
             jitter: "0ms".to_owned(),
             loss: "0%".to_owned(),
             per_edge: true,
+            edges: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EdgeShaperConfig {
+    pub src: usize,
+    pub dst: usize,
+    pub bandwidth: String,
+    pub latency: String,
+    pub jitter: String,
+    pub loss: String,
+}
+
+impl Default for EdgeShaperConfig {
+    fn default() -> Self {
+        Self {
+            src: 0,
+            dst: 0,
+            bandwidth: "0".to_owned(),
+            latency: "0ms".to_owned(),
+            jitter: "0ms".to_owned(),
+            loss: "0%".to_owned(),
         }
     }
 }

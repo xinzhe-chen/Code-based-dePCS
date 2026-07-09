@@ -8,6 +8,7 @@ members = [
     "crates/dzb-sdk",
     "crates/dzb-metrics",
     "crates/dzb-runner",
+    "crates/dzb-toy-adapter",
     "crates/dzb-agent",
     "crates/dzb-controller",
     "crates/dzb-report",

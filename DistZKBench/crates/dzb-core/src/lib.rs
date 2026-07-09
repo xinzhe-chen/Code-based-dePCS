@@ -5,10 +5,10 @@ pub mod run_id;
 pub mod units;
 
 pub use config::{
-    CacheConfig, Config, ConfigError, ExperimentConfig, MemoryConfig, MetricsConfig, NetworkConfig,
-    PlatformBackendName, PlatformConfig, ProtocolConfig, ResolvedConfig, ResourcesConfig,
-    RolesConfig, ShaperConfig, TimeoutsConfig, TopologyConfig, TopologyKind, ToyProtocolConfig,
-    load_config, resolve_config,
+    CacheConfig, Config, ConfigError, EdgeShaperConfig, ExperimentConfig, MemoryConfig,
+    MetricsConfig, NetworkConfig, PlatformBackendName, PlatformConfig, ProtocolConfig,
+    ResolvedConfig, ResourcesConfig, RolesConfig, ShaperConfig, TimeoutsConfig, TopologyConfig,
+    TopologyKind, ToyProtocolConfig, load_config, resolve_config,
 };
 pub use manifest::{Manifest, RunJson, write_json_pretty};
 pub use platform::{

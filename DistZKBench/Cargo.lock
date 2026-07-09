@@ -141,8 +141,18 @@ version = "0.1.0"
 dependencies = [
  "dzb-core",
  "dzb-transport",
+ "mio",
  "serde",
+ "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "dzb-toy-adapter"
+version = "0.1.0"
+dependencies = [
+ "dzb-sdk",
+ "serde_json",
 ]
 
 [[package]]

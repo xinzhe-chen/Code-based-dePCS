@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use dzb_core::{ResolvedConfig, TopologyKind, parse_byte_size, parse_duration_millis};
 use dzb_sdk::{
-    PhaseEvent, ProofArtifact, ProverCtx, deterministic_bytes, deterministic_seed, sha256_hex,
+    CustomMetric, PhaseEvent, ProofArtifact, ProverCtx, deterministic_bytes, deterministic_seed,
+    sha256_hex,
 };
 use dzb_transport::{
     CommunicationCounters, Topology, UserspaceShaper, encode_frames, mio_accept, mio_bind,
@@ -50,6 +51,18 @@ pub struct RankRuntimeConfig {
 pub struct RankShaperConfig {
     pub bandwidth_bytes_per_sec: Option<u64>,
     pub latency_ms: u64,
+    #[serde(default)]
+    pub edge_overrides: Vec<RankEdgeShaperConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RankEdgeShaperConfig {
+    pub src: usize,
+    pub dst: usize,
+    pub bandwidth_bytes_per_sec: Option<u64>,
+    pub latency_ms: u64,
+    pub jitter_ms: u64,
+    pub loss_percent: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,6 +71,8 @@ pub struct RankRuntimeOutput {
     pub pid: u32,
     pub total_time_ms: f64,
     pub phases: Vec<PhaseEvent>,
+    #[serde(default)]
+    pub custom_metrics: Vec<CustomMetric>,
     pub communication: CommunicationCounters,
     pub sent_payload_bytes: u64,
     pub recv_payload_bytes: u64,
@@ -244,6 +259,7 @@ pub fn run_rank_config(config: &RankRuntimeConfig) -> Result<RankRuntimeOutput, 
         pid: std::process::id(),
         total_time_ms: started.elapsed().as_secs_f64() * 1000.0,
         phases: ctx.phases,
+        custom_metrics: Vec::new(),
         sent_payload_bytes: ctx
             .communication
             .edges
@@ -306,6 +322,21 @@ pub fn rank_runtime_config_from_resolved(
                 &config.original.network.shaper.bandwidth,
             ),
             latency_ms: parse_duration_millis(&config.original.network.shaper.latency).unwrap_or(0),
+            edge_overrides: config
+                .original
+                .network
+                .shaper
+                .edges
+                .iter()
+                .map(|edge| RankEdgeShaperConfig {
+                    src: edge.src,
+                    dst: edge.dst,
+                    bandwidth_bytes_per_sec: parse_shaper_bandwidth(&edge.bandwidth),
+                    latency_ms: parse_duration_millis(&edge.latency).unwrap_or(0),
+                    jitter_ms: parse_duration_millis(&edge.jitter).unwrap_or(0),
+                    loss_percent: edge.loss.clone(),
+                })
+                .collect(),
         },
         memory_limit_bytes: parse_byte_size(&config.original.memory.per_rank_limit).ok(),
     })

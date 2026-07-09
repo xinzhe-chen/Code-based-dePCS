@@ -2047,7 +2047,127 @@ pub struct ProverCtx {
 }
 ```
 
-## 11.4 Deterministic RNG
+## 11.4 Public substrate API
+
+MVP-3 的 public API 定位为：
+
+```text
+DistZKBench 不托管 protocol algorithm code。
+用户自己的分布式 PCS / zkSNARK / 其他协议实现为独立 adapter binary。
+adapter binary 通过 dzb-sdk 或 C FFI 调用 DistZKBench 提供的通信、测量和 artifact API。
+```
+
+Rust adapter 入口：
+
+```rust
+let mut dzb = dzb_sdk::init()?;
+
+dzb.phase("commit.local", |dzb| {
+    dzb.send(dst, tag, bytes)?;
+    Ok(())
+})?;
+
+let msg = dzb.recv(src, tag)?;
+dzb.metrics.counter("rounds", 1);
+dzb.artifacts.write_artifact("commitment.bin", &msg)?;
+
+if dzb.context().rank() == dzb.context().master_rank() {
+    dzb.artifacts.publish_proof_bytes(proof_bytes)?;
+}
+
+dzb.finish()?;
+```
+
+public objects：
+
+```text
+RuntimeContext:
+  run_id, rank, world_size, master_rank, adapter, thread_budget, deterministic bytes
+
+Network:
+  send, recv, exchange, broadcast, gather, all_to_all, barrier
+
+Metrics:
+  phase, start_phase, end_phase, counter, gauge, event
+
+Artifacts:
+  write_artifact, publish_bytes, publish_named_artifact, publish_proof_bytes
+
+VerifierChannel:
+  prover-to-verifier artifact convention for ZK-style verification timing
+```
+
+`barrier` 是 control-plane，不计入 protocol communication bytes。
+所有 `send/recv` 都走 DZKB framed TCP data plane，并自动带当前 `phase_id`。
+
+C / C++ / other-language adapter 使用 C FFI：
+
+```c
+#include "distzkbench.h"
+
+Dzb *dzb = dzb_init();
+dzb_phase_start(dzb, "round0");
+dzb_send(dzb, dst, tag, ptr, len);
+DzbBuffer msg = dzb_recv(dzb, src, tag);
+dzb_buf_free(msg);
+dzb_phase_end(dzb);
+dzb_publish_proof_bytes(dzb, proof_ptr, proof_len);
+dzb_finish(dzb);
+```
+
+C ABI 使用 opaque handle 和显式 buffer ownership：
+
+```text
+dzb_init / dzb_finish / dzb_free
+dzb_rank / dzb_world_size / dzb_master_rank
+dzb_send / dzb_recv / dzb_buf_free
+dzb_phase_start / dzb_phase_end / dzb_metric_u64
+dzb_artifact_write / dzb_publish_proof_bytes / dzb_last_error
+```
+
+## 11.5 YAML 与 API 的关系
+
+YAML 不实现协议逻辑，只描述实验环境和运行策略：
+
+```text
+topology, n ranks, TCP ports, shaper, thread/core policy, memory policy, adapter command
+```
+
+controller resolve YAML 后，为每个 rank 写入 `rank_i.json`，
+并通过环境变量传给 adapter：
+
+```bash
+DZB_RANK_CONFIG=/path/to/rank_i.json adapter-binary prove --config /path/to/rank_i.json
+```
+
+adapter 调用 `dzb_sdk::init()` 或 `dzb_init()` 时读取这份 config，
+SDK 根据 config 构造 `Network`、`Metrics`、`Artifacts` 等模块。
+因此“生成 YAML”只是声明实验需求，真正的功能模块由 controller / transport / SDK runtime 在 rank 进程内启用。
+
+网络默认是 ideal：
+
+```yaml
+network:
+  shaper:
+    bandwidth: "0"
+    latency: "0ms"
+```
+
+可以统一设置所有 edge，也可以给某条 edge 覆盖 latency/bandwidth：
+
+```yaml
+network:
+  shaper:
+    bandwidth: 10gbit
+    latency: 0ms
+    edges:
+      - src: 1
+        dst: 0
+        bandwidth: 1gbit
+        latency: 50us
+```
+
+## 11.6 Deterministic RNG
 
 每个 rank seed：
 
@@ -2152,7 +2272,7 @@ dzb interactive
 ```text
 1. 选择并运行本机 toy self-check。
 2. 生成 SDK adapter 或 black-box adapter starter config。
-3. 打印下一步 preflight / run / report 命令。
+3. 打开最新 `report.html`。
 ```
 
 `dzb interactive` 是易用入口；artifact evaluation 仍使用显式 YAML 配置，
@@ -3265,6 +3385,9 @@ Observed calibration fields:
 [x] toy-alltoall
 [x] toy-star-aggregate
 [x] native SDK adapter
+[x] public Rust SDK API
+[x] C FFI public API
+[x] external toy adapter binary
 [x] external black-box adapter
 [x] deterministic seeds
 [x] artifact README
