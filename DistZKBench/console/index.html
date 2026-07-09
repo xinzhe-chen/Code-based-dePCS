@@ -51,6 +51,8 @@
     .status-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
     .status { border: 1px solid var(--line); border-radius: 7px; padding: 9px; min-height: 58px; }
     .status b { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+    .notice { margin: 12px 0 0; border: 1px solid #f4c36a; background: #fff8e6; color: #684200; border-radius: 7px; padding: 10px; font-size: 13px; }
+    .notice.hidden { display: none; }
     .ok { color: var(--good); }
     .bad { color: var(--bad); }
     .warn { color: var(--warn); }
@@ -73,6 +75,9 @@
         <button class="tab" data-pane="cffi">C FFI</button>
       </div>
       <div id="build" class="pane active panel-body">
+        <div id="fileNotice" class="notice hidden">
+          This page is open as a file. Start it with <code>./console/run_console.sh</code> and use the localhost URL it prints.
+        </div>
         <div class="actions">
           <button id="buildRelease">Build Rust release</button>
           <button id="buildDebug" class="secondary">Build Rust debug</button>
@@ -155,6 +160,7 @@
     const $ = id => document.getElementById(id);
     let configPath = null;
     let latestReportUrl = null;
+    const apiUnavailable = location.protocol === 'file:';
 
     document.querySelectorAll('.tab').forEach(button => {
       button.onclick = () => {
@@ -187,7 +193,7 @@
       $('terminal').scrollTop = $('terminal').scrollHeight;
     }
     async function post(url, body={}) {
-      if (location.protocol === 'file:') {
+      if (apiUnavailable) {
         throw new Error('This page must be opened through ./console/run_console.sh so localhost APIs are available.');
       }
       const res = await fetch(url, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
@@ -196,7 +202,7 @@
       return JSON.parse(text);
     }
     async function getJson(url) {
-      if (location.protocol === 'file:') {
+      if (apiUnavailable) {
         throw new Error('This page must be opened through ./console/run_console.sh so localhost APIs are available.');
       }
       const res = await fetch(url);
@@ -220,12 +226,16 @@
     async function launch(url, body={}) {
       try {
         log(`Starting ${url} ...`);
+        const job = await post(url, body);
         if (url.includes('/build/') || url.includes('/clean/target')) setStatus('buildState', 'running', 'warn');
         if (url === '/api/run') setStatus('runState', 'running', 'warn');
-        const job = await post(url, body);
         log(`Job ${job.job_id} started for ${url}. Waiting for output...`);
         await pollJob(job.job_id);
-      } catch (err) { log(String(err)); }
+      } catch (err) {
+        if (url.includes('/build/') || url.includes('/clean/target')) setStatus('buildState', 'not connected', 'bad');
+        if (url === '/api/run') setStatus('runState', 'not connected', 'bad');
+        log(String(err));
+      }
     }
     function renderSummary(summary) {
       if (!summary || !summary.found) {
@@ -321,8 +331,15 @@
     $('runCffi').onclick = () => launch('/api/smoke/c-ffi-pingpong', {base_port: Number($('ffiPort').value), max_frame_payload: Number($('ffiFrame').value)});
     $('refresh').onclick = refreshLatest;
     $('openReport').onclick = () => { if (latestReportUrl) window.open(latestReportUrl, '_blank'); };
+    if (apiUnavailable) {
+      $('fileNotice').classList.remove('hidden');
+      setStatus('buildState', 'not connected', 'bad');
+      setStatus('networkState', 'not connected', 'bad');
+      setStatus('protocolState', 'not connected', 'bad');
+      log('Open this console with:\\n\\n  cd /Users/Projects/DistZK/DistZKBench\\n  ./console/run_console.sh\\n\\nThen use the http://127.0.0.1:38999 URL printed by the server. Direct file:// opening cannot run cargo, cc, dzb, or local smoke jobs.');
+    }
     drawTopology(null);
-    refreshLatest();
+    if (!apiUnavailable) refreshLatest();
   </script>
 </body>
 </html>
