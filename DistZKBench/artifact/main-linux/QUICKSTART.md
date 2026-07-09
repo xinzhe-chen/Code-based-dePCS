@@ -1,15 +1,16 @@
 # DistZKBench Linux Quickstart
 
-Interactive entrypoint:
+Top-level local console:
 
 ```bash
-cargo build --release --locked
-./target/release/dzb interactive
+./console/run_console.sh
 ```
 
-The interactive entrypoint can run a local toy self-check and generate a starter
-config for an SDK or black-box protocol adapter. Use it before wiring a real
-distributed PCS or zkSNARK.
+The console can build the Rust workspace, build the C FFI fixture, run a local
+toy self-check, visualize TCP edges, and generate a starter config for an SDK or
+black-box protocol adapter. Use it before wiring a real distributed PCS or
+zkSNARK. The CLI `dzb interactive` entrypoint remains available after a Rust
+build.
 
 Manual toy smoke:
 

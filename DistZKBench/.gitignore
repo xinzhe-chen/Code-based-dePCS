@@ -1,3 +1,4 @@
 target/
 results/
+configs/generated/
 .DS_Store

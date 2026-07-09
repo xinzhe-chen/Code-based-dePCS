@@ -67,16 +67,18 @@ logic by role.
 Before connecting a real protocol, run:
 
 ```bash
-cargo build --workspace --release --locked
-./target/release/dzb ui
+./console/run_console.sh
 ```
 
-The browser console can generate toy YAML, run preflight, run the toy adapter,
-show terminal logs, visualize active TCP edges, and open the latest report.
+The top-level browser console does not require `target/release/dzb` to exist at
+startup. It can trigger the Rust workspace build, build the C FFI fixture,
+generate toy YAML, run preflight, run the toy adapter, show terminal logs,
+visualize active TCP edges, and open the latest report.
 
 The CLI-only equivalent is:
 
 ```bash
+cargo build --workspace --release --locked
 ./target/release/dzb run configs/examples/toy_star_4.yaml
 ./target/release/dzb report results/toy_star_4/<run_id>
 ```

@@ -2259,35 +2259,41 @@ Artifact-quality baseline comparison 应尽量使用 instrumented mode。
 
 # 14. CLI 设计
 
-## 14.0 HTML integrated terminal / visual self-check
+## 14.0 Top-level HTML integrated console / visual self-check
 
-本地开发和 adapter 接入前提供浏览器控制台：
+本地开发和 adapter 接入前提供顶层浏览器控制台：
 
 ```bash
-dzb ui
+./console/run_console.sh
 ```
 
 默认行为：
 
 ```text
-1. 只监听 127.0.0.1。
-2. 默认端口 38999；端口占用时自动尝试后续端口。
-3. 自动打开浏览器；CI/smoke test 可使用 --no-open。
+1. 不要求 target/release/dzb 预先存在。
+2. 使用 Python standard-library localhost server 调度命令。
+3. 只监听 127.0.0.1。
+4. 默认端口 38999；端口占用时自动尝试后续端口。
+5. 自动打开浏览器；CI/smoke test 可使用 --no-open。
 ```
 
 UI 能做：
 
 ```text
-1. 生成 toy star / full-mesh / pingpong YAML。
-2. 运行 preflight。
-3. 运行 toy self-check。
-4. 显示集成终端日志，包括实际 dzb 命令、stdout/stderr、退出码。
-5. 用拓扑图展示 rank 和 TCP edge 是否导通。
-6. 从 run.json / comm_matrix.csv / per_rank.csv / verifier.json 判断协议是否可行。
-7. 打开最新 report.html。
+1. 触发 Rust workspace release/debug build。
+2. 编译 C FFI fixture 并运行 C pingpong smoke。
+3. 生成 toy star / full-mesh / pingpong YAML。
+4. 运行 preflight。
+5. 运行 toy self-check。
+6. 显示集成终端日志，包括实际 cargo/dzb/cc 命令、stdout/stderr、退出码。
+7. 用拓扑图展示 rank 和 TCP edge 是否导通。
+8. 从 run.json / comm_matrix.csv / per_rank.csv / verifier.json 判断协议是否可行。
+9. 打开最新 report.html。
 ```
 
-`dzb ui` 是本机调试入口，不替代 artifact evaluation 的显式 YAML 流程。
+HTML 本身不直接执行命令；`console/server.py` 是本机 localhost 调度器。
+`dzb ui` 保留为兼容入口，但新的推荐入口是顶层 `./console/run_console.sh`。
+该 UI 不替代 artifact evaluation 的显式 YAML 流程。
 
 ## 14.1 Interactive entrypoint
 
@@ -3412,6 +3418,9 @@ Observed calibration fields:
 [x] Chrome trace output
 [x] JSON/CSV/HTML reports
 [x] HTML integrated terminal UI
+[x] top-level HTML console
+[x] Rust build triggered from console
+[x] C FFI build and smoke from console
 [x] network visualizer
 [x] integrated terminal logs
 [x] toy self-check UI
