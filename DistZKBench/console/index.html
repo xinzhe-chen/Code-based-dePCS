@@ -187,12 +187,18 @@
       $('terminal').scrollTop = $('terminal').scrollHeight;
     }
     async function post(url, body={}) {
+      if (location.protocol === 'file:') {
+        throw new Error('This page must be opened through ./console/run_console.sh so localhost APIs are available.');
+      }
       const res = await fetch(url, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
       const text = await res.text();
       if (!res.ok) throw new Error(text);
       return JSON.parse(text);
     }
     async function getJson(url) {
+      if (location.protocol === 'file:') {
+        throw new Error('This page must be opened through ./console/run_console.sh so localhost APIs are available.');
+      }
       const res = await fetch(url);
       const text = await res.text();
       if (!res.ok) throw new Error(text);
@@ -201,7 +207,7 @@
     async function pollJob(id) {
       for (;;) {
         const job = await getJson(`/api/jobs/${id}`);
-        log(job.log);
+        log(job.log || `Job ${id} is running. Waiting for process output...`);
         if (job.status !== 'running') {
           const ok = job.exit_code === 0;
           if (job.kind.includes('build')) setStatus('buildState', ok ? 'ok' : 'failed', ok ? 'ok' : 'bad');
@@ -213,7 +219,11 @@
     }
     async function launch(url, body={}) {
       try {
+        log(`Starting ${url} ...`);
+        if (url.includes('/build/') || url.includes('/clean/target')) setStatus('buildState', 'running', 'warn');
+        if (url === '/api/run') setStatus('runState', 'running', 'warn');
         const job = await post(url, body);
+        log(`Job ${job.job_id} started for ${url}. Waiting for output...`);
         await pollJob(job.job_id);
       } catch (err) { log(String(err)); }
     }

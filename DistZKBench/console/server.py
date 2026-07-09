@@ -180,8 +180,47 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def cargo_cmd(args: list[str]) -> list[str]:
-    cargo = os.environ.get("DZB_CARGO", "cargo")
+    cargo = find_tool("DZB_CARGO", "cargo")
     return [cargo, *args]
+
+
+def cc_cmd() -> str:
+    return find_tool("CC", "cc")
+
+
+def find_tool(env_name: str, tool: str) -> str:
+    override = os.environ.get(env_name)
+    if override:
+        return override
+    found = shutil.which(tool)
+    if found:
+        return found
+    candidates = [
+        Path.home() / ".cargo" / "bin" / tool,
+        ROOT.parent / "pq_dPCS" / ".codex-rust" / "cargo" / "bin" / tool,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return tool
+
+
+def bundled_rust_env() -> dict[str, str]:
+    candidates = [
+        ROOT / ".codex-rust",
+        ROOT.parent / "pq_dPCS" / ".codex-rust",
+    ]
+    for base in candidates:
+        cargo_home = base / "cargo"
+        rustup_home = base / "rustup"
+        cargo_bin = cargo_home / "bin"
+        if (cargo_bin / "cargo").exists() and rustup_home.exists():
+            return {
+                "CARGO_HOME": str(cargo_home),
+                "RUSTUP_HOME": str(rustup_home),
+                "PATH": str(cargo_bin),
+            }
+    return {}
 
 
 def dzb_release() -> Path:
@@ -207,7 +246,7 @@ def c_ffi_build_steps() -> list[list[str]]:
     return [
         cargo_cmd(["build", "-p", "dzb-sdk", "--release", "--locked"]),
         [
-            os.environ.get("CC", "cc"),
+            cc_cmd(),
             "ffi-fixtures/pingpong.c",
             "-I",
             "include",
@@ -249,16 +288,30 @@ def run_python_job(job_id: int, fn: Any) -> None:
 
 def run_sequence(job_id: int, commands: list[list[str]]) -> None:
     code = 0
-    for command in commands:
-        code = run_subprocess(job_id, command)
-        if code != 0:
-            break
+    try:
+        for command in commands:
+            code = run_subprocess(job_id, command)
+            if code != 0:
+                break
+    except FileNotFoundError as exc:
+        STATE.append_log(job_id, f"command not found: {exc.filename}\n")
+        STATE.append_log(job_id, "If this is a build job, install Rust or set DZB_CARGO=/absolute/path/to/cargo.\n")
+        code = 127
+    except Exception as exc:  # noqa: BLE001 - job boundary
+        STATE.append_log(job_id, f"job failed before process output: {exc}\n")
+        code = 1
     STATE.finish(job_id, code, latest_run_dir_str())
 
 
 def run_subprocess(job_id: int, command: list[str], env: dict[str, str] | None = None) -> int:
     STATE.append_log(job_id, "$ " + " ".join(command) + "\n")
     merged_env = os.environ.copy()
+    rust_env = bundled_rust_env()
+    for key, value in rust_env.items():
+        if key == "PATH":
+            merged_env[key] = value + os.pathsep + merged_env.get(key, "")
+        else:
+            merged_env.setdefault(key, value)
     if env:
         merged_env.update(env)
     process = subprocess.Popen(
