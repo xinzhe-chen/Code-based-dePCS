@@ -125,6 +125,7 @@ version = "0.1.0"
 dependencies = [
  "dzb-core",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
