@@ -1254,6 +1254,14 @@ fn artifact_is_complete(
     fingerprint: &str,
     verifier_required: bool,
 ) -> Result<bool, String> {
+    Ok(check_artifact_complete(run_dir, fingerprint, verifier_required).unwrap_or(false))
+}
+
+fn check_artifact_complete(
+    run_dir: &Path,
+    fingerprint: &str,
+    verifier_required: bool,
+) -> Result<bool, String> {
     let text = fs::read_to_string(run_dir.join("run.json")).map_err(|error| error.to_string())?;
     let run: dzb_core::RunJson = serde_json::from_str(&text).map_err(|error| error.to_string())?;
     if run.status != "ok" || run.execution_fingerprint != fingerprint {
