@@ -794,7 +794,7 @@ fn sample_self_memory() -> MemorySnapshot {
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(|kib| kib * 1024)
         });
-        return MemorySnapshot {
+        MemorySnapshot {
             resident_bytes: rss,
             virtual_bytes: vms,
             source: "procfs_self_status".to_owned(),
