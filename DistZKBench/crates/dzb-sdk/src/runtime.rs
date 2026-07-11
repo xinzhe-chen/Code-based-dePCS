@@ -920,4 +920,50 @@ mod tests {
         assert_eq!(left.communication.total_payload_bytes(), 5);
         assert_eq!(right.communication.total_payload_bytes(), 5);
     }
+
+    #[test]
+    #[ignore = "3 GiB TCP stress test; run explicitly on the Linux acceptance host"]
+    fn four_rank_256_mib_all_to_all_has_exact_accounting() {
+        const RANKS: usize = 4;
+        const EDGE_BYTES: usize = 256 * 1024 * 1024;
+        const FRAME_BYTES: usize = 1024 * 1024;
+        let base = 42000 + (std::process::id() % 1000) as u16;
+        let addrs = (0..RANKS)
+            .map(|rank| format!("127.0.0.1:{}", base + rank as u16))
+            .collect::<Vec<_>>();
+        let mut handles = Vec::new();
+        for rank in 0..RANKS {
+            let mut config = test_config(rank, base);
+            config.world_size = RANKS;
+            config.topology_kind = TopologyKind::FullMesh;
+            config.listen_addrs = addrs.clone();
+            config.max_frame_payload = FRAME_BYTES;
+            handles.push(std::thread::spawn(move || {
+                let mut dzb = init_from_config(config).expect("stress rank sdk init");
+                let payloads = (0..RANKS)
+                    .map(|dst| vec![(rank ^ dst) as u8; EDGE_BYTES])
+                    .collect::<Vec<_>>();
+                let received = dzb.all_to_all(77, payloads).expect("all-to-all");
+                for (src, payload) in received.iter().enumerate() {
+                    assert_eq!(payload.len(), EDGE_BYTES);
+                    assert!(payload.iter().all(|byte| *byte == (rank ^ src) as u8));
+                }
+                dzb.finish().expect("stress rank finish")
+            }));
+        }
+        let outputs = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("stress rank thread"))
+            .collect::<Vec<_>>();
+        let logical = outputs
+            .iter()
+            .map(|output| output.communication.total_payload_bytes())
+            .sum::<u64>();
+        let messages = outputs
+            .iter()
+            .map(|output| output.communication.message_count())
+            .sum::<u64>();
+        assert_eq!(logical, (RANKS * (RANKS - 1) * EDGE_BYTES) as u64);
+        assert_eq!(messages, (RANKS * (RANKS - 1)) as u64);
+    }
 }
