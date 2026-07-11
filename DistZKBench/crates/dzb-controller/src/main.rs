@@ -968,16 +968,116 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_cleanup(args: &[String]) -> Result<(), String> {
-    if args.iter().any(|arg| arg == "--all") {
-        println!("cleanup --all is currently limited to generated DistZKBench result directories");
-        return Ok(());
-    }
+    let all = args.iter().any(|arg| arg == "--all");
     let run_id = value_after(args, "--run-id").unwrap_or_default();
-    if run_id.is_empty() {
+    if !all && run_id.is_empty() {
         return Err("dzb cleanup requires --run-id <id> or --all".to_owned());
     }
-    println!("cleanup requested for run_id={run_id}");
+    if Platform::host() != Platform::Linux {
+        println!("cleanup complete: no privileged Linux resources on this platform");
+        return Ok(());
+    }
+    let safe_run_id = run_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let root = Path::new("/sys/fs/cgroup");
+    let targets = fs::read_dir(root)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            name.starts_with("dzb-") && (all || name == format!("dzb-{safe_run_id}"))
+        })
+        .collect::<Vec<_>>();
+    for target in targets {
+        cleanup_cgroup_tree(&target)?;
+    }
+    cleanup_named_network_resources(if all { "" } else { &safe_run_id })?;
+    println!(
+        "cleanup complete: {}",
+        if all {
+            "all DistZKBench resources"
+        } else {
+            &run_id
+        }
+    );
     Ok(())
+}
+
+fn cleanup_cgroup_tree(path: &Path) -> Result<(), String> {
+    if path.join("cgroup.kill").exists() {
+        let _ = sudo_command(
+            "tee",
+            &[path.join("cgroup.kill").to_string_lossy().as_ref()],
+            Some("1\n"),
+        );
+    }
+    let mut dirs = fs::read_dir(path)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for dir in dirs {
+        sudo_command("rmdir", &[dir.to_string_lossy().as_ref()], None)?;
+    }
+    sudo_command("rmdir", &[path.to_string_lossy().as_ref()], None)
+}
+
+fn cleanup_named_network_resources(run_fragment: &str) -> Result<(), String> {
+    let output = Command::new("ip")
+        .args(["netns", "list"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    for name in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| name.starts_with("dzb") && name.contains(run_fragment))
+    {
+        sudo_command("ip", &["netns", "del", name], None)?;
+    }
+    Ok(())
+}
+
+fn sudo_command(command: &str, args: &[&str], input: Option<&str>) -> Result<(), String> {
+    let mut child = Command::new("sudo")
+        .arg("-n")
+        .arg(command)
+        .args(args)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|error| error.to_string())?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
 }
 
 fn capability_for_request(
