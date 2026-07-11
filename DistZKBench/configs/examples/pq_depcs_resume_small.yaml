@@ -33,11 +33,10 @@ protocol:
   verify_subcommand: dzb-verify
   parameters:
     opening: protocol11
-    batch_claims: 2
     nv: 8
     security: test-only
     queries: 2
 sweep:
   axes:
-    - path: protocol.parameters.opening
-      values: [protocol11, protocol11-batch]
+    - path: protocol.parameters.nv
+      values: [8, 9]

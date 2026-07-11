@@ -45,14 +45,12 @@ enum OutputFormat {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PcsOpeningSelection {
     Protocol11,
-    Protocol11Batch,
 }
 
 impl PcsOpeningSelection {
     fn variants(self) -> Vec<PcsOpeningVariant> {
         match self {
             Self::Protocol11 => vec![PcsOpeningVariant::Protocol11],
-            Self::Protocol11Batch => vec![PcsOpeningVariant::Protocol11Batch],
         }
     }
 }
@@ -60,14 +58,12 @@ impl PcsOpeningSelection {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum PcsOpeningVariant {
     Protocol11,
-    Protocol11Batch,
 }
 
 impl PcsOpeningVariant {
     fn as_str(self) -> &'static str {
         match self {
             Self::Protocol11 => "protocol11",
-            Self::Protocol11Batch => "protocol11-batch",
         }
     }
 }
@@ -436,12 +432,6 @@ impl protocol11::Protocol11Channel for DzbProtocolChannel<'_> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum DzbStatementEnvelope {
     Protocol11(protocol11::Protocol11Statement),
-    Protocol11Batch {
-        config: Protocol11Config,
-        setup_seed: [u8; 32],
-        commitment: protocol11::Protocol11Commitment,
-        claims: Vec<(Vec<depcs::PaperField>, depcs::PaperField)>,
-    },
 }
 
 fn run_dzb_prove() -> Result<(), CliError> {
@@ -455,10 +445,11 @@ fn run_dzb_prove() -> Result<(), CliError> {
         .get("opening")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("protocol11");
-    let batch_claims = params
-        .get("batch_claims")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(2) as usize;
+    if opening != "protocol11" {
+        return Err(CliError(format!(
+            "unsupported DistZKBench opening '{opening}', expected protocol11"
+        )));
+    }
     let security = match params
         .get("security")
         .and_then(serde_json::Value::as_str)
@@ -520,35 +511,25 @@ fn run_dzb_prove() -> Result<(), CliError> {
             .map_err(|error| format!("DistZKBench worker commit failed: {error}"))
         })
         .map_err(CliError)?;
-    let claim_count = if opening == "protocol11-batch" {
-        batch_claims.max(2)
-    } else {
-        1
-    };
     let mut master_outputs = dzb
         .phase("protocol11.distributed_prove", |dzb| {
             let mut master_outputs = Vec::new();
             let mut channel = DzbProtocolChannel { dzb };
-            for claim in 0..claim_count {
-                let point = (0..pp.layout.nv)
-                    .map(|index| {
-                        depcs::PaperField::from_parts(
-                            (index as u64 + 5 + claim as u64) * 19,
-                            (index as u64 + 7 + claim as u64) * 23,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                if let Some(output) = protocol11::prove_distributed_fs(
-                    &pp,
-                    worker_commitment.clone(),
-                    worker_state.clone(),
-                    &point,
-                    &mut channel,
-                )
-                .map_err(|error| format!("distributed Protocol 11 failed: {error}"))?
-                {
-                    master_outputs.push(output);
-                }
+            let point = (0..pp.layout.nv)
+                .map(|index| {
+                    depcs::PaperField::from_parts((index as u64 + 5) * 19, (index as u64 + 7) * 23)
+                })
+                .collect::<Vec<_>>();
+            if let Some(output) = protocol11::prove_distributed_fs(
+                &pp,
+                worker_commitment,
+                worker_state,
+                &point,
+                &mut channel,
+            )
+            .map_err(|error| format!("distributed Protocol 11 failed: {error}"))?
+            {
+                master_outputs.push(output);
             }
             Ok(master_outputs)
         })
@@ -557,45 +538,14 @@ fn run_dzb_prove() -> Result<(), CliError> {
         "protocol11.security_claim_bits",
         pp.security.target_bits.unwrap_or(0) as u64,
     );
-    dzb.metrics
-        .gauge("protocol11.batch_claim_count", claim_count as u64);
     if rank == dzb.context().master_rank() {
-        let (statement_bytes, proof_bytes) = if opening == "protocol11-batch" {
-            let commitment = master_outputs[0].0.commitment.clone();
-            let claims = master_outputs
-                .iter()
-                .map(|(statement, proof)| protocol11::Protocol11BatchClaim {
-                    point: statement.point.clone(),
-                    claimed_value: statement.claimed_value,
-                    proof: proof.clone(),
-                })
-                .collect::<Vec<_>>();
-            let batch = protocol11::bind_batch_claims(&pp, &commitment, claims)
-                .map_err(|error| CliError(format!("bind Protocol 11 batch failed: {error}")))?;
-            let statement = DzbStatementEnvelope::Protocol11Batch {
-                config,
-                setup_seed,
-                commitment,
-                claims: master_outputs
-                    .iter()
-                    .map(|(statement, _)| (statement.point.clone(), statement.claimed_value))
-                    .collect(),
-            };
-            (
-                bincode::serialize(&statement).map_err(|error| CliError(error.to_string()))?,
-                protocol11::serialize_batch_proof(&batch)
-                    .map_err(|error| CliError(error.to_string()))?,
-            )
-        } else {
-            let (statement, proof) = master_outputs
-                .pop()
-                .ok_or_else(|| CliError("master protocol output missing".to_owned()))?;
-            (
-                bincode::serialize(&DzbStatementEnvelope::Protocol11(statement))
-                    .map_err(|error| CliError(error.to_string()))?,
-                protocol11::serialize_proof(&proof).map_err(|error| CliError(error.to_string()))?,
-            )
-        };
+        let (statement, proof) = master_outputs
+            .pop()
+            .ok_or_else(|| CliError("master protocol output missing".to_owned()))?;
+        let statement_bytes = bincode::serialize(&DzbStatementEnvelope::Protocol11(statement))
+            .map_err(|error| CliError(error.to_string()))?;
+        let proof_bytes =
+            protocol11::serialize_proof(&proof).map_err(|error| CliError(error.to_string()))?;
         dzb.artifacts
             .publish_statement_bytes(&statement_bytes)
             .map_err(CliError)?;
@@ -650,28 +600,6 @@ fn verify_dzb_bytes(statement_bytes: &[u8], proof_bytes: &[u8]) -> Result<&'stat
             )
             .map_err(|error| CliError(error.to_string()))?;
             Ok("protocol11")
-        }
-        DzbStatementEnvelope::Protocol11Batch {
-            config,
-            setup_seed,
-            commitment,
-            claims,
-        } => {
-            let pp = protocol11::setup(config, setup_seed)
-                .map_err(|error| CliError(error.to_string()))?;
-            let proof = protocol11::deserialize_batch_proof(proof_bytes)
-                .map_err(|error| CliError(error.to_string()))?;
-            if proof
-                .claims
-                .iter()
-                .map(|claim| (&claim.point, claim.claimed_value))
-                .ne(claims.iter().map(|(point, value)| (point, *value)))
-            {
-                return Err(CliError("batch statement/proof claim mismatch".to_owned()));
-            }
-            protocol11::verify_batch_fs(&pp, &commitment, &proof)
-                .map_err(|error| CliError(error.to_string()))?;
-            Ok("protocol11-batch")
         }
     }
 }
@@ -993,7 +921,6 @@ fn run_pcs_benchmark(command: PcsBenchmarkCommand) -> Result<(), CliError> {
 fn run_single_pcs_job(job: PcsBenchmarkJob) -> Result<PcsJobOutput, CliError> {
     match job.opening {
         PcsOpeningVariant::Protocol11 => run_single_depcs_job(job),
-        PcsOpeningVariant::Protocol11Batch => run_single_depcs_batch_job(job),
     }
 }
 
@@ -1332,16 +1259,6 @@ fn depcs_fixture_seed(size: usize, workers: usize, trial: usize) -> [u8; 32] {
     seed[16..24].copy_from_slice(&(trial as u64).to_le_bytes());
     seed[24..].copy_from_slice(b"pq-pv1!!");
     seed
-}
-
-fn run_single_depcs_batch_job(job: PcsBenchmarkJob) -> Result<PcsJobOutput, CliError> {
-    let reason = "batch_unavailable_deepfold_multi_open_api_missing: Protocol 11 uses the vendored DeepFold adapter over Ft255 and does not expose LigeSIS batch/multi-open; refusing to swap the configured backend";
-    Err(CliError(format!(
-        "paper-backed protocol11-batch unavailable for backend={} nv={} workers={}: {reason}",
-        job.backend.as_str(),
-        variable_count(job.size),
-        job.workers
-    )))
 }
 
 fn verify_pcs_results(command: VerifyPcsResultsCommand) -> Result<(), CliError> {
@@ -2787,9 +2704,8 @@ fn next_value<'a>(args: &'a [String], index: &mut usize, flag: &str) -> Result<&
 fn parse_opening(value: &str) -> Result<PcsOpeningSelection, CliError> {
     match value {
         "protocol11" | "depcs" => Ok(PcsOpeningSelection::Protocol11),
-        "protocol11-batch" | "depcs-batch" => Ok(PcsOpeningSelection::Protocol11Batch),
         other => Err(CliError(format!(
-            "unsupported --opening '{other}', expected protocol11 or protocol11-batch"
+            "unsupported --opening '{other}', expected protocol11"
         ))),
     }
 }
@@ -3060,7 +2976,7 @@ fn write_text_file(path: &Path, contents: &str) -> Result<(), CliError> {
 
 fn usage() -> String {
     "usage:
-  cargo run -p pq-experiments -- pcs-benchmark [--opening protocol11|protocol11-batch] [--backend deepfold] [--backend-rate-inv N] [--sizes 256,512,1024 | --size-range 256..1024 | --nv-values/--variable-counts 8,9,10 | --nv-range/--variable-range 8..10] [--workers 1,2,4] [--cores-per-worker N] [--pcs-queries N] [--security-bits N] [--repeats N] [--allow-insecure-test-profile] [--no-pcs-warmup] [--out DIR]
+  cargo run -p pq-experiments -- pcs-benchmark [--opening protocol11] [--backend deepfold] [--backend-rate-inv N] [--sizes 256,512,1024 | --size-range 256..1024 | --nv-values/--variable-counts 8,9,10 | --nv-range/--variable-range 8..10] [--workers 1,2,4] [--cores-per-worker N] [--pcs-queries N] [--security-bits N] [--repeats N] [--allow-insecure-test-profile] [--no-pcs-warmup] [--out DIR]
   cargo run -p pq-experiments -- verify-pcs-results --dir results/pcs-bench-... [--format json|csv]"
         .to_owned()
 }
@@ -3097,6 +3013,12 @@ mod tests {
     }
 
     #[test]
+    fn removed_protocol11_batch_opening_is_rejected() {
+        let error = parse_opening("protocol11-batch").expect_err("batch opening was removed");
+        assert!(error.0.contains("expected protocol11"));
+    }
+
+    #[test]
     fn core_affinity_label_records_affinity_metadata() {
         let label = core_affinity_label_from_parts(
             4,
@@ -3115,32 +3037,6 @@ mod tests {
         assert!(label.contains("worker_cpusets=0-7;8-15;16-23;24-31"));
         assert!(label.contains("numa_policy=local-node-if-available"));
         assert!(label.contains("affinity_status=taskset-available"));
-    }
-
-    #[test]
-    fn protocol11_batch_opening_is_explicit_and_fail_closed() {
-        assert_eq!(
-            parse_opening("protocol11-batch").expect("batch opening"),
-            PcsOpeningSelection::Protocol11Batch
-        );
-        let deepfold_job = PcsBenchmarkJob {
-            size: 1 << 10,
-            workers: 2,
-            opening: PcsOpeningVariant::Protocol11Batch,
-            trial: 1,
-            pcs_queries: 1,
-            backend: PaperPcsBackend::DeepFold,
-            backend_rate_inv: 2,
-            cores_per_worker: 1,
-            allow_insecure_test_profile: true,
-        };
-        let error = run_single_depcs_batch_job(deepfold_job)
-            .expect_err("deepfold batch must not swap backend");
-        assert!(
-            error
-                .0
-                .contains("batch_unavailable_deepfold_multi_open_api_missing")
-        );
     }
 
     #[test]

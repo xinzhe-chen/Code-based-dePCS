@@ -1072,7 +1072,6 @@ def build_fair_schedule(args: argparse.Namespace) -> list[dict]:
     index = 1
     fixed_scheme_order = [
         ("depcs", "depcs-deepfold-protocol11", "deepfold", "protocol11"),
-        ("depcs", "depcs-deepfold-protocol11-batch", "deepfold", "protocol11-batch"),
         ("ligesis", "LigeSIS", None),
         ("external", "dFRIttata", "dfrittata-pcs"),
         ("external", "dPIP-FRI", "dpip-fri-pcs"),
@@ -1081,8 +1080,6 @@ def build_fair_schedule(args: argparse.Namespace) -> list[dict]:
         kind, scheme, backend_or_key = entry[:3]
         opening = entry[3] if len(entry) > 3 else ""
         if kind == "depcs" and backend_or_key not in backend_by_name:
-            continue
-        if kind == "depcs" and opening == "protocol11-batch" and not args.include_depcs_batch:
             continue
         if kind == "ligesis" and args.skip_ligesis:
             continue
@@ -2620,7 +2617,7 @@ def write_report(
         )
         scheduling = (
             f"strict row order is depcs-deepfold"
-            f"{', depcs-deepfold-batch' if getattr(args, 'include_depcs_batch', False) else ''}, "
+            ", "
             f"LigeSIS, dFRIttata, dPIP-FRI; "
             f"within each scheme rows run nv ascending then workers ascending. host_logical_cores="
             f"{args.host_logical_cores}, max_workers={args.max_workers}, cores_per_worker="
@@ -2662,7 +2659,6 @@ def write_report(
         "- proof_size_semantics: `proof KiB` is the verifier-received PCS commitment object plus PCS opening proof. It is not prover-local committed polynomial storage.",
         "- communication_semantics: `dePCS send+recv KiB` is only master/worker network sent plus received bytes from dePCS protocol11 rows. External and LigeSIS native communication is reported separately as `native comm KiB`; `communication_cost_kib` is a chart-only derived value with `communication_cost_basis`.",
         "- verifier_semantics: paper-backed dePCS uses parallel independent artifact PCS verification plus batched Protocol10/11 consistency checks; no unsupported artifact batch-verify API is assumed.",
-        "- batch_boundary: `protocol11-batch` is an explicit experimental runner. If a real artifact-native batch opening cannot be constructed without changing the field/backend semantics, the row is recorded as blocked instead of falling back to individual worker proofs.",
         "- scalability_semantics: worker-local and end-to-end scaling fields are meaningful only for distributed dePCS rows with `communication_basis=master_worker_sent_recv`.",
         "- interpretation: paper-native rows are PCS-only artifact timings and must not be read as distributed dePCS Protocol10/11 evidence.",
         "- local_simulation_caveat: this is a single-machine Rayon simulation, so high worker counts also include scheduler, cache, memory-bandwidth, and proof-object allocation noise.",
@@ -2807,9 +2803,7 @@ def blocked_metric_row(row: dict, args: argparse.Namespace, failure_reason: str)
         scheme=row.get("scheme", "blocked"),
         backend=backend,
         backend_rate_inv=rate_inv,
-        runner="paper-network-protocol11-batch"
-        if row.get("opening") == "protocol11-batch"
-        else row.get("kind", "blocked"),
+        runner=row.get("kind", "blocked"),
         opening=row.get("opening") or args.depcs_opening,
         workers=workers,
         nv=nv,
@@ -3317,12 +3311,7 @@ def main() -> int:
     parser.add_argument("--depcs-workers", default="2,4,8,16")
     parser.add_argument("--cores-per-worker", type=int, default=None)
     parser.add_argument("--depcs-runner", default="local-network")
-    parser.add_argument("--depcs-opening", default="protocol11")
-    parser.add_argument(
-        "--include-depcs-batch",
-        action="store_true",
-        help="Also schedule explicit protocol11-batch dePCS rows. Unavailable paper-native batch backends are kept as blocked rows instead of falling back.",
-    )
+    parser.add_argument("--depcs-opening", choices=["protocol11"], default="protocol11")
     parser.add_argument(
         "--depcs-backends",
         default="deepfold:2",

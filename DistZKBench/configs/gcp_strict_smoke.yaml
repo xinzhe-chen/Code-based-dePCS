@@ -37,8 +37,7 @@ protocol:
   prove_subcommand: dzb-prove
   verify_subcommand: dzb-verify
   parameters:
-    opening: protocol11-batch
-    batch_claims: 2
+    opening: protocol11
     nv: 10
     security: test-only
     queries: 2

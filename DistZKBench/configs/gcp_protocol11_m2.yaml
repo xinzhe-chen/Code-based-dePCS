@@ -53,7 +53,6 @@ protocol:
   verify_subcommand: dzb-verify
   parameters:
     opening: protocol11
-    batch_claims: 2
     nv: 18
     security: paper100
     queries: 0
@@ -69,5 +68,3 @@ sweep:
       values: [18, 19, 20, 21, 22, 23, 24]
     - path: roles.prover_ranks
       values: [2, 4]
-    - path: protocol.parameters.opening
-      values: [protocol11, protocol11-batch]

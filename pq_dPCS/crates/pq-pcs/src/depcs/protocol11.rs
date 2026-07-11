@@ -29,7 +29,6 @@ pub const PROTOCOL11_FIDELITY: &str = "protocol11-deepfold";
 pub const PROTOCOL11_RELEASE_BLOCKER: &str = "vendored-deepfold-has-no-confirmed-license";
 const PROOF_MAGIC: &[u8; 8] = b"PQDPCS11";
 const COMMITMENT_MAGIC: &[u8; 8] = b"PQDPCSC1";
-const BATCH_PROOF_MAGIC: &[u8; 8] = b"PQDPCSB1";
 const PROOF_SCHEMA: u16 = 2;
 const MAX_PROOF_BYTES: usize = 1 << 30;
 const CODE_EXPANSION: usize = 2;
@@ -1033,29 +1032,6 @@ struct OpeningAggregate {
     y2: Vec<PaperField>,
 }
 
-/// A single claim carried by the shared-transcript batch container.
-///
-/// Each constituent proof remains a complete Protocol 11 proof.  The batch
-/// transcript binds the ordered claim list but deliberately does not claim a
-/// DeepFold multi-open optimization.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Protocol11BatchClaim {
-    pub point: Vec<PaperField>,
-    pub claimed_value: PaperField,
-    pub proof: Protocol11Proof,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Protocol11BatchProof {
-    pub protocol: String,
-    pub batch_mode: String,
-    pub params_digest: [u8; 32],
-    pub commitment_root: [u8; 32],
-    pub claims: Vec<Protocol11BatchClaim>,
-    pub coefficients: Vec<PaperField>,
-    pub transcript_digest: [u8; 32],
-}
-
 #[derive(Clone, Debug)]
 struct EvalMaterial {
     worker_id: usize,
@@ -1750,104 +1726,6 @@ pub fn verify_fs(
     session.finalize(proof)
 }
 
-pub fn prove_batch_fs(
-    pp: &PublicParameters,
-    commitment: &Protocol11Commitment,
-    workers: &[WorkerProverState],
-    points: &[Vec<PaperField>],
-) -> Result<Protocol11BatchProof> {
-    if points.len() < 2 {
-        return Err(Protocol11Error::InvalidParameters(
-            "Protocol 11 batch requires at least two claims",
-        ));
-    }
-    let mut claims = Vec::with_capacity(points.len());
-    for point in points {
-        let (claimed_value, proof) = prove_fs(pp, commitment, workers.to_vec(), point)?;
-        claims.push(Protocol11BatchClaim {
-            point: point.clone(),
-            claimed_value,
-            proof,
-        });
-    }
-    bind_batch_claims(pp, commitment, claims)
-}
-
-pub fn bind_batch_claims(
-    pp: &PublicParameters,
-    commitment: &Protocol11Commitment,
-    claims: Vec<Protocol11BatchClaim>,
-) -> Result<Protocol11BatchProof> {
-    if claims.len() < 2 {
-        return Err(Protocol11Error::InvalidParameters(
-            "Protocol 11 batch requires at least two claims",
-        ));
-    }
-    let (coefficients, transcript_digest) = batch_binding(pp, commitment, &claims)?;
-    Ok(Protocol11BatchProof {
-        protocol: PROTOCOL11_VERSION.to_owned(),
-        batch_mode: "shared-transcript-independent-openings".to_owned(),
-        params_digest: pp.params_digest,
-        commitment_root: commitment.root,
-        claims,
-        coefficients,
-        transcript_digest,
-    })
-}
-
-pub fn verify_batch_fs(
-    pp: &PublicParameters,
-    commitment: &Protocol11Commitment,
-    batch: &Protocol11BatchProof,
-) -> Result<()> {
-    if batch.protocol != PROTOCOL11_VERSION
-        || batch.batch_mode != "shared-transcript-independent-openings"
-        || batch.params_digest != pp.params_digest
-        || batch.commitment_root != commitment.root
-        || batch.claims.len() < 2
-    {
-        return Err(Protocol11Error::InvalidProof("batch header mismatch"));
-    }
-    for claim in &batch.claims {
-        verify_fs(
-            pp,
-            commitment,
-            &claim.point,
-            claim.claimed_value,
-            &claim.proof,
-        )?;
-    }
-    let (coefficients, transcript_digest) = batch_binding(pp, commitment, &batch.claims)?;
-    if coefficients != batch.coefficients || transcript_digest != batch.transcript_digest {
-        return Err(Protocol11Error::InvalidProof(
-            "batch transcript binding mismatch",
-        ));
-    }
-    Ok(())
-}
-
-fn batch_binding(
-    pp: &PublicParameters,
-    commitment: &Protocol11Commitment,
-    claims: &[Protocol11BatchClaim],
-) -> Result<(Vec<PaperField>, [u8; 32])> {
-    let mut transcript = Transcript::new();
-    transcript.absorb_bytes(b"batch-mode", b"shared-transcript-independent-openings");
-    transcript.absorb(b"batch-params-digest", &pp.params_digest)?;
-    transcript.absorb(b"batch-commitment-root", &commitment.root)?;
-    transcript.absorb(b"batch-claim-count", &claims.len())?;
-    for claim in claims {
-        let proof_bytes = serialize_proof(&claim.proof)?;
-        transcript.absorb(
-            b"batch-claim",
-            &(&claim.point, claim.claimed_value, sha256(&proof_bytes)),
-        )?;
-    }
-    let coefficients = transcript.challenge_fields(b"batch-coefficients", claims.len());
-    transcript.absorb(b"batch-coefficients-binding", &coefficients)?;
-    Ok((coefficients, transcript.digest()))
-}
-
 fn verify_fs_inner(
     pp: &PublicParameters,
     commitment: &Protocol11Commitment,
@@ -2040,39 +1918,6 @@ pub fn deserialize_proof(bytes: &[u8]) -> Result<Protocol11Proof> {
         .deserialize(&bytes[18..])
         .map_err(|_| Protocol11Error::Serialization)?;
     if serialize_proof(&proof)? != bytes {
-        return Err(Protocol11Error::Serialization);
-    }
-    Ok(proof)
-}
-
-pub fn serialize_batch_proof(proof: &Protocol11BatchProof) -> Result<Vec<u8>> {
-    let body = canonical_options()
-        .serialize(proof)
-        .map_err(|_| Protocol11Error::Serialization)?;
-    let mut output = Vec::with_capacity(BATCH_PROOF_MAGIC.len() + 10 + body.len());
-    output.extend_from_slice(BATCH_PROOF_MAGIC);
-    output.extend_from_slice(&PROOF_SCHEMA.to_le_bytes());
-    output.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    output.extend_from_slice(&body);
-    Ok(output)
-}
-
-pub fn deserialize_batch_proof(bytes: &[u8]) -> Result<Protocol11BatchProof> {
-    if bytes.len() < BATCH_PROOF_MAGIC.len() + 10
-        || &bytes[..BATCH_PROOF_MAGIC.len()] != BATCH_PROOF_MAGIC
-    {
-        return Err(Protocol11Error::UnsupportedLegacyProtocol);
-    }
-    let schema = u16::from_le_bytes(bytes[8..10].try_into().expect("two bytes"));
-    let body_len = u64::from_le_bytes(bytes[10..18].try_into().expect("eight bytes")) as usize;
-    if schema != PROOF_SCHEMA || body_len > MAX_PROOF_BYTES || bytes.len() != 18 + body_len {
-        return Err(Protocol11Error::Serialization);
-    }
-    let proof: Protocol11BatchProof = canonical_options()
-        .reject_trailing_bytes()
-        .deserialize(&bytes[18..])
-        .map_err(|_| Protocol11Error::Serialization)?;
-    if serialize_batch_proof(&proof)? != bytes {
         return Err(Protocol11Error::Serialization);
     }
     Ok(proof)
@@ -3217,40 +3062,6 @@ mod tests {
         let mut other_point = point.clone();
         other_point[0] += PaperField::from_int(1);
         assert!(verify_fs(&pp, &commitment, &other_point, claimed_value, &proof).is_err());
-    }
-
-    #[test]
-    fn protocol11_batch_binds_order_claims_and_commitment() {
-        let pp = setup(test_config(8, 2, 2), [12_u8; 32]).unwrap();
-        let evaluations = (0..pp.layout.original_len).map(value).collect::<Vec<_>>();
-        let (commitment, states) = commit_global(&pp, evaluations).unwrap();
-        let points = vec![
-            vec![PaperField::from_parts(2, 5); pp.layout.nv],
-            vec![PaperField::from_parts(3, 7); pp.layout.nv],
-        ];
-        let batch = prove_batch_fs(&pp, &commitment, &states, &points).unwrap();
-        verify_batch_fs(&pp, &commitment, &batch).unwrap();
-        let encoded = serialize_batch_proof(&batch).unwrap();
-        let decoded = deserialize_batch_proof(&encoded).unwrap();
-        verify_batch_fs(&pp, &commitment, &decoded).unwrap();
-
-        let mut reordered = batch.clone();
-        reordered.claims.swap(0, 1);
-        assert!(verify_batch_fs(&pp, &commitment, &reordered).is_err());
-
-        let mut bad_point = batch.clone();
-        bad_point.claims[0].point[0] += PaperField::from_int(1);
-        assert!(verify_batch_fs(&pp, &commitment, &bad_point).is_err());
-
-        let other_pp = setup(test_config(8, 2, 2), [14_u8; 32]).unwrap();
-        let (other_commitment, _) = commit_global(
-            &other_pp,
-            (0..other_pp.layout.original_len)
-                .map(value)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        assert!(verify_batch_fs(&other_pp, &other_commitment, &batch).is_err());
     }
 
     #[test]
