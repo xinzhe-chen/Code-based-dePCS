@@ -252,7 +252,7 @@ fn write_perf_csv(result_dir: &Path, config: &ResolvedConfig) -> std::io::Result
     let mut file = File::create(result_dir.join("perf_counters.csv"))?;
     writeln!(file, "rank,event,value,source")?;
     for rank in 0..config.original.roles.prover_ranks {
-        writeln!(file, "{rank},perf_event_open,0,not_collected")?;
+        writeln!(file, "{rank},perf_event_open,,unsupported_or_not_requested")?;
     }
     Ok(())
 }
