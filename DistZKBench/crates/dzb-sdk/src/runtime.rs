@@ -798,7 +798,7 @@ fn sample_self_memory() -> MemorySnapshot {
             resident_bytes: rss,
             virtual_bytes: vms,
             source: "procfs_self_status".to_owned(),
-        };
+        }
     }
     #[cfg(target_os = "macos")]
     {
