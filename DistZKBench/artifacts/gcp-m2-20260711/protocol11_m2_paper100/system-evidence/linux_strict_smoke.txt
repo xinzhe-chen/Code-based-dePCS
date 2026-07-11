@@ -1,0 +1,17 @@
+bash: line 5: 21787 Killed                  python3 - <<'PY'
+chunks = []
+while True:
+    chunks.append(bytearray(4 * 1024 * 1024))
+PY
+
+linux_strict_smoke=ok
+cgroup_v2=ok
+cgroup_memory_max=ok
+cgroup_memory_peak=67108864
+taskset_affinity=ok Cpus_allowed_list:	0
+cpuset_cgroup=ok Cpus_allowed_list:	0
+smt_sibling_avoidance_set=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23
+numa_plan=ok
+netns_veth_tc=ok
+resctrl_cat=unsupported
+perf_event_open=unsupported paranoid=4
