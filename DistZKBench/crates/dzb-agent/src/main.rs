@@ -304,12 +304,22 @@ fn prepare_cgroup(
     };
     let run = root.join(format!("dzb-{}", safe(run_id)));
     let path = run.join(safe(id));
+    enable_controllers(root, "+cpuset +memory")?;
+    std::fs::create_dir_all(&run)
+        .map_err(|error| format!("create run cgroup {} failed: {error}", run.display()))?;
+    let root_mems = std::fs::read_to_string(root.join("cpuset.mems.effective"))
+        .unwrap_or_else(|_| "0".to_owned());
+    let root_cpus = std::fs::read_to_string(root.join("cpuset.cpus.effective"))
+        .map_err(|error| format!("read effective cpuset failed: {error}"))?;
+    std::fs::write(run.join("cpuset.mems"), root_mems.trim())
+        .map_err(|error| format!("initialize run cpuset.mems failed: {error}"))?;
+    std::fs::write(run.join("cpuset.cpus"), root_cpus.trim())
+        .map_err(|error| format!("initialize run cpuset.cpus failed: {error}"))?;
+    enable_controllers(&run, "+cpuset +memory")?;
     std::fs::create_dir_all(&path)
-        .map_err(|error| format!("create cgroup {} failed: {error}", path.display()))?;
+        .map_err(|error| format!("create process cgroup {} failed: {error}", path.display()))?;
     if let Some(cpus) = cpuset {
-        let mems = std::fs::read_to_string(root.join("cpuset.mems.effective"))
-            .unwrap_or_else(|_| "0".to_owned());
-        std::fs::write(path.join("cpuset.mems"), mems.trim())
+        std::fs::write(path.join("cpuset.mems"), root_mems.trim())
             .map_err(|error| format!("write cpuset.mems failed: {error}"))?;
         std::fs::write(path.join("cpuset.cpus"), cpus)
             .map_err(|error| format!("write cpuset.cpus failed: {error}"))?;
@@ -319,6 +329,11 @@ fn prepare_cgroup(
             .map_err(|error| format!("write memory.max failed: {error}"))?;
     }
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+fn enable_controllers(cgroup: &std::path::Path, controllers: &str) -> Result<(), String> {
+    std::fs::write(cgroup.join("cgroup.subtree_control"), controllers)
+        .map_err(|error| format!("enable controllers in {} failed: {error}", cgroup.display()))
 }
 
 #[cfg(unix)]
