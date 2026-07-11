@@ -6,11 +6,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use dzb_core::{TopologyKind, parse_byte_size, parse_duration_millis};
-use dzb_transport::{
-    CommunicationCounters, Topology, UserspaceShaper, encode_frames, mio_accept, mio_bind,
-    mio_connect, mio_read_message, mio_write_frames, run_id_words, set_nodelay,
-};
+use dzb_transport::{CommunicationCounters, Topology, UserspaceShaper, encode_frames};
 
+use crate::persistent::{NetworkStats, PersistentPeers};
 use crate::{PhaseEvent, ProofArtifact, deterministic_bytes, deterministic_seed, sha256_hex};
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -39,6 +37,12 @@ pub struct DzbRankConfig {
     pub thread_budget: usize,
     pub shaper: SdkShaperConfig,
     pub memory_limit_bytes: Option<u64>,
+    #[serde(default = "default_connection_timeout_sec")]
+    pub connection_timeout_sec: u64,
+}
+
+const fn default_connection_timeout_sec() -> u64 {
+    30
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -223,11 +227,12 @@ impl Metrics {
 pub struct Network {
     config: DzbRankConfig,
     topology: Topology,
-    listener: mio::net::TcpListener,
+    peers: PersistentPeers,
     counters: CommunicationCounters,
     shaper: UserspaceShaper,
-    next_message_id: u64,
+    next_message_id: BTreeMap<RankId, u64>,
     inbox: BTreeMap<(RankId, MsgTag), VecDeque<Vec<u8>>>,
+    barrier_generation: u32,
 }
 
 impl Network {
@@ -235,9 +240,16 @@ impl Network {
         if config.listen_addrs.len() != config.world_size {
             return Err("listen_addrs length must equal world_size".to_owned());
         }
-        let listener = mio_bind(&config.listen_addrs[config.rank])
-            .map_err(|error| format!("rank {} bind listener failed: {error}", config.rank))?;
-        Ok(Self {
+        let peers = PersistentPeers::connect(
+            &config.run_id,
+            config.rank as RankId,
+            config.world_size,
+            config.master_rank as RankId,
+            config.topology_kind,
+            &config.listen_addrs,
+            Duration::from_secs(config.connection_timeout_sec),
+        )?;
+        let mut network = Self {
             config: config.clone(),
             topology: Topology {
                 kind: config.topology_kind,
@@ -246,15 +258,19 @@ impl Network {
                 enforce: config.enforce_topology,
                 routed_star: config.routed_star,
             },
-            listener,
+            peers,
             counters: CommunicationCounters::new(config.world_size),
             shaper: UserspaceShaper {
                 bandwidth_bytes_per_sec: config.shaper.bandwidth_bytes_per_sec,
                 latency: Duration::from_millis(config.shaper.latency_ms),
             },
-            next_message_id: 1,
+            next_message_id: BTreeMap::new(),
             inbox: BTreeMap::new(),
-        })
+            barrier_generation: 0,
+        };
+        network.barrier("connection-ready")?;
+        network.barrier("measured-start")?;
+        Ok(network)
     }
 
     pub fn rank(&self) -> RankId {
@@ -266,31 +282,40 @@ impl Network {
     }
 
     pub fn send(&mut self, to: RankId, tag: MsgTag, payload: &[u8], phase_id: u32) -> Result<()> {
+        self.send_impl(to, tag, payload, phase_id, true)
+    }
+
+    fn send_impl(
+        &mut self,
+        to: RankId,
+        tag: MsgTag,
+        payload: &[u8],
+        phase_id: u32,
+        record: bool,
+    ) -> Result<()> {
         self.topology
             .check_send(self.rank(), to)
             .map_err(|error| error.to_string())?;
+        let rank = self.rank();
+        let message_id = self.next_message_id.entry(to).or_insert(1);
+        let current_message_id = *message_id;
+        *message_id = message_id.saturating_add(1);
         let frames = encode_frames(
             &self.config.run_id,
             phase_id,
-            self.rank(),
+            rank,
             to,
             tag,
-            self.next_message_id,
+            current_message_id,
             payload,
             self.config.max_frame_payload,
         );
-        self.next_message_id = self.next_message_id.saturating_add(1);
-        let addr = self
-            .config
-            .listen_addrs
-            .get(to as usize)
-            .ok_or_else(|| format!("destination rank {to} out of range"))?;
-        let mut stream = mio_connect(addr, Duration::from_secs(30))?;
-        let _ = set_nodelay(&stream, true);
         let shaper = self.shaper_for(to);
-        mio_write_frames(&mut stream, &frames, &shaper, Duration::from_secs(30))?;
-        self.counters
-            .record_message(self.rank(), to, payload.len(), frames.len());
+        self.peers.send(to, &frames, &shaper, payload.len())?;
+        if record {
+            self.counters
+                .record_message(self.rank(), to, payload.len(), frames.len());
+        }
         Ok(())
     }
 
@@ -299,11 +324,9 @@ impl Network {
             return Ok(payload);
         }
         loop {
-            let mut stream = mio_accept(&mut self.listener, Duration::from_secs(30))?;
-            let (key, payload, _) = mio_read_message(&mut stream, Duration::from_secs(30))?;
-            if (key.run_id_hi, key.run_id_lo) != run_id_words(&self.config.run_id) {
-                return Err("received message from a different DistZKBench run".to_owned());
-            }
+            let incoming = self.peers.recv()?;
+            let key = incoming.key;
+            let payload = incoming.payload;
             if key.dst_rank != self.rank() {
                 return Err(format!(
                     "received message for rank {} on rank {}",
@@ -414,57 +437,53 @@ impl Network {
             self.topology
                 .check_send(self.rank(), dst)
                 .map_err(|error| error.to_string())?;
-            let frames = encode_frames(
-                &self.config.run_id,
-                phase_id,
-                self.rank(),
-                dst,
-                tag,
-                self.next_message_id,
-                &payloads[dst as usize],
-                self.config.max_frame_payload,
-            );
-            self.next_message_id = self.next_message_id.saturating_add(1);
-            outgoing.push((
-                dst,
-                self.config.listen_addrs[dst as usize].clone(),
-                frames,
-                self.shaper_for(dst),
-                payloads[dst as usize].len(),
-            ));
+            outgoing.push(dst);
         }
         let mut values = vec![Vec::new(); self.world_size()];
         values[self.rank() as usize] = payloads[self.rank() as usize].clone();
-        std::thread::scope(|scope| -> Result<()> {
-            let mut handles = Vec::with_capacity(outgoing.len());
-            for (_, addr, frames, shaper, _) in &outgoing {
-                handles.push(scope.spawn(move || -> Result<()> {
-                    let mut stream = mio_connect(addr, Duration::from_secs(30))?;
-                    let _ = set_nodelay(&stream, true);
-                    mio_write_frames(&mut stream, frames, shaper, Duration::from_secs(30))
-                }));
+        for dst in outgoing {
+            self.send(dst, tag, &payloads[dst as usize], phase_id)?;
+        }
+        for src in 0..self.world_size() as RankId {
+            if src != self.rank() {
+                values[src as usize] = self.recv(src, tag)?;
             }
-            for src in 0..self.world_size() as RankId {
-                if src != self.rank() {
-                    values[src as usize] = self.recv(src, tag)?;
-                }
-            }
-            for handle in handles {
-                handle
-                    .join()
-                    .map_err(|_| "all-to-all sender thread panicked".to_owned())??;
-            }
-            Ok(())
-        })?;
-        for (dst, _, frames, _, payload_len) in outgoing {
-            self.counters
-                .record_message(self.rank(), dst, payload_len, frames.len());
         }
         Ok(values)
     }
 
     pub fn barrier(&mut self, _name: &str) -> Result<()> {
+        let generation = self.barrier_generation;
+        self.barrier_generation = self.barrier_generation.saturating_add(1);
+        let arrive_tag = 0xff00_0000_u32.saturating_add(generation.saturating_mul(2));
+        let release_tag = arrive_tag.saturating_add(1);
+        let root = self.config.master_rank as RankId;
+        if self.rank() == root {
+            for src in 0..self.world_size() as RankId {
+                if src != root {
+                    let marker = self.recv(src, arrive_tag)?;
+                    if marker != generation.to_le_bytes() {
+                        return Err("barrier generation mismatch".to_owned());
+                    }
+                }
+            }
+            for dst in 0..self.world_size() as RankId {
+                if dst != root {
+                    self.send_impl(dst, release_tag, &generation.to_le_bytes(), 0, false)?;
+                }
+            }
+        } else {
+            self.send_impl(root, arrive_tag, &generation.to_le_bytes(), 0, false)?;
+            let marker = self.recv(root, release_tag)?;
+            if marker != generation.to_le_bytes() {
+                return Err("barrier release mismatch".to_owned());
+            }
+        }
         Ok(())
+    }
+
+    pub fn network_stats(&self) -> NetworkStats {
+        self.peers.stats()
     }
 
     pub fn counters(&self) -> &CommunicationCounters {
@@ -668,7 +687,8 @@ impl Dzb {
         self.network.barrier(name)
     }
 
-    pub fn finish(self) -> Result<SdkRankOutput> {
+    pub fn finish(mut self) -> Result<SdkRankOutput> {
+        self.network.barrier("measured-end")?;
         let memory = sample_self_memory();
         let proof = self.artifacts.proof().cloned();
         let output = SdkRankOutput {
@@ -706,6 +726,7 @@ impl Dzb {
             thermal_start: "unavailable".to_owned(),
             thermal_end: "unavailable".to_owned(),
             thermal_source: "sdk_public_api_unavailable".to_owned(),
+            network_stats: self.network.network_stats(),
         };
         let text = serde_json::to_string_pretty(&output)
             .map_err(|error| format!("serialize rank output failed: {error}"))?;
@@ -738,6 +759,8 @@ pub struct SdkRankOutput {
     pub thermal_start: String,
     pub thermal_end: String,
     pub thermal_source: String,
+    #[serde(default)]
+    pub network_stats: NetworkStats,
 }
 
 pub fn init() -> Result<Dzb> {
@@ -892,6 +915,7 @@ mod tests {
             thread_budget: 1,
             shaper: SdkShaperConfig::default(),
             memory_limit_bytes: None,
+            connection_timeout_sec: 30,
         }
     }
 
@@ -919,6 +943,55 @@ mod tests {
         let right = right.join().expect("rank 1 thread");
         assert_eq!(left.communication.total_payload_bytes(), 5);
         assert_eq!(right.communication.total_payload_bytes(), 5);
+        assert_eq!(left.network_stats.peers.len(), 1);
+        assert_eq!(right.network_stats.peers.len(), 1);
+        assert_eq!(left.network_stats.peers[0].connections_opened, 1);
+        assert_eq!(right.network_stats.peers[0].connections_opened, 1);
+    }
+
+    #[test]
+    fn four_rank_persistent_all_to_all_reuses_one_peer_connection() {
+        const RANKS: usize = 4;
+        const EDGE_BYTES: usize = 1024 * 1024;
+        let base = 43000 + (std::process::id() % 1000) as u16;
+        let addrs = (0..RANKS)
+            .map(|rank| format!("127.0.0.1:{}", base + rank as u16))
+            .collect::<Vec<_>>();
+        let handles = (0..RANKS)
+            .map(|rank| {
+                let mut config = test_config(rank, base);
+                config.world_size = RANKS;
+                config.listen_addrs = addrs.clone();
+                std::thread::spawn(move || {
+                    let mut dzb = init_from_config(config).expect("persistent sdk init");
+                    let payloads = (0..RANKS)
+                        .map(|dst| vec![(rank ^ dst) as u8; EDGE_BYTES])
+                        .collect::<Vec<_>>();
+                    let received = dzb.all_to_all(91, payloads).expect("all-to-all");
+                    assert!(received.iter().all(|payload| payload.len() == EDGE_BYTES));
+                    dzb.finish().expect("finish")
+                })
+            })
+            .collect::<Vec<_>>();
+        let outputs = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("rank thread"))
+            .collect::<Vec<_>>();
+        assert!(outputs.iter().all(|output| {
+            output.network_stats.peers.len() == RANKS - 1
+                && output
+                    .network_stats
+                    .peers
+                    .iter()
+                    .all(|peer| peer.connections_opened == 1)
+        }));
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| output.communication.total_payload_bytes())
+                .sum::<u64>(),
+            (RANKS * (RANKS - 1) * EDGE_BYTES) as u64
+        );
     }
 
     #[test]
@@ -965,5 +1038,13 @@ mod tests {
             .sum::<u64>();
         assert_eq!(logical, (RANKS * (RANKS - 1) * EDGE_BYTES) as u64);
         assert_eq!(messages, (RANKS * (RANKS - 1)) as u64);
+        assert!(outputs.iter().all(|output| {
+            output.network_stats.peers.len() == RANKS - 1
+                && output
+                    .network_stats
+                    .peers
+                    .iter()
+                    .all(|peer| peer.connections_opened == 1)
+        }));
     }
 }

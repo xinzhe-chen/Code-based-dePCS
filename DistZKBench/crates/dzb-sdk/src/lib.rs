@@ -2,11 +2,13 @@
 
 pub mod context;
 pub mod ffi;
+mod persistent;
 pub mod protocol;
 pub mod rng;
 pub mod runtime;
 
 pub use context::{PhaseEvent, ProofArtifact, ProverCtx, sha256_hex};
+pub use persistent::{NetworkStats, PeerStat};
 pub use protocol::Protocol;
 pub use rng::{deterministic_bytes, deterministic_seed};
 pub use runtime::{

@@ -9,7 +9,7 @@ pub use config::{
     MetricsConfig, NetworkConfig, PlatformBackendName, PlatformConfig, ProtocolConfig,
     ResolvedConfig, ResourcesConfig, RolesConfig, ShaperConfig, SweepAxis, SweepConfig,
     TimeoutsConfig, TopologyConfig, TopologyKind, ToyProtocolConfig, expand_sweep, load_config,
-    resolve_config,
+    resolve_config, semantic_config_hash,
 };
 pub use manifest::{Manifest, RunJson, RunStatus, write_json_pretty};
 pub use platform::{

@@ -306,7 +306,8 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     };
     let config = load_config(&config_path).map_err(|error| error.to_string())?;
     let capability = capability_for_request(config.platform.backend)?;
-    let resolved = resolve_config(config, capability).map_err(|error| error.to_string())?;
+    let mut resolved = resolve_config(config, capability).map_err(|error| error.to_string())?;
+    resolved.execution_fingerprint = execution_fingerprint(&resolved)?;
     let start = Instant::now();
     let execution = (|| -> Result<ExperimentOutput, String> {
         if resolved.original.protocol.mode == "black-box" {
@@ -414,6 +415,8 @@ fn persist_failed_run(
         communication_precision: "partial_or_unavailable".to_owned(),
         platform_evidence: serde_json::json!({"error": error}),
         best_effort_warning: None,
+        config_hash: config.config_hash.clone(),
+        execution_fingerprint: config.execution_fingerprint.clone(),
     };
     dzb_core::write_json_pretty(&result_dir.join("run.json"), &run).map_err(|io| io.to_string())
 }
@@ -478,6 +481,7 @@ fn run_black_box(
         thermal_end: "unavailable".to_owned(),
         thermal_source: "black_box_external_unavailable".to_owned(),
         custom_metrics: Vec::new(),
+        network_stats: dzb_sdk::NetworkStats::default(),
     };
     Ok(ExperimentOutput {
         status: dzb_core::RunStatus::Failed,
@@ -553,6 +557,19 @@ fn spawn_verifier_process(
         ),
         memory_limit_bytes: strict_memory_limit(config)?,
         strict_linux: config.platform == Platform::Linux && config.original.memory.cgroup,
+        namespace: None,
+        sample_path: Some(
+            logs.join("memory")
+                .join("verifier.csv")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        sample_interval_ms: dzb_core::parse_duration_millis(
+            &config.original.metrics.memory_sampling_interval,
+        )
+        .map_err(|error| error.to_string())?,
+        role: "verifier".to_owned(),
+        rank: None,
     })?;
     let status = agent.wait(
         "verifier",
@@ -600,6 +617,58 @@ struct AgentLaunch {
     cpuset: Option<String>,
     memory_limit_bytes: Option<u64>,
     strict_linux: bool,
+    namespace: Option<String>,
+    sample_path: Option<String>,
+    sample_interval_ms: u64,
+    role: String,
+    rank: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct KernelShaper {
+    bandwidth_bps: Option<u64>,
+    latency_ms: u64,
+    jitter_ms: u64,
+    loss_percent: String,
+    edges: Vec<KernelEdgeShaper>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct KernelEdgeShaper {
+    src: usize,
+    dst: usize,
+    bandwidth_bps: Option<u64>,
+    latency_ms: u64,
+    jitter_ms: u64,
+    loss_percent: String,
+}
+
+fn kernel_shaper(config: &dzb_core::ResolvedConfig) -> KernelShaper {
+    KernelShaper {
+        bandwidth_bps: dzb_runner::parse_shaper_bandwidth(
+            &config.original.network.shaper.bandwidth,
+        ),
+        latency_ms: dzb_core::parse_duration_millis(&config.original.network.shaper.latency)
+            .unwrap_or(0),
+        jitter_ms: dzb_core::parse_duration_millis(&config.original.network.shaper.jitter)
+            .unwrap_or(0),
+        loss_percent: config.original.network.shaper.loss.clone(),
+        edges: config
+            .original
+            .network
+            .shaper
+            .edges
+            .iter()
+            .map(|edge| KernelEdgeShaper {
+                src: edge.src,
+                dst: edge.dst,
+                bandwidth_bps: dzb_runner::parse_shaper_bandwidth(&edge.bandwidth),
+                latency_ms: dzb_core::parse_duration_millis(&edge.latency).unwrap_or(0),
+                jitter_ms: dzb_core::parse_duration_millis(&edge.jitter).unwrap_or(0),
+                loss_percent: edge.loss.clone(),
+            })
+            .collect(),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -608,12 +677,18 @@ struct AgentResponse {
     message: String,
     pid: Option<u32>,
     exit_code: Option<i32>,
+    #[serde(default)]
+    listen_addrs: Option<Vec<String>>,
+    #[serde(default)]
+    namespaces: Option<Vec<String>>,
 }
 
 struct AgentClient {
     child: Child,
     input: ChildStdin,
     output: ChildStdout,
+    listen_addrs: Vec<String>,
+    namespaces: Vec<String>,
 }
 
 impl AgentClient {
@@ -649,13 +724,55 @@ impl AgentClient {
             child,
             input,
             output,
+            listen_addrs: Vec::new(),
+            namespaces: Vec::new(),
         };
         let response = client.request(&serde_json::json!({"kind": "ping"}))?;
-        if response.ok {
-            Ok(client)
-        } else {
-            Err(response.message)
+        if !response.ok {
+            return Err(response.message);
         }
+        let prepared = client.request(&serde_json::json!({
+            "kind": "prepare_run",
+            "run_id": config.run_id,
+        }))?;
+        if !prepared.ok {
+            return Err(prepared.message);
+        }
+        if config.platform == Platform::Linux && config.original.network.mode == "netns_veth" {
+            let setup = client.request(&serde_json::json!({
+                "kind": "setup_network",
+                "run_id": config.run_id,
+                "world_size": config.original.roles.prover_ranks,
+                "base_port": config.original.network.base_port,
+                "topology": match config.original.topology.kind {
+                    TopologyKind::Star => "star",
+                    TopologyKind::FullMesh => "full-mesh",
+                },
+                "master_rank": config.original.roles.master_rank,
+                "worker_to_worker": config.original.topology.worker_to_worker,
+                "shaper": kernel_shaper(config),
+            }))?;
+            if !setup.ok {
+                return Err(setup.message);
+            }
+            client.listen_addrs = setup
+                .listen_addrs
+                .ok_or_else(|| "agent network response omitted addresses".to_owned())?;
+            client.namespaces = setup
+                .namespaces
+                .ok_or_else(|| "agent network response omitted namespaces".to_owned())?;
+        } else {
+            client.listen_addrs = (0..config.original.roles.prover_ranks)
+                .map(|rank| {
+                    format!(
+                        "127.0.0.1:{}",
+                        config.original.network.base_port as usize + rank
+                    )
+                })
+                .collect();
+            client.namespaces = vec![String::new(); config.original.roles.prover_ranks];
+        }
+        Ok(client)
     }
 
     fn launch(&mut self, launch: AgentLaunch) -> Result<u32, String> {
@@ -735,20 +852,13 @@ fn spawn_rank_processes(
     let tmp = result_dir.join("tmp");
     std::fs::create_dir_all(&logs).map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&tmp).map_err(|error| error.to_string())?;
-    let listen_addrs = (0..config.original.roles.prover_ranks)
-        .map(|rank| {
-            format!(
-                "127.0.0.1:{}",
-                config.original.network.base_port as usize + rank
-            )
-        })
-        .collect::<Vec<_>>();
+    let listen_addrs = agent.listen_addrs.clone();
     let proof_path = result_dir.join("proof.bin");
     let mut rank_ids = Vec::new();
     for rank in 0..config.original.roles.prover_ranks {
         let out = logs.join(format!("rank_{rank}.json"));
         let rank_config_path = tmp.join(format!("rank_{rank}.json"));
-        let rank_config = rank_runtime_config_from_resolved(
+        let mut rank_config = rank_runtime_config_from_resolved(
             config,
             rank,
             listen_addrs.clone(),
@@ -756,6 +866,9 @@ fn spawn_rank_processes(
             (rank == config.original.roles.master_rank)
                 .then(|| proof_path.to_string_lossy().into_owned()),
         )?;
+        if config.original.network.mode == "netns_veth" {
+            rank_config.shaper = dzb_runner::RankShaperConfig::default();
+        }
         write_json_pretty(&rank_config_path, &rank_config).map_err(|error| error.to_string())?;
         let mut env = std::collections::BTreeMap::new();
         env.insert(
@@ -792,6 +905,23 @@ fn spawn_rank_processes(
             cpuset: strict_cpuset(config, rank, config.original.resources.worker_threads),
             memory_limit_bytes: strict_memory_limit(config)?,
             strict_linux: config.platform == Platform::Linux && config.original.memory.cgroup,
+            namespace: agent
+                .namespaces
+                .get(rank)
+                .filter(|value| !value.is_empty())
+                .cloned(),
+            sample_path: Some(
+                logs.join("memory")
+                    .join(format!("rank_{rank}.csv"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            sample_interval_ms: dzb_core::parse_duration_millis(
+                &config.original.metrics.memory_sampling_interval,
+            )
+            .map_err(|error| error.to_string())?,
+            role: "rank".to_owned(),
+            rank: Some(rank),
         })?;
         rank_ids.push((rank, id));
     }
@@ -892,6 +1022,32 @@ fn adapter_command(config: &dzb_core::ResolvedConfig) -> Result<PathBuf, String>
     ))
 }
 
+fn execution_fingerprint(config: &dzb_core::ResolvedConfig) -> Result<String, String> {
+    let adapter = adapter_command(config)?;
+    let adapter_hash = std::fs::read(&adapter)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|error| format!("hash adapter {} failed: {error}", adapter.display()))?;
+    let framework_commit = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let framework_binary_hash = std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|bytes| sha256_hex(&bytes))
+        .unwrap_or_else(|| "unavailable".to_owned());
+    Ok(sha256_hex(
+        format!(
+            "{}\n{framework_commit}\n{framework_binary_hash}\n{adapter_hash}",
+            config.config_hash
+        )
+        .as_bytes(),
+    ))
+}
+
 fn sibling_executable(name: &str) -> Result<PathBuf, String> {
     let current = env::current_exe().map_err(|error| error.to_string())?;
     let Some(dir) = current.parent() else {
@@ -909,19 +1065,22 @@ fn sibling_executable(name: &str) -> Result<PathBuf, String> {
 }
 
 fn cmd_sweep(args: &[String]) -> Result<(), String> {
-    let config_path = if args.len() == 1 {
-        PathBuf::from(&args[0])
-    } else {
-        parse_config_arg(args)?
-    };
+    let rerun = args.iter().any(|arg| arg == "--rerun");
+    let config_path = args
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(PathBuf::from)
+        .or_else(|| value_after(args, "--config").map(PathBuf::from))
+        .ok_or_else(|| "dzb sweep requires <config.yaml>".to_owned())?;
     let config = load_config(&config_path).map_err(|error| error.to_string())?;
     let cells = expand_sweep(&config).map_err(|error| error.to_string())?;
-    let generated = Path::new(&config.experiment.output_dir)
-        .join(&config.experiment.name)
-        .join("sweep-configs");
+    let sweep_root = Path::new(&config.experiment.output_dir).join(&config.experiment.name);
+    let generated = sweep_root.join("sweep-configs");
     fs::create_dir_all(&generated).map_err(|error| error.to_string())?;
+    let mut state = SweepState::default();
     for (cell_index, mut cell) in cells.into_iter().enumerate() {
-        let cell_id = format!("cell-{cell_index:03}");
+        let cell_hash = dzb_core::semantic_config_hash(&cell).map_err(|error| error.to_string())?;
+        let cell_id = format!("cell-{cell_index:03}-{}", &cell_hash[..8]);
         let repetitions = cell.experiment.repetitions.max(1);
         let warmups = cell.experiment.warmups;
         cell.experiment.repetitions = 1;
@@ -932,13 +1091,23 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
                 "{}/warmups/{cell_id}/warmup-{warmup:03}",
                 config.experiment.name
             );
+            warmup_config.experiment.run_id =
+                dzb_core::new_run_id(&format!("{cell_id}-warmup-{warmup:03}"));
             let path = generated.join(format!("{cell_id}-warmup-{warmup:03}.yaml"));
             fs::write(
                 &path,
                 serde_yaml::to_string(&warmup_config).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
-            cmd_run(&[path.to_string_lossy().into_owned()])?;
+            run_or_resume_sweep_item(
+                &path,
+                &warmup_config,
+                &cell_id,
+                format!("warmup-{warmup:03}"),
+                rerun,
+                &mut state,
+                &sweep_root,
+            )?;
         }
         for repetition in 0..repetitions {
             let mut measured = cell.clone();
@@ -946,16 +1115,182 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
                 "{}/cells/{cell_id}/repetitions/{repetition:03}",
                 config.experiment.name
             );
+            measured.experiment.run_id =
+                dzb_core::new_run_id(&format!("{cell_id}-repetition-{repetition:03}"));
             let path = generated.join(format!("{cell_id}-repetition-{repetition:03}.yaml"));
             fs::write(
                 &path,
                 serde_yaml::to_string(&measured).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
-            cmd_run(&[path.to_string_lossy().into_owned()])?;
+            run_or_resume_sweep_item(
+                &path,
+                &measured,
+                &cell_id,
+                format!("repetition-{repetition:03}"),
+                rerun,
+                &mut state,
+                &sweep_root,
+            )?;
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SweepState {
+    schema_version: u32,
+    items: Vec<SweepStateItem>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SweepStateItem {
+    cell_id: String,
+    item: String,
+    execution_fingerprint: String,
+    status: String,
+    result_dir: String,
+}
+
+fn run_or_resume_sweep_item(
+    path: &Path,
+    config: &Config,
+    cell_id: &str,
+    item: String,
+    rerun: bool,
+    state: &mut SweepState,
+    sweep_root: &Path,
+) -> Result<(), String> {
+    let capability = capability_for_request(config.platform.backend)?;
+    let mut resolved =
+        resolve_config(config.clone(), capability).map_err(|error| error.to_string())?;
+    resolved.execution_fingerprint = execution_fingerprint(&resolved)?;
+    let experiment_root = Path::new(&config.experiment.output_dir).join(&config.experiment.name);
+    let existing = (!rerun)
+        .then(|| {
+            find_complete_artifact(
+                &experiment_root,
+                &resolved.execution_fingerprint,
+                config.roles.verifier_enabled,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let (status, result_dir) = if let Some(existing) = existing {
+        println!(
+            "resume: skipping verified {} {} at {}",
+            cell_id,
+            item,
+            existing.display()
+        );
+        (
+            "skipped".to_owned(),
+            existing.to_string_lossy().into_owned(),
+        )
+    } else {
+        cmd_run(&[path.to_string_lossy().into_owned()])?;
+        let completed = find_complete_artifact(
+            &experiment_root,
+            &resolved.execution_fingerprint,
+            config.roles.verifier_enabled,
+        )?
+        .ok_or_else(|| {
+            format!(
+                "completed sweep item {} {} has no valid artifact",
+                cell_id, item
+            )
+        })?;
+        (
+            "completed".to_owned(),
+            completed.to_string_lossy().into_owned(),
+        )
+    };
+    state.schema_version = 1;
+    state
+        .items
+        .retain(|entry| !(entry.cell_id == cell_id && entry.item == item));
+    state.items.push(SweepStateItem {
+        cell_id: cell_id.to_owned(),
+        item,
+        execution_fingerprint: resolved.execution_fingerprint,
+        status,
+        result_dir,
+    });
+    write_json_atomic(&sweep_root.join("sweep-state.json"), state)
+}
+
+fn find_complete_artifact(
+    root: &Path,
+    fingerprint: &str,
+    verifier_required: bool,
+) -> Result<Option<PathBuf>, String> {
+    if !root.exists() {
+        return Ok(None);
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+            {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|name| name == "run.json") {
+                let run_dir = path.parent().unwrap_or(root);
+                if artifact_is_complete(run_dir, fingerprint, verifier_required)? {
+                    return Ok(Some(run_dir.to_path_buf()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn artifact_is_complete(
+    run_dir: &Path,
+    fingerprint: &str,
+    verifier_required: bool,
+) -> Result<bool, String> {
+    let text = fs::read_to_string(run_dir.join("run.json")).map_err(|error| error.to_string())?;
+    let run: dzb_core::RunJson = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    if run.status != "ok" || run.execution_fingerprint != fingerprint {
+        return Ok(false);
+    }
+    let proof = fs::read(run_dir.join("proof.bin")).map_err(|error| error.to_string())?;
+    if sha256_hex(&proof) != run.proof_sha256 {
+        return Ok(false);
+    }
+    if let Some(expected) = &run.statement_sha256 {
+        let statement =
+            fs::read(run_dir.join("statement.bin")).map_err(|error| error.to_string())?;
+        if sha256_hex(&statement) != *expected {
+            return Ok(false);
+        }
+    }
+    if verifier_required {
+        let verifier =
+            fs::read_to_string(run_dir.join("verifier.json")).map_err(|error| error.to_string())?;
+        let verifier: serde_json::Value =
+            serde_json::from_str(&verifier).map_err(|error| error.to_string())?;
+        if verifier
+            .pointer("/process_report/verified")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let temp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    fs::write(&temp, bytes).map_err(|error| error.to_string())?;
+    fs::rename(temp, path).map_err(|error| error.to_string())
 }
 
 fn cmd_report(args: &[String]) -> Result<(), String> {
@@ -1002,7 +1337,7 @@ fn cmd_cleanup(args: &[String]) -> Result<(), String> {
     for target in targets {
         cleanup_cgroup_tree(&target)?;
     }
-    cleanup_named_network_resources(if all { "" } else { &safe_run_id })?;
+    cleanup_named_network_resources(if all { None } else { Some(run_id.as_str()) })?;
     println!(
         "cleanup complete: {}",
         if all {
@@ -1035,7 +1370,8 @@ fn cleanup_cgroup_tree(path: &Path) -> Result<(), String> {
     sudo_command("rmdir", &[path.to_string_lossy().as_ref()], None)
 }
 
-fn cleanup_named_network_resources(run_fragment: &str) -> Result<(), String> {
+fn cleanup_named_network_resources(run_id: Option<&str>) -> Result<(), String> {
+    let short = run_id.map(stable_run_short);
     let output = Command::new("ip")
         .args(["netns", "list"])
         .output()
@@ -1043,11 +1379,34 @@ fn cleanup_named_network_resources(run_fragment: &str) -> Result<(), String> {
     for name in String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.split_whitespace().next())
-        .filter(|name| name.starts_with("dzb") && name.contains(run_fragment))
+        .filter(|name| {
+            name.starts_with("dzb") && short.as_ref().is_none_or(|short| name.contains(short))
+        })
     {
         sudo_command("ip", &["netns", "del", name], None)?;
     }
+    let links = Command::new("ip")
+        .args(["-o", "link", "show", "type", "bridge"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    for name in String::from_utf8_lossy(&links.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|name| name.trim_end_matches(':'))
+        .filter(|name| {
+            name.starts_with("dzb") && short.as_ref().is_none_or(|short| name.contains(short))
+        })
+    {
+        sudo_command("ip", &["link", "del", name], None)?;
+    }
     Ok(())
+}
+
+fn stable_run_short(run_id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    run_id.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())[..6].to_owned()
 }
 
 fn sudo_command(command: &str, args: &[&str], input: Option<&str>) -> Result<(), String> {
@@ -1113,7 +1472,7 @@ fn value_after(args: &[String], key: &str) -> Option<String> {
 }
 
 fn usage() -> String {
-    "usage: dzb ui | dzb interactive | dzb preflight --config <yaml> | dzb run <yaml> | dzb report <results_dir> | dzb cleanup --run-id <id>".to_owned()
+    "usage: dzb ui | dzb interactive | dzb preflight --config <yaml> | dzb run <yaml> | dzb sweep <yaml> [--rerun] | dzb report <results_dir> | dzb cleanup --run-id <id> | dzb cleanup --all".to_owned()
 }
 
 fn interactive_usage() -> String {

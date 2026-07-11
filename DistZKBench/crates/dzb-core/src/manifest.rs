@@ -51,6 +51,10 @@ pub struct Manifest {
     pub toolchain: String,
     pub system: serde_json::Value,
     pub release_blockers: Vec<String>,
+    #[serde(default)]
+    pub config_hash: String,
+    #[serde(default)]
+    pub execution_fingerprint: String,
 }
 
 impl Manifest {
@@ -83,6 +87,8 @@ impl Manifest {
                 "vendored DeepFold redistribution permission is not recorded; internal validation only"
                     .to_owned(),
             ],
+            config_hash: config.config_hash.clone(),
+            execution_fingerprint: config.execution_fingerprint.clone(),
         }
     }
 }
@@ -130,6 +136,10 @@ pub struct RunJson {
     pub communication_precision: String,
     pub platform_evidence: serde_json::Value,
     pub best_effort_warning: Option<String>,
+    #[serde(default)]
+    pub config_hash: String,
+    #[serde(default)]
+    pub execution_fingerprint: String,
 }
 
 const fn run_schema_v2() -> u32 {

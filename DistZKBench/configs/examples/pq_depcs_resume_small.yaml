@@ -1,15 +1,15 @@
 schema_version: 2
 experiment:
-  name: gcp_strict_smoke_netns_v2
+  name: pq_depcs_resume_small
   run_id: auto
   output_dir: results
-  random_seed: 20260711
+  random_seed: 12345
   repetitions: 1
   warmups: 0
 platform:
-  backend: linux
+  backend: auto
 roles:
-  prover_ranks: 4
+  prover_ranks: 2
   master_rank: 0
   verifier_enabled: true
 topology:
@@ -17,32 +17,27 @@ topology:
   worker_to_worker: forbidden
   enforce_topology: true
 resources:
-  worker_threads: 4
+  worker_threads: 1
   verifier_threads: same_as_worker
-  no_overcommit: true
-  check_extra_threads: true
-memory:
-  per_rank_limit: 4GiB
-  cgroup: true
 network:
   transport: tcp
-  mode: netns_veth
-  base_port: 39400
+  mode: loopback
+  base_port: 39260
 metrics:
   memory_sampling_interval: 100ms
 protocol:
   adapter: pq-depcs-adapter
   mode: sdk-binary
-  command: ../pq_dPCS/target/release/pq-experiments
+  command: ../pq_dPCS/target/debug/pq-experiments
   prove_subcommand: dzb-prove
   verify_subcommand: dzb-verify
   parameters:
-    opening: protocol11-batch
+    opening: protocol11
     batch_claims: 2
-    nv: 10
+    nv: 8
     security: test-only
     queries: 2
-timeouts:
-  connection_setup_sec: 30
-  prove_sec: 600
-  verify_sec: 300
+sweep:
+  axes:
+    - path: protocol.parameters.opening
+      values: [protocol11, protocol11-batch]

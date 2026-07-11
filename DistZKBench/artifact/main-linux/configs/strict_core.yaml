@@ -27,10 +27,11 @@ cache:
 
 network:
   transport: tcp
-  mode: loopback
+  mode: netns_veth
   base_port: 39300
 
 metrics:
+  memory_sampling_interval: 100ms
   collect_perf: false
 
 protocol:

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::platform::{CapabilityReport, IsolationTier, Platform};
 use crate::run_id::new_run_id;
@@ -303,6 +304,7 @@ pub struct MetricsConfig {
     pub communication_breakdown: bool,
     pub chrome_trace: bool,
     pub collect_perf: bool,
+    pub memory_sampling_interval: String,
     pub output_formats: Vec<String>,
 }
 
@@ -313,6 +315,7 @@ impl Default for MetricsConfig {
             communication_breakdown: true,
             chrome_trace: true,
             collect_perf: false,
+            memory_sampling_interval: "100ms".to_owned(),
             output_formats: vec!["json".to_owned(), "csv".to_owned(), "html".to_owned()],
         }
     }
@@ -387,6 +390,22 @@ pub struct ResolvedConfig {
     pub result_dir: String,
     pub verifier_threads: usize,
     pub capability: CapabilityReport,
+    pub config_hash: String,
+    #[serde(default)]
+    pub execution_fingerprint: String,
+}
+
+pub fn semantic_config_hash(config: &Config) -> Result<String, ConfigError> {
+    let mut canonical = config.clone();
+    canonical.experiment.run_id = "auto".to_owned();
+    canonical.experiment.output_dir.clear();
+    canonical.experiment.name.clear();
+    canonical.experiment.repetitions = 1;
+    canonical.experiment.warmups = 0;
+    canonical.sweep.axes.clear();
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|error| ConfigError(format!("serialize canonical config failed: {error}")))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
@@ -523,6 +542,16 @@ pub fn resolve_config(
             capability.unsupported_features
         )));
     }
+    let sampling_ms = crate::parse_duration_millis(&config.metrics.memory_sampling_interval)
+        .map_err(|error| {
+            ConfigError(format!("invalid metrics.memory_sampling_interval: {error}"))
+        })?;
+    if sampling_ms == 0 {
+        return Err(ConfigError(
+            "metrics.memory_sampling_interval must be positive".to_owned(),
+        ));
+    }
+    let config_hash = semantic_config_hash(&config)?;
     let run_id = if config.experiment.run_id == "auto" {
         new_run_id(&config.experiment.name)
     } else {
@@ -549,6 +578,8 @@ pub fn resolve_config(
         result_dir,
         verifier_threads,
         capability,
+        config_hash,
+        execution_fingerprint: String::new(),
     })
 }
 
@@ -627,6 +658,21 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn semantic_hash_ignores_run_location_but_binds_protocol() {
+        let mut left = Config::default();
+        left.experiment.name = "left".to_owned();
+        left.experiment.output_dir = "one".to_owned();
+        left.experiment.run_id = "run-a".to_owned();
+        let mut right = left.clone();
+        right.experiment.name = "right".to_owned();
+        right.experiment.output_dir = "two".to_owned();
+        right.experiment.run_id = "run-b".to_owned();
+        assert_eq!(semantic_config_hash(&left), semantic_config_hash(&right));
+        right.protocol.parameters = serde_json::json!({"nv": 20});
+        assert_ne!(semantic_config_hash(&left), semantic_config_hash(&right));
     }
 
     #[test]

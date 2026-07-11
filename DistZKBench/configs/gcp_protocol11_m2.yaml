@@ -1,7 +1,7 @@
 schema_version: 2
 
 experiment:
-  name: protocol11_m2_paper100
+  name: protocol11_m2_paper100_netns_v2
   run_id: auto
   output_dir: results
   random_seed: 20260711
@@ -38,11 +38,12 @@ memory:
 
 network:
   transport: tcp
-  mode: loopback
+  mode: netns_veth
   base_port: 39300
 
 metrics:
   perf: false
+  memory_sampling_interval: 100ms
 
 protocol:
   adapter: pq-depcs-adapter

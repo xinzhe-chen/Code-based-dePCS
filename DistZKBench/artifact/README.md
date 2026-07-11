@@ -29,3 +29,8 @@ export DZB_LINUX_WORKDIR=/tmp/distzkbench-$USER
 ```
 
 The Linux strict artifact path expects `sudo -n true` to work.
+
+Headline Linux runs use one Agent-managed netns/veth per rank, kernel tc
+shaping, one persistent TCP connection per permitted peer edge, 100 ms memory
+sampling, and verified-artifact sweep resume. Multi-host orchestration and
+resctrl are intentionally out of scope.

@@ -48,6 +48,7 @@ pub fn write_outputs(
     write_custom_metrics(result_dir, output)?;
     write_rank_csv(result_dir, config, output)?;
     write_comm_matrix(result_dir, &output.communication)?;
+    write_network_stats(result_dir, output)?;
     write_memory_csv(result_dir, config, output)?;
     write_perf_csv(result_dir, config)?;
     fs::write(result_dir.join("proof.bin"), &output.proof.bytes)?;
@@ -98,9 +99,23 @@ pub fn write_outputs(
         best_effort_warning: config.capability.requires_best_effort_warning().then(|| {
             "macOS Apple Silicon backend uses best-effort resource isolation; do not compare directly with Linux strict-isolation results".to_owned()
         }),
+        config_hash: config.config_hash.clone(),
+        execution_fingerprint: config.execution_fingerprint.clone(),
     };
     write_json_pretty(&result_dir.join("run.json"), &run_json)?;
     Ok(run_json)
+}
+
+fn write_network_stats(result_dir: &Path, output: &ExperimentOutput) -> std::io::Result<()> {
+    let ranks = output
+        .ranks
+        .iter()
+        .map(|rank| serde_json::json!({"rank": rank.rank, "peers": rank.network_stats.peers}))
+        .collect::<Vec<_>>();
+    write_json_pretty(
+        &result_dir.join("network_stats.json"),
+        &serde_json::json!({"schema_version": 1, "ranks": ranks}),
+    )
 }
 
 fn write_events(result_dir: &Path, phases: &[PhaseEvent]) -> std::io::Result<()> {
@@ -236,14 +251,36 @@ fn write_memory_csv(
     output: &ExperimentOutput,
 ) -> std::io::Result<()> {
     let mut file = File::create(result_dir.join("memory_timeseries.csv"))?;
-    writeln!(file, "rank,time_ms,resident_bytes,source")?;
+    let header = "timestamp_ns,elapsed_ms,role,rank,pid,resident_bytes,virtual_bytes,cgroup_current_bytes,cgroup_peak_bytes,oom,source";
+    writeln!(file, "{header}")?;
+    let fragments = result_dir.join("logs/memory");
+    let mut copied = false;
+    if fragments.is_dir() {
+        let mut paths = fs::read_dir(&fragments)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "csv"))
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            let text = fs::read_to_string(path)?;
+            for line in text.lines().skip(1).filter(|line| !line.is_empty()) {
+                writeln!(file, "{line}")?;
+                copied = true;
+            }
+        }
+    }
+    if copied {
+        return Ok(());
+    }
     for rank in 0..config.original.roles.prover_ranks {
         let rank_output = output.ranks.iter().find(|item| item.rank == rank);
         let resident = rank_output
             .and_then(|item| item.resident_bytes)
             .unwrap_or(0);
         let source = rank_output.map_or("unavailable", |item| item.memory_source.as_str());
-        writeln!(file, "{rank},0,{resident},{source}")?;
+        let pid = rank_output.map_or(0, |item| item.pid);
+        writeln!(file, "0,0,rank,{rank},{pid},{resident},,,,,{source}")?;
     }
     Ok(())
 }
@@ -288,8 +325,9 @@ fn write_html_report(
     } else {
         ""
     };
+    let memory = memory_summary_html(result_dir, config)?;
     let html = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>DistZKBench report</title><h1>{}</h1>{}<table><tr><th>platform</th><td>{}</td></tr><tr><th>isolation</th><td>{}</td></tr><tr><th>communication precision</th><td>{}</td></tr><tr><th>proof bytes</th><td>{}</td></tr><tr><th>protocol bytes</th><td>{}</td></tr></table>",
+        "<!doctype html><meta charset=\"utf-8\"><title>DistZKBench report</title><h1>{}</h1>{}<table><tr><th>platform</th><td>{}</td></tr><tr><th>isolation</th><td>{}</td></tr><tr><th>communication precision</th><td>{}</td></tr><tr><th>proof bytes</th><td>{}</td></tr><tr><th>protocol bytes</th><td>{}</td></tr></table>{memory}",
         config.original.experiment.name,
         warning,
         config.platform.as_str(),
@@ -299,6 +337,52 @@ fn write_html_report(
         output.communication.total_payload_bytes()
     );
     fs::write(result_dir.join("report.html"), html)
+}
+
+fn memory_summary_html(result_dir: &Path, config: &ResolvedConfig) -> std::io::Result<String> {
+    let text = fs::read_to_string(result_dir.join("memory_timeseries.csv"))?;
+    let mut peaks = std::collections::BTreeMap::<String, (u64, usize, String)>::new();
+    let mut last = std::collections::BTreeMap::<String, f64>::new();
+    let expected =
+        dzb_core::parse_duration_millis(&config.original.metrics.memory_sampling_interval)
+            .unwrap_or(100) as f64;
+    let mut gaps = 0_usize;
+    for line in text.lines().skip(1) {
+        let fields = line.split(',').collect::<Vec<_>>();
+        if fields.len() < 11 {
+            continue;
+        }
+        let key = format!("{}:{}", fields[2], fields[3]);
+        let elapsed = fields[1].parse::<f64>().unwrap_or(0.0);
+        if last
+            .insert(key.clone(), elapsed)
+            .is_some_and(|previous| elapsed - previous > expected * 3.0)
+        {
+            gaps += 1;
+        }
+        let resident = fields[5].parse::<u64>().unwrap_or(0);
+        let cgroup_peak = fields[8].parse::<u64>().unwrap_or(0);
+        let peak = resident.max(cgroup_peak);
+        let entry = peaks.entry(key).or_insert((0, 0, fields[10].to_owned()));
+        entry.0 = entry.0.max(peak);
+        entry.1 += 1;
+    }
+    let rows = peaks
+        .into_iter()
+        .map(|(role, (peak, samples, source))| {
+            format!("<tr><td>{role}</td><td>{peak}</td><td>{samples}</td><td>{source}</td></tr>")
+        })
+        .collect::<String>();
+    let warning = if gaps > 0 {
+        format!(
+            "<p><strong>Memory sampling warning:</strong> {gaps} gaps exceeded 3x the configured interval.</p>"
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "<h2>Memory timeline</h2>{warning}<p>Full samples: <code>memory_timeseries.csv</code></p><table><tr><th>role</th><th>peak bytes</th><th>samples</th><th>source</th></tr>{rows}</table>"
+    ))
 }
 
 fn io_err(error: impl std::fmt::Display) -> std::io::Error {

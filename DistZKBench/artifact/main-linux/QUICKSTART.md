@@ -24,6 +24,24 @@ cargo build --release --locked
 Linux is the strict artifact backend. Strict cgroup, cpuset, netns/tc,
 and perf paths must fail closed when requested but unavailable.
 
+Formal Linux configs use Agent-managed rank-local network namespaces. The
+Agent creates the bridge/veth/tc hierarchy before launch, samples cgroup memory
+every 100 ms, and removes all run resources on success, failure, timeout, OOM,
+or cancellation. Validate that lifecycle directly with:
+
+```bash
+artifact/main-linux/scripts/agent_netns_acceptance.py target/release/dzb-agent
+```
+
+Sweeps resume verified cells by default. A cell is skipped only when its
+configuration/framework/adapter fingerprint and proof, statement, and verifier
+artifacts all match:
+
+```bash
+./target/release/dzb sweep configs/gcp_protocol11_m2.yaml
+./target/release/dzb sweep configs/gcp_protocol11_m2.yaml --rerun
+```
+
 Remote preflight:
 
 ```bash
@@ -33,21 +51,6 @@ export DZB_LINUX_WORKDIR=/tmp/distzkbench-$USER
 artifact/main-linux/scripts/remote_preflight.sh
 artifact/main-linux/scripts/remote_run_toy.sh
 ```
-
-Two-host local-vs-remote calibration:
-
-```bash
-export DZB_LINUX_SSH_A=user@host-a
-export DZB_LINUX_SSH_B=user@host-b
-export DZB_LINUX_IP_A=10.x.x.a
-export DZB_LINUX_IP_B=10.x.x.b
-export DZB_LINUX_KEY=/path/to/key        # optional
-artifact/main-linux/scripts/remote_two_host_calibration.sh
-```
-
-The two-host script first runs a local loopback two-rank all-to-all baseline on
-host A, then runs one rank per host over private TCP and writes a calibration
-summary under `results/twohost_calibration/<run-id>/`.
 
 Strict preflight config:
 

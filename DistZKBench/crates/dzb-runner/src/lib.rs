@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use dzb_core::{ResolvedConfig, TopologyKind, parse_byte_size, parse_duration_millis};
 use dzb_sdk::{
-    CustomMetric, PhaseEvent, ProofArtifact, ProverCtx, deterministic_bytes, deterministic_seed,
-    sha256_hex,
+    CustomMetric, NetworkStats, PhaseEvent, ProofArtifact, ProverCtx, deterministic_bytes,
+    deterministic_seed, sha256_hex,
 };
 use dzb_transport::{
     CommunicationCounters, Topology, UserspaceShaper, encode_frames, mio_accept, mio_bind,
@@ -48,6 +48,12 @@ pub struct RankRuntimeConfig {
     pub thread_budget: usize,
     pub shaper: RankShaperConfig,
     pub memory_limit_bytes: Option<u64>,
+    #[serde(default = "default_connection_timeout_sec")]
+    pub connection_timeout_sec: u64,
+}
+
+const fn default_connection_timeout_sec() -> u64 {
+    30
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -91,6 +97,8 @@ pub struct RankRuntimeOutput {
     pub thermal_start: String,
     pub thermal_end: String,
     pub thermal_source: String,
+    #[serde(default)]
+    pub network_stats: NetworkStats,
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +292,7 @@ pub fn run_rank_config(config: &RankRuntimeConfig) -> Result<RankRuntimeOutput, 
         thermal_start: thermal_start.state,
         thermal_end: thermal_end.state,
         thermal_source: thermal_end.source,
+        network_stats: NetworkStats::default(),
     };
     let text = serde_json::to_string_pretty(&output)
         .map_err(|error| format!("serialize rank output failed: {error}"))?;
@@ -349,6 +358,7 @@ pub fn rank_runtime_config_from_resolved(
                 .collect(),
         },
         memory_limit_bytes: parse_byte_size(&config.original.memory.per_rank_limit).ok(),
+        connection_timeout_sec: config.original.timeouts.connection_setup_sec,
     })
 }
 
@@ -481,7 +491,7 @@ fn assemble_toy_proof(config: &RankRuntimeConfig) -> Vec<u8> {
     .into_bytes()
 }
 
-fn parse_shaper_bandwidth(value: &str) -> Option<u64> {
+pub fn parse_shaper_bandwidth(value: &str) -> Option<u64> {
     let trimmed = value.trim();
     if trimmed == "0" || trimmed.is_empty() {
         return None;

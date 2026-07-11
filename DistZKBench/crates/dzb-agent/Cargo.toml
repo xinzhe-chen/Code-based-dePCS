@@ -9,6 +9,7 @@ dzb-core = { path = "../dzb-core" }
 dzb-platform = { path = "../dzb-platform" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+ctrlc = { workspace = true }
 
 [lints]
 workspace = true
