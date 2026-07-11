@@ -1071,8 +1071,8 @@ def build_fair_schedule(args: argparse.Namespace) -> list[dict]:
     rows: list[dict] = []
     index = 1
     fixed_scheme_order = [
-        ("depcs", "depcs-deepfold-paper-protocol11", "deepfold", "protocol11"),
-        ("depcs", "depcs-deepfold-paper-protocol11-batch", "deepfold", "protocol11-batch"),
+        ("depcs", "depcs-deepfold-protocol11", "deepfold", "protocol11"),
+        ("depcs", "depcs-deepfold-protocol11-batch", "deepfold", "protocol11-batch"),
         ("ligesis", "LigeSIS", None),
         ("external", "dFRIttata", "dfrittata-pcs"),
         ("external", "dPIP-FRI", "dpip-fri-pcs"),
@@ -1189,8 +1189,8 @@ def annotate_run_context(rows: list[MetricRow], args: argparse.Namespace) -> Non
                 row.query_count_semantics = "scheme-native-ligesis"
             elif row.scheme in {"dFRIttata-PCS", "dPIP-FRI-PCS"}:
                 row.query_count_semantics = "scheme-native-external"
-            elif "paper-protocol11" in row.scheme:
-                row.query_count_semantics = "paper-backed-protocol11-artifact"
+            elif "protocol11" in row.scheme:
+                row.query_count_semantics = "protocol11-profile-from-artifact"
             else:
                 row.query_count_semantics = "query-unified"
         row.query_count_target = (
@@ -2844,7 +2844,7 @@ def blocked_metric_row(row: dict, args: argparse.Namespace, failure_reason: str)
         max_workers=args.max_workers,
         cores_per_worker=int(row.get("cores_per_worker") or args.cores_per_worker or 1),
         backend_source="deepfold-bench-v0.1-paper-artifact",
-        field="Mersenne61Ext" if row.get("kind") == "depcs" else "",
+        field="Ft255" if row.get("kind") == "depcs" else "",
         hash="Blake3" if row.get("kind") == "depcs" else "",
         code_rate_log=1 if backend == "deepfold" and rate_inv == 2 else 0,
         security_target_bits=security_bits,

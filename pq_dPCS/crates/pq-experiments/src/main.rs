@@ -7,20 +7,17 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Instant, SystemTime};
 
+use pq_pcs::depcs::protocol11::{self as protocol11, Protocol11Config, SecurityProfile};
 use pq_pcs::depcs::{
     self, PAPER_PCS_HASH, PAPER_PCS_LICENSE, PAPER_PCS_SECURITY_BITS, PAPER_PCS_SOURCE_REV,
-    PAPER_PCS_SOURCE_URL, PaperDepcsConfig, PaperPcsBackend, PaperProtocol11Commitment,
-    PaperProtocol11Proof, PaperWorkerCache,
+    PAPER_PCS_SOURCE_URL, PaperPcsBackend,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 mod network;
 
-use network::{
-    PcsNetworkWorkerClient, PcsWorkerRequest, PcsWorkerResponse, read_frame_binary,
-    send_worker_requests_concurrently, shutdown_pcs_network_workers, spawn_pcs_network_workers,
-    write_frame_binary,
-};
+use network::{PcsWorkerRequest, PcsWorkerResponse, read_frame_binary, write_frame_binary};
 
 const PCS_SOURCE_CSV_HEADER: &str = "scheme,backend,backend_rate_inv,effective_query_count,column_query_count,pcs_query_count,query_security_bits,algebraic_security_bits,batch_claim_count,batch_open_ms,batch_verify_ms,batch_proof_bytes,runner,opening,trial,workers,nv,polynomial_length,t_rows_per_worker,paper_b_target,shard_len,pcs_queries_requested,pcs_queries_effective,partition_ms,worker_commit_ms,master_commit_ms,commit_ms,open_ms,verify_ms,paper_worker_commit_max_ms,paper_worker_commit_sum_ms,paper_worker_open_max_ms,paper_worker_open_sum_ms,paper_master_assemble_ms,paper_worker_verify_max_ms,paper_worker_verify_sum_ms,paper_master_verify_ms,paper_batch_claim_ms,paper_batch_sumcheck_ms,paper_batch_combined_open_ms,paper_batch_merkle_ms,paper_batch_verify_ms,paper_individual_worker_proof_count,paper_batched_proof_count,worker_eval_commit_ms,column_open_ms,f2_open_ms,protocol10_e1_sumcheck_ms,protocol10_e1_open_ms,protocol10_e1_opening_batch_open_ms,protocol10_e1_hu_open_ms,protocol10_e1_e_at_r_open_ms,protocol10_e1_f_at_u_prime_open_ms,protocol10_e1_e_systematic_open_ms,protocol10_e2_sumcheck_ms,protocol10_e2_open_ms,protocol10_e2_opening_batch_open_ms,protocol10_e2_hu_open_ms,protocol10_e2_e_at_r_open_ms,protocol10_e2_f_at_u_prime_open_ms,protocol10_e2_e_systematic_open_ms,proof_size_accounting_ms,column_verify_ms,f2_verify_ms,protocol10_e1_verify_ms,protocol10_e2_verify_ms,proof_commitment_object_bytes,proof_point_query_public_bytes,proof_eval_commitments_bytes,proof_merkle_roots_bytes,proof_column_openings_bytes,proof_f2_openings_bytes,proof_protocol10_e1_bytes,proof_protocol10_e2_bytes,proof_transcript_overhead_bytes,proof_p10_e1_commitments_bytes,proof_p10_e1_public_scalars_bytes,proof_p10_e1_opening_batch_bytes,proof_p10_e1_hu_opening_bytes,proof_p10_e1_sumcheck_bytes,proof_p10_e1_e_at_r_openings_bytes,proof_p10_e1_f_at_u_prime_openings_bytes,proof_p10_e1_e_systematic_openings_bytes,proof_p10_e2_commitments_bytes,proof_p10_e2_public_scalars_bytes,proof_p10_e2_opening_batch_bytes,proof_p10_e2_hu_opening_bytes,proof_p10_e2_sumcheck_bytes,proof_p10_e2_e_at_r_openings_bytes,proof_p10_e2_f_at_u_prime_openings_bytes,proof_p10_e2_e_systematic_openings_bytes,proof_bytes,communication_bytes,verifier_communication_bytes,scheme_reported_communication_bytes,communication_basis,network_commit_bytes,network_open_bytes,network_bytes,host_logical_cores,cores_per_worker,core_affinity,backend_source,field,hash,code_rate_log,security_target_bits,security_effective_bits,security_exact,query_count_semantics,source_rev,verified,failure_reason";
 const PCS_COMPARISON_CSV_HEADER: &str = "backend,nv,polynomial_length,backend_rate_inv,code_rate_log,security_bits,query_count,query_policy,workers,cores_per_worker,commit_ms,open_ms,verify_ms,proof_bytes,commitment_bytes,communication_bytes,verifier_communication_bytes,scheme_reported_communication_bytes,communication_basis,network_bytes,verified,failure_reason,source_rev,source_url,license,field,hash,opening,backend_source,security_target_bits,security_effective_bits,security_exact,query_count_semantics";
@@ -86,6 +83,7 @@ struct PcsBenchmarkCommand {
     backend: PaperPcsBackend,
     backend_rate_inv: usize,
     out_dir: PathBuf,
+    allow_insecure_test_profile: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -98,7 +96,31 @@ struct PcsBenchmarkJob {
     backend: PaperPcsBackend,
     backend_rate_inv: usize,
     cores_per_worker: usize,
+    allow_insecure_test_profile: bool,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Protocol11Artifact {
+    protocol_version: String,
+    pcs_instantiation: String,
+    fidelity: String,
+    field: String,
+    security_model: String,
+    soundness_regime: String,
+    security_claim: Option<usize>,
+    release_blocker: String,
+    public_parameters: protocol11::PublicParameters,
+    commitment: protocol11::Protocol11Commitment,
+    point: Vec<depcs::PaperField>,
+    claimed_value: depcs::PaperField,
+    proof: Vec<u8>,
+}
+
+type PcsJobOutput = (
+    PcsMetricRecord,
+    Vec<PhaseTimingRecord>,
+    Option<Protocol11Artifact>,
+);
 
 #[derive(Clone, Debug)]
 struct VerifyPcsResultsCommand {
@@ -238,32 +260,6 @@ struct PhaseTimingRecord {
     commit_ms: f64,
     open_ms: f64,
     verify_ms: f64,
-}
-
-struct PcsNetworkWorkerState {
-    worker_id: usize,
-    paper_config: Option<PaperDepcsConfig>,
-    paper_cache: Option<PaperWorkerCache>,
-}
-
-struct PaperPcsNetworkRun {
-    commitment: PaperProtocol11Commitment,
-    proof: PaperProtocol11Proof,
-    open_profile: depcs::PaperProtocol11OpenProfile,
-    verify_profile: depcs::PaperProtocol11VerifyProfile,
-    commit_ms: f64,
-    open_ms: f64,
-    verify_ms: f64,
-    paper_worker_commit_max_ms: f64,
-    paper_worker_commit_sum_ms: f64,
-    paper_worker_open_max_ms: f64,
-    paper_worker_open_sum_ms: f64,
-    paper_master_assemble_ms: f64,
-    paper_worker_verify_max_ms: f64,
-    paper_worker_verify_sum_ms: f64,
-    paper_master_verify_ms: f64,
-    network_commit_bytes: usize,
-    network_open_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -415,93 +411,18 @@ fn run_pcs_network_worker(args: &[String]) -> Result<(), CliError> {
 }
 
 fn serve_pcs_network_worker_stream(stream: &mut TcpStream) -> Result<(), CliError> {
-    let mut state: Option<PcsNetworkWorkerState> = None;
-    loop {
-        let (request, _bytes_recv): (PcsWorkerRequest, usize) = read_frame_binary(stream)
-            .map_err(|error| CliError(format!("worker read failed: {error}")))?;
-        let response = match request {
-            PcsWorkerRequest::PaperCommitSeeded {
-                original_len,
-                workers,
-                worker_id,
-                config,
-            } => {
-                let start = Instant::now();
-                match depcs::commit_worker_cached(original_len, workers, worker_id, config) {
-                    Ok(cache) => {
-                        let elapsed_ms = elapsed_ms(start);
-                        let commitment = cache.commitment.clone();
-                        state = Some(PcsNetworkWorkerState {
-                            worker_id,
-                            paper_config: Some(config),
-                            paper_cache: Some(cache),
-                        });
-                        PcsWorkerResponse::PaperCommit {
-                            commitment,
-                            elapsed_ms,
-                        }
-                    }
-                    Err(error) => PcsWorkerResponse::Error {
-                        message: format!("{error:?}"),
-                    },
-                }
-            }
-            PcsWorkerRequest::PaperOpen { commitment, point } => {
-                let start = Instant::now();
-                if let Some(state) = state.as_mut() {
-                    if state
-                        .paper_config
-                        .is_some_and(|config| config != commitment.config)
-                    {
-                        PcsWorkerResponse::Error {
-                            message: "paper open commitment config does not match committed shard"
-                                .to_owned(),
-                        }
-                    } else if let Some(cache) = state.paper_cache.take() {
-                        match depcs::open_worker_cached(cache, &commitment, &point) {
-                            Ok(opening) => PcsWorkerResponse::PaperOpen {
-                                opening,
-                                elapsed_ms: elapsed_ms(start),
-                            },
-                            Err(error) => PcsWorkerResponse::Error {
-                                message: format!("{error:?}"),
-                            },
-                        }
-                    } else if state.paper_config.is_none() {
-                        PcsWorkerResponse::Error {
-                            message: "worker has no paper-backed committed shard".to_owned(),
-                        }
-                    } else {
-                        match depcs::open_worker(&commitment, state.worker_id, &point) {
-                            Ok(opening) => PcsWorkerResponse::PaperOpen {
-                                opening,
-                                elapsed_ms: elapsed_ms(start),
-                            },
-                            Err(error) => PcsWorkerResponse::Error {
-                                message: format!("{error:?}"),
-                            },
-                        }
-                    }
-                } else {
-                    PcsWorkerResponse::Error {
-                        message: "worker has no committed shard".to_owned(),
-                    }
-                }
-            }
-            PcsWorkerRequest::Shutdown => {
-                write_frame_binary(stream, &PcsWorkerResponse::Ack)
-                    .map_err(|error| CliError(format!("worker shutdown ack failed: {error}")))?;
-                return Ok(());
-            }
-        };
-        write_frame_binary(stream, &response)
-            .map_err(|error| CliError(format!("worker write failed: {error}")))?;
+    let (request, _bytes_recv): (PcsWorkerRequest, usize) = read_frame_binary(stream)
+        .map_err(|error| CliError(format!("worker read failed: {error}")))?;
+    match request {
+        PcsWorkerRequest::Shutdown => write_frame_binary(stream, &PcsWorkerResponse::Ack)
+            .map(|_| ())
+            .map_err(|error| CliError(format!("worker shutdown ack failed: {error}"))),
     }
 }
 
 fn parse_pcs_benchmark_command(args: &[String]) -> Result<PcsBenchmarkCommand, CliError> {
     let mut sizes = vec![1024];
-    let mut workers = vec![1, 2];
+    let mut workers = vec![2];
     let mut cores_per_worker = env_cores_per_worker();
     let mut pcs_queries = 1;
     let mut security_bits_override: Option<usize> = None;
@@ -511,6 +432,7 @@ fn parse_pcs_benchmark_command(args: &[String]) -> Result<PcsBenchmarkCommand, C
     let mut backend_rate_inv: Option<usize> = None;
     let mut out_dir = PathBuf::from("results");
     let mut runner = "local-network".to_owned();
+    let mut allow_insecure_test_profile = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -562,6 +484,7 @@ fn parse_pcs_benchmark_command(args: &[String]) -> Result<PcsBenchmarkCommand, C
             "--out" => out_dir = PathBuf::from(next_value(args, &mut index, "--out")?),
             // Retained for CLI compatibility; the paper artifact path has no warmup phase.
             "--no-pcs-warmup" => {}
+            "--allow-insecure-test-profile" => allow_insecure_test_profile = true,
             "--worker-power-range" => {
                 workers =
                     parse_worker_power_range(next_value(args, &mut index, "--worker-power-range")?)?
@@ -624,6 +547,7 @@ fn parse_pcs_benchmark_command(args: &[String]) -> Result<PcsBenchmarkCommand, C
         backend,
         backend_rate_inv,
         out_dir,
+        allow_insecure_test_profile,
     })
 }
 
@@ -679,7 +603,7 @@ fn run_pcs_benchmark(command: PcsBenchmarkCommand) -> Result<(), CliError> {
                         trial,
                         command.repeats
                     );
-                    let (record, job_timings) = run_single_pcs_job(PcsBenchmarkJob {
+                    let (record, job_timings, artifact) = run_single_pcs_job(PcsBenchmarkJob {
                         size: *size,
                         workers: *workers,
                         opening,
@@ -688,7 +612,20 @@ fn run_pcs_benchmark(command: PcsBenchmarkCommand) -> Result<(), CliError> {
                         backend: command.backend,
                         backend_rate_inv: command.backend_rate_inv,
                         cores_per_worker: command.cores_per_worker,
+                        allow_insecure_test_profile: command.allow_insecure_test_profile,
                     })?;
+                    if let Some(artifact) = artifact {
+                        let bytes = bincode::serialize(&artifact).map_err(|error| {
+                            CliError(format!("serialize Protocol 11 artifact failed: {error}"))
+                        })?;
+                        fs::write(
+                            run_dir.join(format!("protocol11-proof-{job_index}.bin")),
+                            bytes,
+                        )
+                        .map_err(|error| {
+                            CliError(format!("write Protocol 11 artifact failed: {error}"))
+                        })?;
+                    }
                     timings.extend(job_timings);
                     records.push(record);
                 }
@@ -758,304 +695,304 @@ fn run_pcs_benchmark(command: PcsBenchmarkCommand) -> Result<(), CliError> {
     Ok(())
 }
 
-fn run_paper_network_protocol11(
-    original_len: usize,
-    workers: usize,
-    config: PaperDepcsConfig,
-    cores_per_worker: usize,
-) -> Result<PaperPcsNetworkRun, CliError> {
-    let mut clients = spawn_pcs_network_workers(workers, cores_per_worker)?;
-    let result =
-        run_paper_network_protocol11_with_clients(original_len, workers, config, &mut clients);
-    shutdown_pcs_network_workers(&mut clients);
-    result
-}
-
-fn run_paper_network_protocol11_with_clients(
-    original_len: usize,
-    workers: usize,
-    config: PaperDepcsConfig,
-    clients: &mut [PcsNetworkWorkerClient],
-) -> Result<PaperPcsNetworkRun, CliError> {
-    let commit_start = Instant::now();
-    let commit_requests = (0..workers)
-        .map(|worker_id| PcsWorkerRequest::PaperCommitSeeded {
-            original_len,
-            workers,
-            worker_id,
-            config,
-        })
-        .collect::<Vec<_>>();
-    let commit_responses =
-        send_worker_requests_concurrently(clients, &commit_requests, "paper worker commit")?;
-    let mut worker_commitments = Vec::with_capacity(workers);
-    let mut worker_commit_times = Vec::with_capacity(workers);
-    for response in commit_responses {
-        match response {
-            PcsWorkerResponse::PaperCommit {
-                commitment,
-                elapsed_ms,
-            } => {
-                worker_commitments.push(commitment);
-                worker_commit_times.push(elapsed_ms);
-            }
-            PcsWorkerResponse::Error { message } => {
-                return Err(CliError(format!("paper worker commit failed: {message}")));
-            }
-            other => {
-                return Err(CliError(format!(
-                    "unexpected paper worker commit response: {other:?}"
-                )));
-            }
-        }
-    }
-    let network_commit_bytes = clients
-        .iter()
-        .map(|client| client.bytes_sent + client.bytes_recv)
-        .sum::<usize>();
-    let commitment =
-        depcs::commit_from_worker_commitments(original_len, workers, config, worker_commitments)
-            .map_err(|error| CliError(format!("assemble paper commitment failed: {error:?}")))?;
-    let commit_ms = elapsed_ms(commit_start);
-
-    let point = depcs::sample_point(commitment.nv);
-    let open_start = Instant::now();
-    let open_requests = (0..workers)
-        .map(|_| PcsWorkerRequest::PaperOpen {
-            commitment: commitment.clone(),
-            point: point.clone(),
-        })
-        .collect::<Vec<_>>();
-    let open_responses =
-        send_worker_requests_concurrently(clients, &open_requests, "paper worker open")?;
-    let mut worker_openings = Vec::with_capacity(workers);
-    let mut worker_open_times = Vec::with_capacity(workers);
-    for response in open_responses {
-        match response {
-            PcsWorkerResponse::PaperOpen {
-                opening,
-                elapsed_ms,
-            } => {
-                worker_openings.push(opening);
-                worker_open_times.push(elapsed_ms);
-            }
-            PcsWorkerResponse::Error { message } => {
-                return Err(CliError(format!("paper worker open failed: {message}")));
-            }
-            other => {
-                return Err(CliError(format!(
-                    "unexpected paper worker open response: {other:?}"
-                )));
-            }
-        }
-    }
-    let network_total_after_open = clients
-        .iter()
-        .map(|client| client.bytes_sent + client.bytes_recv)
-        .sum::<usize>();
-    let network_open_bytes = network_total_after_open.saturating_sub(network_commit_bytes);
-    let assemble_start = Instant::now();
-    let (proof, open_profile) = depcs::assemble_opening(&commitment, point, worker_openings)
-        .map_err(|error| {
-            CliError(format!(
-                "assemble paper Protocol 11 proof failed: {error:?}"
-            ))
-        })?;
-    let paper_master_assemble_ms = elapsed_ms(assemble_start);
-    let open_ms = elapsed_ms(open_start);
-    let verify_start = Instant::now();
-    let verify_profile = depcs::verify(&commitment, &proof)
-        .map_err(|error| CliError(format!("verify paper Protocol 11 proof failed: {error:?}")))?;
-    let verify_ms = elapsed_ms(verify_start);
-    Ok(PaperPcsNetworkRun {
-        commitment,
-        proof,
-        open_profile,
-        verify_profile,
-        commit_ms,
-        open_ms,
-        verify_ms,
-        paper_worker_commit_max_ms: max_f64(&worker_commit_times),
-        paper_worker_commit_sum_ms: sum_f64(&worker_commit_times),
-        paper_worker_open_max_ms: max_f64(&worker_open_times),
-        paper_worker_open_sum_ms: sum_f64(&worker_open_times),
-        paper_master_assemble_ms,
-        paper_worker_verify_max_ms: verify_profile.paper_worker_verify_max_ms,
-        paper_worker_verify_sum_ms: verify_profile.paper_worker_verify_sum_ms,
-        paper_master_verify_ms: verify_profile.paper_master_verify_ms,
-        network_commit_bytes,
-        network_open_bytes,
-    })
-}
-
-fn max_f64(values: &[f64]) -> f64 {
-    values.iter().copied().fold(0.0, f64::max)
-}
-
-fn sum_f64(values: &[f64]) -> f64 {
-    values.iter().sum()
-}
-
-fn run_single_pcs_job(
-    job: PcsBenchmarkJob,
-) -> Result<(PcsMetricRecord, Vec<PhaseTimingRecord>), CliError> {
+fn run_single_pcs_job(job: PcsBenchmarkJob) -> Result<PcsJobOutput, CliError> {
     match job.opening {
         PcsOpeningVariant::Protocol11 => run_single_depcs_job(job),
         PcsOpeningVariant::Protocol11Batch => run_single_depcs_batch_job(job),
     }
 }
 
-fn run_single_depcs_job(
-    job: PcsBenchmarkJob,
-) -> Result<(PcsMetricRecord, Vec<PhaseTimingRecord>), CliError> {
+fn run_single_depcs_job(job: PcsBenchmarkJob) -> Result<PcsJobOutput, CliError> {
     let paper_backend = job.backend;
-    let config = PaperDepcsConfig::new(paper_backend, job.backend_rate_inv)
-        .map_err(|error| CliError(format!("invalid paper dePCS config: {error:?}")))?;
+    if paper_backend != PaperPcsBackend::DeepFold || job.backend_rate_inv != 2 {
+        return Err(CliError(
+            "protocol11 supports the DeepFold rate-1/2 instantiation only".to_owned(),
+        ));
+    }
     validate_partition_shape(job.size, job.workers)?;
     let host_logical_cores = std::thread::available_parallelism().map_or(1, usize::from);
     let partition_start = Instant::now();
+    let mut paper_config = Protocol11Config {
+        original_len: job.size,
+        workers: job.workers,
+        security: SecurityProfile::Paper100,
+    };
+    let setup_seed = depcs_fixture_seed(job.size, job.workers, job.trial);
+    let pp = match protocol11::setup(paper_config, setup_seed) {
+        Ok(pp) => pp,
+        Err(protocol11::Protocol11Error::InsecureParameters) => {
+            if !job.allow_insecure_test_profile {
+                return Err(CliError(
+                    "Paper100 does not fit this domain; pass --allow-insecure-test-profile only for a TestOnly smoke"
+                        .to_owned(),
+                ));
+            }
+            paper_config.security = SecurityProfile::TestOnly {
+                queries: job.pcs_queries.max(1),
+            };
+            protocol11::setup(paper_config, setup_seed).map_err(|error| {
+                CliError(format!(
+                    "construct protocol11 test parameters failed: {error}"
+                ))
+            })?
+        }
+        Err(error) => {
+            return Err(CliError(format!(
+                "construct protocol11 parameters failed: {error}"
+            )));
+        }
+    };
+    let evaluations = (0..job.size)
+        .map(|index| {
+            depcs::PaperField::from_parts(
+                ((index as u64 + 3) * 17) & ((1_u64 << 61) - 1),
+                ((index as u64 + 11) * 23) & ((1_u64 << 61) - 1),
+            )
+        })
+        .collect::<Vec<_>>();
     let partition_ms = elapsed_ms(partition_start);
-    let network_run =
-        run_paper_network_protocol11(job.size, job.workers, config, job.cores_per_worker)?;
-    let commitment_bytes = depcs::commitment_size_bytes(&network_run.commitment);
-    let opening_proof_bytes = depcs::proof_size_bytes(&network_run.proof);
-    let proof_size_breakdown = depcs::proof_size_breakdown(&network_run.proof);
-    let proof_size_accounting_ms = 0.0;
+    let commit_start = Instant::now();
+    let (commitment, states) = protocol11::commit_global(&pp, evaluations)
+        .map_err(|error| CliError(format!("protocol11 commit failed: {error}")))?;
+    let commit_ms = elapsed_ms(commit_start);
+    let point = (0..pp.layout.nv)
+        .map(|index| {
+            depcs::PaperField::from_parts((index as u64 + 5) * 19, (index as u64 + 7) * 23)
+        })
+        .collect::<Vec<_>>();
+    let open_start = Instant::now();
+    let (claimed_value, proof) = protocol11::prove_fs(&pp, &commitment, states, &point)
+        .map_err(|error| CliError(format!("protocol11 prove failed: {error}")))?;
+    let open_ms = elapsed_ms(open_start);
+    let verify_start = Instant::now();
+    protocol11::verify_fs(&pp, &commitment, &point, claimed_value, &proof)
+        .map_err(|error| CliError(format!("protocol11 verify failed: {error}")))?;
+    let verify_ms = elapsed_ms(verify_start);
+    let proof_size_start = Instant::now();
+    let commitment_bytes = protocol11::serialize_commitment(&commitment)
+        .map_err(|error| CliError(format!("serialize protocol11 commitment failed: {error}")))?
+        .len();
+    let opening_proof_bytes = protocol11::proof_size_bytes(&proof)
+        .map_err(|error| CliError(format!("size protocol11 proof failed: {error}")))?;
+    let eval_commitment_bytes = bincode::serialize(&proof.eval_commitments)
+        .map_err(|error| CliError(format!("size eval commitments failed: {error}")))?
+        .len();
+    let column_opening_bytes = bincode::serialize(&proof.worker_openings)
+        .map_err(|error| CliError(format!("size column openings failed: {error}")))?
+        .len();
+    let f2_opening_bytes = proof
+        .worker_openings
+        .iter()
+        .map(|worker| bincode::serialize(&worker.f2_at_s2).map(|bytes| bytes.len()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| CliError(format!("size F2 openings failed: {error}")))?
+        .into_iter()
+        .sum::<usize>();
+    let p10_e1_bytes = bincode::serialize(&proof.protocol10_e1)
+        .map_err(|error| CliError(format!("size Protocol 10 E1 failed: {error}")))?
+        .len();
+    let p10_e2_bytes = bincode::serialize(&proof.protocol10_e2)
+        .map_err(|error| CliError(format!("size Protocol 10 E2 failed: {error}")))?
+        .len();
+    let p10_e1_sumcheck_bytes = bincode::serialize(&proof.protocol10_e1.rounds)
+        .map_err(|error| CliError(format!("size E1 sumcheck failed: {error}")))?
+        .len();
+    let p10_e2_sumcheck_bytes = bincode::serialize(&proof.protocol10_e2.rounds)
+        .map_err(|error| CliError(format!("size E2 sumcheck failed: {error}")))?
+        .len();
+    let proof_size_accounting_ms = elapsed_ms(proof_size_start);
     let proof_bytes = commitment_bytes + opening_proof_bytes;
-    let network_commit_bytes = network_run.network_commit_bytes;
-    let network_open_bytes = network_run.network_open_bytes;
-    let network_bytes = network_commit_bytes + network_open_bytes;
-    let effective_queries = config.query_count();
-    let scheme = "depcs-deepfold-paper-protocol11";
+    let effective_queries = pp.security.pcs_queries;
+    let security_target = pp.security.target_bits.unwrap_or(0);
+    let security_effective = pp.security.effective_bits.unwrap_or(0);
+    let unmeasured = -1.0;
+    let scheme = "depcs-deepfold-protocol11";
     let record = PcsMetricRecord {
         scheme: scheme.to_owned(),
         backend: paper_backend.as_str().to_owned(),
-        backend_rate_inv: config.rate_inv,
+        backend_rate_inv: 2,
         effective_query_count: effective_queries,
-        column_query_count: network_run.verify_profile.column_query_count,
-        pcs_query_count: network_run.verify_profile.pcs_query_count,
-        query_security_bits: network_run.verify_profile.query_security_bits,
-        algebraic_security_bits: network_run.verify_profile.algebraic_security_bits,
-        batch_claim_count: network_run.proof.opening_batch.claim_count,
-        batch_open_ms: network_run.open_ms,
-        batch_verify_ms: network_run.verify_ms,
-        batch_proof_bytes: opening_proof_bytes,
-        runner: "paper-network-protocol11".to_owned(),
+        column_query_count: pp.security.column_queries,
+        pcs_query_count: pp.security.pcs_queries,
+        query_security_bits: security_effective,
+        algebraic_security_bits: pp.security.algebraic_bits,
+        batch_claim_count: 0,
+        batch_open_ms: unmeasured,
+        batch_verify_ms: unmeasured,
+        batch_proof_bytes: 0,
+        runner: "protocol11-local".to_owned(),
         opening: job.opening.as_str().to_owned(),
         trial: job.trial,
         workers: job.workers,
         variable_count: variable_count(job.size),
         polynomial_length: job.size,
-        t_rows_per_worker: network_run.commitment.shard_len,
-        paper_b_target: network_run.commitment.original_len,
-        shard_len: network_run.commitment.shard_len,
+        t_rows_per_worker: pp.layout.rows_per_worker,
+        paper_b_target: pp.layout.rows,
+        shard_len: pp.layout.rows_per_worker * pp.layout.columns,
         pcs_queries_requested: job.pcs_queries,
         pcs_queries_effective: effective_queries,
         partition_ms,
-        worker_commit_ms: network_run.commit_ms,
-        master_commit_ms: 0.0,
-        commit_ms: network_run.commit_ms,
-        open_ms: network_run.open_ms,
-        verify_ms: network_run.verify_ms,
-        paper_worker_commit_max_ms: network_run.paper_worker_commit_max_ms,
-        paper_worker_commit_sum_ms: network_run.paper_worker_commit_sum_ms,
-        paper_worker_open_max_ms: network_run.paper_worker_open_max_ms,
-        paper_worker_open_sum_ms: network_run.paper_worker_open_sum_ms,
-        paper_master_assemble_ms: network_run.paper_master_assemble_ms,
-        paper_worker_verify_max_ms: network_run.paper_worker_verify_max_ms,
-        paper_worker_verify_sum_ms: network_run.paper_worker_verify_sum_ms,
-        paper_master_verify_ms: network_run.paper_master_verify_ms,
-        paper_batch_claim_ms: 0.0,
-        paper_batch_sumcheck_ms: 0.0,
-        paper_batch_combined_open_ms: 0.0,
-        paper_batch_merkle_ms: 0.0,
-        paper_batch_verify_ms: 0.0,
-        paper_individual_worker_proof_count: job.workers,
-        paper_batched_proof_count: job.workers,
-        worker_eval_commit_ms: network_run.open_profile.worker_eval_commit_ms,
-        column_open_ms: network_run.open_profile.column_open_ms,
-        f2_open_ms: network_run.open_profile.f2_open_ms,
-        protocol10_e1_sumcheck_ms: network_run.open_profile.protocol10_e1_sumcheck_ms,
-        protocol10_e1_open_ms: network_run.open_profile.protocol10_e1_open_ms,
-        protocol10_e1_opening_batch_open_ms: network_run
-            .open_profile
-            .protocol10_e1_opening_batch_open_ms,
-        protocol10_e1_hu_open_ms: network_run.open_profile.protocol10_e1_hu_open_ms,
-        protocol10_e1_e_at_r_open_ms: network_run.open_profile.protocol10_e1_e_at_r_open_ms,
-        protocol10_e1_f_at_u_prime_open_ms: network_run
-            .open_profile
-            .protocol10_e1_f_at_u_prime_open_ms,
-        protocol10_e1_e_systematic_open_ms: network_run
-            .open_profile
-            .protocol10_e1_e_systematic_open_ms,
-        protocol10_e2_sumcheck_ms: network_run.open_profile.protocol10_e2_sumcheck_ms,
-        protocol10_e2_open_ms: network_run.open_profile.protocol10_e2_open_ms,
-        protocol10_e2_opening_batch_open_ms: network_run
-            .open_profile
-            .protocol10_e2_opening_batch_open_ms,
-        protocol10_e2_hu_open_ms: network_run.open_profile.protocol10_e2_hu_open_ms,
-        protocol10_e2_e_at_r_open_ms: network_run.open_profile.protocol10_e2_e_at_r_open_ms,
-        protocol10_e2_f_at_u_prime_open_ms: network_run
-            .open_profile
-            .protocol10_e2_f_at_u_prime_open_ms,
-        protocol10_e2_e_systematic_open_ms: network_run
-            .open_profile
-            .protocol10_e2_e_systematic_open_ms,
+        worker_commit_ms: unmeasured,
+        master_commit_ms: unmeasured,
+        commit_ms,
+        open_ms,
+        verify_ms,
+        paper_worker_commit_max_ms: unmeasured,
+        paper_worker_commit_sum_ms: unmeasured,
+        paper_worker_open_max_ms: unmeasured,
+        paper_worker_open_sum_ms: unmeasured,
+        paper_master_assemble_ms: unmeasured,
+        paper_worker_verify_max_ms: unmeasured,
+        paper_worker_verify_sum_ms: unmeasured,
+        paper_master_verify_ms: verify_ms,
+        paper_batch_claim_ms: unmeasured,
+        paper_batch_sumcheck_ms: unmeasured,
+        paper_batch_combined_open_ms: unmeasured,
+        paper_batch_merkle_ms: unmeasured,
+        paper_batch_verify_ms: unmeasured,
+        paper_individual_worker_proof_count: job.workers * 9 + 2,
+        paper_batched_proof_count: 0,
+        worker_eval_commit_ms: unmeasured,
+        column_open_ms: unmeasured,
+        f2_open_ms: unmeasured,
+        protocol10_e1_sumcheck_ms: unmeasured,
+        protocol10_e1_open_ms: unmeasured,
+        protocol10_e1_opening_batch_open_ms: unmeasured,
+        protocol10_e1_hu_open_ms: unmeasured,
+        protocol10_e1_e_at_r_open_ms: unmeasured,
+        protocol10_e1_f_at_u_prime_open_ms: unmeasured,
+        protocol10_e1_e_systematic_open_ms: unmeasured,
+        protocol10_e2_sumcheck_ms: unmeasured,
+        protocol10_e2_open_ms: unmeasured,
+        protocol10_e2_opening_batch_open_ms: unmeasured,
+        protocol10_e2_hu_open_ms: unmeasured,
+        protocol10_e2_e_at_r_open_ms: unmeasured,
+        protocol10_e2_f_at_u_prime_open_ms: unmeasured,
+        protocol10_e2_e_systematic_open_ms: unmeasured,
         proof_size_accounting_ms,
-        column_verify_ms: network_run.verify_profile.column_verify_ms,
-        f2_verify_ms: network_run.verify_profile.f2_verify_ms,
-        protocol10_e1_verify_ms: network_run.verify_profile.protocol10_e1_verify_ms,
-        protocol10_e2_verify_ms: network_run.verify_profile.protocol10_e2_verify_ms,
+        column_verify_ms: unmeasured,
+        f2_verify_ms: unmeasured,
+        protocol10_e1_verify_ms: unmeasured,
+        protocol10_e2_verify_ms: unmeasured,
         proof_commitment_object_bytes: commitment_bytes,
-        proof_point_query_public_bytes: proof_size_breakdown.point_query_public_bytes,
-        proof_eval_commitments_bytes: proof_size_breakdown.eval_commitments_bytes,
-        proof_merkle_roots_bytes: proof_size_breakdown.merkle_roots_bytes,
-        proof_column_openings_bytes: proof_size_breakdown.column_openings_bytes,
-        proof_f2_openings_bytes: proof_size_breakdown.f2_openings_bytes,
-        proof_protocol10_e1_bytes: proof_size_breakdown.protocol10_e1_bytes,
-        proof_protocol10_e2_bytes: proof_size_breakdown.protocol10_e2_bytes,
-        proof_transcript_overhead_bytes: proof_size_breakdown.transcript_overhead_bytes,
-        proof_p10_e1_commitments_bytes: 0,
+        proof_point_query_public_bytes: point.len() * 16 + 16 + 64,
+        proof_eval_commitments_bytes: eval_commitment_bytes,
+        proof_merkle_roots_bytes: job.workers * 3 * 32,
+        proof_column_openings_bytes: column_opening_bytes.saturating_sub(f2_opening_bytes),
+        proof_f2_openings_bytes: f2_opening_bytes,
+        proof_protocol10_e1_bytes: p10_e1_bytes,
+        proof_protocol10_e2_bytes: p10_e2_bytes,
+        proof_transcript_overhead_bytes: 32,
+        proof_p10_e1_commitments_bytes: bincode::serialize(&proof.protocol10_e1.hu_commitment)
+            .map_err(|error| CliError(format!("size E1 H_u commitment failed: {error}")))?
+            .len(),
         proof_p10_e1_public_scalars_bytes: 0,
-        proof_p10_e1_opening_batch_bytes: proof_size_breakdown.protocol10_e1_bytes,
-        proof_p10_e1_hu_opening_bytes: 0,
-        proof_p10_e1_sumcheck_bytes: 0,
-        proof_p10_e1_e_at_r_openings_bytes: 0,
-        proof_p10_e1_f_at_u_prime_openings_bytes: 0,
-        proof_p10_e1_e_systematic_openings_bytes: 0,
-        proof_p10_e2_commitments_bytes: 0,
+        proof_p10_e1_opening_batch_bytes: 0,
+        proof_p10_e1_hu_opening_bytes: bincode::serialize(&proof.protocol10_e1.hu_at_r)
+            .map_err(|error| CliError(format!("size E1 H_u opening failed: {error}")))?
+            .len(),
+        proof_p10_e1_sumcheck_bytes: p10_e1_sumcheck_bytes,
+        proof_p10_e1_e_at_r_openings_bytes: proof
+            .protocol10_e1
+            .worker_openings
+            .iter()
+            .map(|item| {
+                bincode::serialize(&item.e_at_r)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0)
+            })
+            .sum(),
+        proof_p10_e1_f_at_u_prime_openings_bytes: proof
+            .protocol10_e1
+            .worker_openings
+            .iter()
+            .map(|item| {
+                bincode::serialize(&item.f_at_u_prime)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0)
+            })
+            .sum(),
+        proof_p10_e1_e_systematic_openings_bytes: proof
+            .protocol10_e1
+            .worker_openings
+            .iter()
+            .map(|item| {
+                bincode::serialize(&item.e_at_systematic)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0)
+            })
+            .sum(),
+        proof_p10_e2_commitments_bytes: bincode::serialize(&proof.protocol10_e2.hu_commitment)
+            .map_err(|error| CliError(format!("size E2 H_u commitment failed: {error}")))?
+            .len(),
         proof_p10_e2_public_scalars_bytes: 0,
-        proof_p10_e2_opening_batch_bytes: proof_size_breakdown.protocol10_e2_bytes,
-        proof_p10_e2_hu_opening_bytes: 0,
-        proof_p10_e2_sumcheck_bytes: 0,
-        proof_p10_e2_e_at_r_openings_bytes: 0,
-        proof_p10_e2_f_at_u_prime_openings_bytes: 0,
-        proof_p10_e2_e_systematic_openings_bytes: 0,
+        proof_p10_e2_opening_batch_bytes: 0,
+        proof_p10_e2_hu_opening_bytes: bincode::serialize(&proof.protocol10_e2.hu_at_r)
+            .map_err(|error| CliError(format!("size E2 H_u opening failed: {error}")))?
+            .len(),
+        proof_p10_e2_sumcheck_bytes: p10_e2_sumcheck_bytes,
+        proof_p10_e2_e_at_r_openings_bytes: proof
+            .protocol10_e2
+            .worker_openings
+            .iter()
+            .map(|item| {
+                bincode::serialize(&item.e_at_r)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0)
+            })
+            .sum(),
+        proof_p10_e2_f_at_u_prime_openings_bytes: proof
+            .protocol10_e2
+            .worker_openings
+            .iter()
+            .map(|item| {
+                bincode::serialize(&item.f_at_u_prime)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0)
+            })
+            .sum(),
+        proof_p10_e2_e_systematic_openings_bytes: proof
+            .protocol10_e2
+            .worker_openings
+            .iter()
+            .map(|item| {
+                bincode::serialize(&item.e_at_systematic)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0)
+            })
+            .sum(),
         proof_bytes,
-        communication_bytes: network_bytes,
+        communication_bytes: proof_bytes,
         verifier_communication_bytes: proof_bytes,
         scheme_reported_communication_bytes: 0,
-        communication_basis: "master_worker_sent_recv".to_owned(),
-        network_commit_bytes,
-        network_open_bytes,
-        network_bytes,
+        communication_basis: "verifier_facing_commitment_plus_proof".to_owned(),
+        network_commit_bytes: 0,
+        network_open_bytes: 0,
+        network_bytes: 0,
         host_logical_cores,
         cores_per_worker: job.cores_per_worker,
         core_affinity: core_affinity_label(job.workers, job.cores_per_worker),
-        backend_source: "deepfold-bench-v0.1-paper-artifact".to_owned(),
-        field: "Mersenne61Ext".to_owned(),
+        backend_source: protocol11::PROTOCOL11_FIDELITY.to_owned(),
+        field: "Ft255".to_owned(),
         hash: PAPER_PCS_HASH.to_owned(),
-        code_rate_log: config.code_rate_log(),
-        security_target_bits: PAPER_PCS_SECURITY_BITS,
-        security_effective_bits: network_run.verify_profile.query_security_bits,
-        security_exact: network_run.verify_profile.query_security_bits == PAPER_PCS_SECURITY_BITS,
-        query_count_semantics: "paper-backed-protocol11-artifact".to_owned(),
+        code_rate_log: 1,
+        security_target_bits: security_target,
+        security_effective_bits: security_effective,
+        security_exact: security_target != 0 && security_effective >= security_target,
+        query_count_semantics: format!(
+            "protocol11-distinct-columns;profile={};aggregate-timing-only;-1=not-measured",
+            if pp.security.target_bits.is_some() {
+                "Paper100"
+            } else {
+                "TestOnly-security-claim-none"
+            }
+        ),
         source_rev: PAPER_PCS_SOURCE_REV.to_owned(),
         verified: true,
         failure_reason: String::new(),
     };
     let scope = format!(
-        "runner=paper-network-protocol11 opening={} nv={} workers={} trial={}",
+        "runner=protocol11-local opening={} nv={} workers={} trial={}",
         job.opening.as_str(),
         variable_count(job.size),
         job.workers,
@@ -1065,22 +1002,45 @@ fn run_single_depcs_job(
         PhaseTimingRecord {
             phase: "job".to_owned(),
             scope: scope.clone(),
-            elapsed_ms: network_run.commit_ms + network_run.open_ms + network_run.verify_ms,
-            commit_ms: network_run.commit_ms,
-            open_ms: network_run.open_ms,
-            verify_ms: network_run.verify_ms,
+            elapsed_ms: commit_ms + open_ms + verify_ms,
+            commit_ms,
+            open_ms,
+            verify_ms,
         },
-        phase_record("paper_worker_commit", &scope, network_run.commit_ms),
-        phase_record("paper_protocol11_open", &scope, network_run.open_ms),
-        phase_record("paper_protocol11_verify", &scope, network_run.verify_ms),
+        phase_record("protocol11_commit", &scope, commit_ms),
+        phase_record("protocol11_prove", &scope, open_ms),
+        phase_record("protocol11_verify", &scope, verify_ms),
     ];
-    Ok((record, timings))
+    let artifact = Protocol11Artifact {
+        protocol_version: protocol11::PROTOCOL11_VERSION.to_owned(),
+        pcs_instantiation: "deepfold".to_owned(),
+        fidelity: protocol11::PROTOCOL11_FIDELITY.to_owned(),
+        field: "Ft255".to_owned(),
+        security_model: pp.security.security_model.clone(),
+        soundness_regime: pp.security.soundness_regime.clone(),
+        security_claim: pp.security.effective_bits,
+        release_blocker: protocol11::PROTOCOL11_RELEASE_BLOCKER.to_owned(),
+        public_parameters: pp,
+        commitment,
+        point,
+        claimed_value,
+        proof: protocol11::serialize_proof(&proof)
+            .map_err(|error| CliError(format!("serialize Protocol 11 proof failed: {error}")))?,
+    };
+    Ok((record, timings, Some(artifact)))
 }
 
-fn run_single_depcs_batch_job(
-    job: PcsBenchmarkJob,
-) -> Result<(PcsMetricRecord, Vec<PhaseTimingRecord>), CliError> {
-    let reason = "batch_unavailable_deepfold_artifact_native_batch_api_missing: LigeSIS batch/multi-open requires ark_ff::PrimeField + HasQuadraticExtension, while paper dePCS uses DeepFold artifact Mersenne61Ext/RandomOracle/Merkle; refusing to swap backend or use digest-only Protocol10/11 placeholders";
+fn depcs_fixture_seed(size: usize, workers: usize, trial: usize) -> [u8; 32] {
+    let mut seed = [0_u8; 32];
+    seed[..8].copy_from_slice(&(size as u64).to_le_bytes());
+    seed[8..16].copy_from_slice(&(workers as u64).to_le_bytes());
+    seed[16..24].copy_from_slice(&(trial as u64).to_le_bytes());
+    seed[24..].copy_from_slice(b"pq-pv1!!");
+    seed
+}
+
+fn run_single_depcs_batch_job(job: PcsBenchmarkJob) -> Result<PcsJobOutput, CliError> {
+    let reason = "batch_unavailable_deepfold_multi_open_api_missing: Protocol 11 uses the vendored DeepFold adapter over Ft255 and does not expose LigeSIS batch/multi-open; refusing to swap the configured backend";
     Err(CliError(format!(
         "paper-backed protocol11-batch unavailable for backend={} nv={} workers={}: {reason}",
         job.backend.as_str(),
@@ -1108,13 +1068,26 @@ fn verify_pcs_results(command: VerifyPcsResultsCommand) -> Result<(), CliError> 
 }
 
 fn phase_record(phase: &str, scope: &str, elapsed_ms: f64) -> PhaseTimingRecord {
+    let unmeasured = -1.0;
     PhaseTimingRecord {
         phase: phase.to_owned(),
         scope: scope.to_owned(),
         elapsed_ms,
-        commit_ms: 0.0,
-        open_ms: 0.0,
-        verify_ms: 0.0,
+        commit_ms: if phase.ends_with("commit") {
+            elapsed_ms
+        } else {
+            unmeasured
+        },
+        open_ms: if phase.ends_with("prove") {
+            elapsed_ms
+        } else {
+            unmeasured
+        },
+        verify_ms: if phase.ends_with("verify") {
+            elapsed_ms
+        } else {
+            unmeasured
+        },
     }
 }
 
@@ -1172,19 +1145,29 @@ fn verify_pcs_source_csv(dir: &Path) -> Result<SourceCsvCheck, CliError> {
             )));
         }
         if fields[scheme_idx].starts_with("depcs-") {
-            if fields[communication_basis_idx] != "master_worker_sent_recv"
-                || communication == 0
-                || communication != network
-                || network == 0
+            if fields[scheme_idx] != "depcs-deepfold-protocol11" {
+                return Err(CliError(format!(
+                    "UnsupportedLegacyProtocol: source.csv row {} uses '{}'",
+                    line_index + 2,
+                    fields[scheme_idx]
+                )));
+            }
+            if fields[communication_basis_idx] != "verifier_facing_commitment_plus_proof"
+                || communication != proof_bytes
+                || network != 0
             {
                 return Err(CliError(format!(
-                    "PCS source.csv row {} has invalid dePCS master/worker communication accounting",
+                    "PCS source.csv row {} has invalid Protocol 11 communication accounting",
                     line_index + 2
                 )));
             }
-            if !fields[backend_source_idx].contains("paper-artifact") {
-                depcs_rows += 1;
+            if fields[backend_source_idx] != protocol11::PROTOCOL11_FIDELITY {
+                return Err(CliError(format!(
+                    "PCS source.csv row {} has invalid fidelity marker",
+                    line_index + 2
+                )));
             }
+            depcs_rows += 1;
         }
         rows += 1;
     }
@@ -1194,15 +1177,58 @@ fn verify_pcs_source_csv(dir: &Path) -> Result<SourceCsvCheck, CliError> {
     Ok(SourceCsvCheck { rows, depcs_rows })
 }
 
-fn verify_pcs_proof_fixtures(_dir: &Path, expected_depcs_rows: usize) -> Result<usize, CliError> {
-    // The paper artifact dePCS path self-verifies inside each run and does not
-    // emit replayable proof fixtures, so there are never any rows to re-check.
-    if expected_depcs_rows != 0 {
+fn verify_pcs_proof_fixtures(dir: &Path, expected_depcs_rows: usize) -> Result<usize, CliError> {
+    let mut paths = fs::read_dir(dir)
+        .map_err(|error| CliError(format!("read artifact directory failed: {error}")))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("protocol11-proof-") && name.ends_with(".bin"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    if paths.len() != expected_depcs_rows {
         return Err(CliError(format!(
-            "PCS source.csv reports {expected_depcs_rows} legacy dePCS rows, but the legacy fixture path has been removed"
+            "Protocol 11 fixture count mismatch: found {}, expected {expected_depcs_rows}",
+            paths.len()
         )));
     }
-    Ok(0)
+    for path in &paths {
+        let bytes = fs::read(path)
+            .map_err(|error| CliError(format!("read {} failed: {error}", path.display())))?;
+        let artifact: Protocol11Artifact = bincode::deserialize(&bytes).map_err(|_| {
+            CliError(format!(
+                "UnsupportedLegacyProtocol: {} is not a Protocol 11 artifact",
+                path.display()
+            ))
+        })?;
+        if artifact.protocol_version != protocol11::PROTOCOL11_VERSION
+            || artifact.pcs_instantiation != "deepfold"
+            || artifact.fidelity != protocol11::PROTOCOL11_FIDELITY
+            || artifact.field != "Ft255"
+            || artifact.security_model != artifact.public_parameters.security.security_model
+            || artifact.soundness_regime != artifact.public_parameters.security.soundness_regime
+            || artifact.release_blocker != protocol11::PROTOCOL11_RELEASE_BLOCKER
+            || artifact.security_claim != artifact.public_parameters.security.effective_bits
+        {
+            return Err(CliError(format!(
+                "{} has inconsistent Protocol 11 artifact metadata",
+                path.display()
+            )));
+        }
+        let proof = protocol11::deserialize_proof(&artifact.proof)
+            .map_err(|error| CliError(format!("decode {} failed: {error}", path.display())))?;
+        protocol11::verify_fs(
+            &artifact.public_parameters,
+            &artifact.commitment,
+            &artifact.point,
+            artifact.claimed_value,
+            &proof,
+        )
+        .map_err(|error| CliError(format!("verify {} failed: {error}", path.display())))?;
+    }
+    Ok(paths.len())
 }
 
 fn csv_field_index(fields: &[String], name: &str) -> Result<usize, CliError> {
@@ -1701,7 +1727,7 @@ fn query_policy_for_record(record: &PcsMetricRecord) -> &str {
 }
 
 fn source_url_for_record(record: &PcsMetricRecord) -> &'static str {
-    if record.backend_source.contains("paper-artifact") {
+    if record.scheme.starts_with("depcs-") {
         PAPER_PCS_SOURCE_URL
     } else {
         "local-workspace"
@@ -1709,7 +1735,7 @@ fn source_url_for_record(record: &PcsMetricRecord) -> &'static str {
 }
 
 fn license_for_record(record: &PcsMetricRecord) -> &'static str {
-    if record.backend_source.contains("paper-artifact") {
+    if record.scheme.starts_with("depcs-") {
         PAPER_PCS_LICENSE
     } else {
         "MIT OR Apache-2.0"
@@ -1717,8 +1743,8 @@ fn license_for_record(record: &PcsMetricRecord) -> &'static str {
 }
 
 fn field_for_record(record: &PcsMetricRecord) -> &'static str {
-    if record.backend_source.contains("paper-artifact") {
-        "Mersenne61Ext"
+    if record.scheme.starts_with("depcs-") {
+        "Ft255"
     } else {
         "Goldilocks"
     }
@@ -2500,6 +2526,7 @@ fn core_affinity_label(workers: usize, cores_per_worker: usize) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn core_affinity_label_from_parts(
     workers: usize,
     cores_per_worker: usize,
@@ -2683,7 +2710,7 @@ fn write_text_file(path: &Path, contents: &str) -> Result<(), CliError> {
 
 fn usage() -> String {
     "usage:
-  cargo run -p pq-experiments -- pcs-benchmark [--opening protocol11|protocol11-batch] [--backend deepfold] [--backend-rate-inv N] [--sizes 256,512,1024 | --size-range 256..1024 | --nv-values/--variable-counts 8,9,10 | --nv-range/--variable-range 8..10] [--workers 1,2,4] [--cores-per-worker N] [--pcs-queries N] [--security-bits N] [--repeats N] [--no-pcs-warmup] [--out DIR]
+  cargo run -p pq-experiments -- pcs-benchmark [--opening protocol11|protocol11-batch] [--backend deepfold] [--backend-rate-inv N] [--sizes 256,512,1024 | --size-range 256..1024 | --nv-values/--variable-counts 8,9,10 | --nv-range/--variable-range 8..10] [--workers 1,2,4] [--cores-per-worker N] [--pcs-queries N] [--security-bits N] [--repeats N] [--allow-insecure-test-profile] [--no-pcs-warmup] [--out DIR]
   cargo run -p pq-experiments -- verify-pcs-results --dir results/pcs-bench-... [--format json|csv]"
         .to_owned()
 }
@@ -2691,8 +2718,6 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use std::thread;
-
-    use pq_pcs::depcs::PaperProtocol11WorkerOpening;
 
     use super::*;
 
@@ -2713,9 +2738,12 @@ mod tests {
 
     #[test]
     fn protocol11_paper_backend_config_is_accepted() {
-        let config = PaperDepcsConfig::new(PaperPcsBackend::DeepFold, 2).expect("deepfold");
-        assert_eq!(config.code_rate_log(), 1);
-        assert!(PaperDepcsConfig::new(PaperPcsBackend::DeepFold, 8).is_err());
+        let config = Protocol11Config {
+            original_len: 1 << 10,
+            workers: 2,
+            security: SecurityProfile::TestOnly { queries: 4 },
+        };
+        assert!(protocol11::setup(config, [7_u8; 32]).is_ok());
     }
 
     #[test]
@@ -2754,14 +2782,32 @@ mod tests {
             backend: PaperPcsBackend::DeepFold,
             backend_rate_inv: 2,
             cores_per_worker: 1,
+            allow_insecure_test_profile: true,
         };
         let error = run_single_depcs_batch_job(deepfold_job)
             .expect_err("deepfold batch must not swap backend");
         assert!(
             error
                 .0
-                .contains("batch_unavailable_deepfold_artifact_native_batch_api_missing")
+                .contains("batch_unavailable_deepfold_multi_open_api_missing")
         );
+    }
+
+    #[test]
+    fn testonly_profile_requires_explicit_cli_opt_in() {
+        let job = PcsBenchmarkJob {
+            size: 1 << 10,
+            workers: 2,
+            opening: PcsOpeningVariant::Protocol11,
+            trial: 1,
+            pcs_queries: 4,
+            backend: PaperPcsBackend::DeepFold,
+            backend_rate_inv: 2,
+            cores_per_worker: 1,
+            allow_insecure_test_profile: false,
+        };
+        let error = run_single_depcs_job(job).expect_err("small domain must fail closed");
+        assert!(error.0.contains("--allow-insecure-test-profile"));
     }
 
     #[test]
@@ -2792,109 +2838,9 @@ mod tests {
     }
 
     #[test]
-    fn paper_network_worker_uses_commit_cache_and_rejects_mismatch() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            serve_pcs_network_worker_stream(&mut stream).expect("serve");
-        });
-
-        let mut stream = TcpStream::connect(addr).expect("connect");
-        let config = PaperDepcsConfig::new(PaperPcsBackend::DeepFold, 2).expect("config");
-        let original_len = 1 << 6;
-        let workers = 2;
-        let worker1 =
-            depcs::commit_worker(original_len, workers, 1, config).expect("worker1 commit");
-        let local_worker0 =
-            depcs::commit_worker(original_len, workers, 0, config).expect("worker0 commit");
-        let precommit_commitment = depcs::commit_from_worker_commitments(
-            original_len,
-            workers,
-            config,
-            vec![local_worker0, worker1.clone()],
-        )
-        .expect("precommit commitment");
-        let point = depcs::sample_point(precommit_commitment.nv);
-
-        write_frame_binary(
-            &mut stream,
-            &PcsWorkerRequest::PaperOpen {
-                commitment: precommit_commitment,
-                point: point.clone(),
-            },
-        )
-        .expect("write paper open before commit");
-        let (response, _): (PcsWorkerResponse, usize) =
-            read_frame_binary(&mut stream).expect("read paper open before commit");
-        assert!(matches!(response, PcsWorkerResponse::Error { .. }));
-
-        write_frame_binary(
-            &mut stream,
-            &PcsWorkerRequest::PaperCommitSeeded {
-                original_len,
-                workers,
-                worker_id: 0,
-                config,
-            },
-        )
-        .expect("write paper commit");
-        let (response, _): (PcsWorkerResponse, usize) =
-            read_frame_binary(&mut stream).expect("read paper commit");
-        let worker0 = match response {
-            PcsWorkerResponse::PaperCommit { commitment, .. } => commitment,
-            other => panic!("unexpected response: {other:?}"),
-        };
-        let commitment = depcs::commit_from_worker_commitments(
-            original_len,
-            workers,
-            config,
-            vec![worker0, worker1],
-        )
-        .expect("commitment");
-        write_frame_binary(
-            &mut stream,
-            &PcsWorkerRequest::PaperOpen {
-                commitment: commitment.clone(),
-                point: point.clone(),
-            },
-        )
-        .expect("write paper open");
-        let (response, _): (PcsWorkerResponse, usize) =
-            read_frame_binary(&mut stream).expect("read paper open");
-        assert!(matches!(
-            response,
-            PcsWorkerResponse::PaperOpen {
-                opening: PaperProtocol11WorkerOpening { worker_id: 0, .. },
-                ..
-            }
-        ));
-
-        let mut bad_commitment = commitment;
-        bad_commitment.config.security_bits += 1;
-        write_frame_binary(
-            &mut stream,
-            &PcsWorkerRequest::PaperOpen {
-                commitment: bad_commitment,
-                point,
-            },
-        )
-        .expect("write mismatched paper open");
-        let (response, _): (PcsWorkerResponse, usize) =
-            read_frame_binary(&mut stream).expect("read mismatched paper open");
-        assert!(matches!(response, PcsWorkerResponse::Error { .. }));
-
-        write_frame_binary(&mut stream, &PcsWorkerRequest::Shutdown).expect("write shutdown");
-        let (response, _): (PcsWorkerResponse, usize) =
-            read_frame_binary(&mut stream).expect("read shutdown");
-        assert!(matches!(response, PcsWorkerResponse::Ack));
-        handle.join().expect("thread");
-    }
-
-    #[test]
     fn source_csv_verifier_accepts_generated_row() {
         let record = PcsMetricRecord {
-            scheme: "depcs-deepfold-paper-protocol11".to_owned(),
+            scheme: "depcs-deepfold-protocol11".to_owned(),
             backend: "deepfold".to_owned(),
             backend_rate_inv: 2,
             effective_query_count: 1,
@@ -2989,15 +2935,15 @@ mod tests {
             communication_bytes: 180,
             verifier_communication_bytes: 180,
             scheme_reported_communication_bytes: 0,
-            communication_basis: "master_worker_sent_recv".to_owned(),
-            network_commit_bytes: 80,
-            network_open_bytes: 100,
-            network_bytes: 180,
+            communication_basis: "verifier_facing_commitment_plus_proof".to_owned(),
+            network_commit_bytes: 0,
+            network_open_bytes: 0,
+            network_bytes: 0,
             host_logical_cores: 1,
             cores_per_worker: 1,
             core_affinity: "local-network".to_owned(),
-            backend_source: "deepfold-bench-v0.1-paper-artifact".to_owned(),
-            field: "Mersenne61Ext".to_owned(),
+            backend_source: protocol11::PROTOCOL11_FIDELITY.to_owned(),
+            field: "Ft255".to_owned(),
             hash: PAPER_PCS_HASH.to_owned(),
             code_rate_log: 2,
             security_target_bits: 128,
@@ -3032,11 +2978,18 @@ mod tests {
         );
         let dir = env::temp_dir().join(format!("depcs_csv_test_{}", unix_millis().expect("time")));
         fs::create_dir_all(&dir).expect("dir");
-        write_text_file(&dir.join("source.csv"), &pcs_records_to_csv(&[record])).expect("write");
+        let source_csv = pcs_records_to_csv(&[record]);
+        write_text_file(&dir.join("source.csv"), &source_csv).expect("write");
         let check = verify_pcs_source_csv(&dir).expect("verify");
         assert_eq!(check.rows, 1);
-        // Paper-artifact dePCS rows self-verify and emit no replayable fixtures.
-        assert_eq!(check.depcs_rows, 0);
+        assert_eq!(check.depcs_rows, 1);
+        let legacy = source_csv.replace(
+            "depcs-deepfold-protocol11",
+            "depcs-deepfold-paper-protocol11",
+        );
+        write_text_file(&dir.join("source.csv"), &legacy).expect("write legacy");
+        let error = verify_pcs_source_csv(&dir).expect_err("legacy schema must fail closed");
+        assert!(error.0.contains("UnsupportedLegacyProtocol"));
         fs::remove_dir_all(dir).expect("cleanup");
     }
 }

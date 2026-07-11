@@ -15,11 +15,12 @@ use super::{interpolate_cosets, interpolate_cosets_lazy};
 use crate::depcs::types::*;
 
 type LazyCosetCache = Mutex<HashMap<(usize, usize), Arc<Vec<Coset<PaperField>>>>>;
+type MaterializedCosetEntry = ((usize, usize), Arc<Vec<Coset<PaperField>>>);
 const MATERIALIZED_COSET_CACHE_CAPACITY: usize = 2;
 
 #[derive(Default)]
 struct BoundedMaterializedCosetCache {
-    entries: VecDeque<((usize, usize), Arc<Vec<Coset<PaperField>>>)>,
+    entries: VecDeque<MaterializedCosetEntry>,
 }
 
 impl BoundedMaterializedCosetCache {
@@ -109,15 +110,6 @@ pub(crate) fn prepare_prover(
     )
 }
 
-pub(crate) fn open_prepared(
-    prover: deepfold_prover::Prover<PaperField>,
-    point: &[PaperField],
-) -> PaperDepcsResult<(PaperPcsOpeningProof, PaperField)> {
-    let proof = prover.generate_proof(point.to_vec());
-    let evaluation = proof.evaluation;
-    Ok((PaperPcsOpeningProof::DeepFold(proof), evaluation))
-}
-
 pub(crate) fn open_polynomial(
     nv: usize,
     values: Vec<PaperField>,
@@ -131,10 +123,11 @@ pub(crate) fn open_polynomial(
     (PaperPcsOpeningProof::DeepFold(proof), evaluation)
 }
 
-pub(crate) fn verify_opening(
+pub(crate) fn verify_evaluation(
     nv: usize,
     commitment: &paper_deepfold::Commit<PaperField>,
-    opening: &PaperProtocol11WorkerOpening,
+    point: &[PaperField],
+    value: PaperField,
     proof: &paper_deepfold::Proof<PaperField>,
     oracle: &RandomOracle<PaperField>,
     code_rate_log: usize,
@@ -142,8 +135,8 @@ pub(crate) fn verify_opening(
     let cosets = cached_lazy_cosets(nv, code_rate_log);
     let mut verifier =
         deepfold_verifier::Verifier::new(nv, cosets.as_ref(), commitment.clone(), oracle, STEP);
-    verifier.set_open_point(&opening.shard_point);
-    verifier.verify_ref(proof) && proof.evaluation == opening.value
+    verifier.set_open_point(point);
+    verifier.verify_ref(proof) && proof.evaluation == value
 }
 
 #[cfg(test)]

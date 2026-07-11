@@ -55,7 +55,12 @@ pub fn paper_query_count(backend: PaperPcsBackend) -> usize {
 
 pub fn paper_query_count_for_code_rate(backend: PaperPcsBackend, code_rate_log: usize) -> usize {
     match backend {
-        PaperPcsBackend::DeepFold => SECURITY_BITS.div_ceil(code_rate_log.max(1)),
+        PaperPcsBackend::DeepFold => {
+            let rate_inverse = 1usize << code_rate_log.max(1);
+            let rho = 1.0 / rate_inverse as f64;
+            let per_query_failure = (1.0 + rho) / 2.0;
+            (SECURITY_BITS as f64 / -per_query_failure.log2()).ceil() as usize
+        }
     }
 }
 

@@ -1,8 +1,22 @@
 # pq_dSNARK dePCS
 
-This repository contains a transparent distributed polynomial commitment scheme
-(dePCS) implementation plus benchmark scripts for comparing it with vendored PCS
-baselines.
+This repository contains the Protocol 6--11 distributed polynomial commitment
+scheme, with DeepFold used as the generic polynomial-commitment backend, plus
+benchmark scripts for comparison with vendored PCS baselines.
+
+The implementation exposes `setup`, `commit_global`/`commit_worker`,
+`aggregate_commitments`, `prove_fs`, and `verify_fs` under
+`pq_pcs::depcs::protocol11`. Proofs use a versioned canonical envelope and bind
+the external `(commitment, point, claimed_value)` statement. The research
+artifact identifies itself with `protocol_version=protocol11`,
+`pcs_instantiation=deepfold`, and
+`fidelity=protocol11-deepfold`. `Paper100` uses `Ft255` and the conservative
+DeepFold unique-decoding regime to target at least 100 bits of classical
+soundness in the classical random-oracle model.
+
+This is not an audited production release. DeepFold licensing remains an
+explicit redistribution blocker; independent cryptographic review is still
+required before describing the implementation as production-audited.
 
 ## 1. Install Requirements
 
@@ -155,12 +169,17 @@ cargo run -p pq-experiments --release -- pcs-benchmark \
   --opening protocol11 \
   --backend deepfold \
   --backend-rate-inv 2 \
-  --nv-range 18..18 \
+  --nv-range 10..10 \
   --workers 2 \
   --pcs-queries 1 \
+  --allow-insecure-test-profile \
   --no-pcs-warmup \
   --out results/smoke
 ```
+
+`--allow-insecure-test-profile` is required for small domains that cannot fit
+the full `Paper100` query budget. Such artifacts record
+`security_claim = none`; omit the flag for claim-bearing runs.
 
 ## 9. Repository Layout
 
