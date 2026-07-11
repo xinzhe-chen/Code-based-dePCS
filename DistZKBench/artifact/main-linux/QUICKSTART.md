@@ -21,7 +21,7 @@ cargo build --release --locked
 ./target/release/dzb report results/toy_star_4/<run-id>
 ```
 
-Linux is the strict artifact backend. Strict cgroup, cpuset, resctrl, netns/tc,
+Linux is the strict artifact backend. Strict cgroup, cpuset, netns/tc,
 and perf paths must fail closed when requested but unavailable.
 
 Remote preflight:

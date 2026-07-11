@@ -874,7 +874,6 @@ fn platform_evidence(config: &dzb_core::ResolvedConfig, mode: Option<&str>) -> s
             "cgroup_v2": config.capability.memory_control.hard_limit.supported,
             "netns": config.capability.network_emulation.netns_or_equivalent.supported,
             "tc": config.capability.network_emulation.kernel_shaper.supported,
-            "resctrl": config.capability.resource_control.cache_isolation.supported,
             "perf": config.capability.perf_counters.linux_perf_equivalent.supported
         }
     })

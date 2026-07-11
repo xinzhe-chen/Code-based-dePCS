@@ -489,12 +489,9 @@ pub fn resolve_config(
     if config.roles.master_rank >= config.roles.prover_ranks {
         return Err(ConfigError("roles.master_rank out of range".to_owned()));
     }
-    if config.cache.mode == "resctrl_cat" && !capability.resource_control.cache_isolation.supported
-    {
-        return Err(ConfigError(
-            "resctrl CAT was requested but is unavailable on this platform".to_owned(),
-        ));
-    }
+    // `cache.mode` remains in schema v1/v2 for compatibility. DistZKBench no
+    // longer requests resctrl because it is unavailable on most benchmark
+    // hosts; legacy values are accepted but intentionally have no effect.
     if config.memory.cgroup && !capability.memory_control.hard_limit.supported {
         return Err(ConfigError(
             "memory.cgroup was requested but cgroup v2 hard memory limit is unavailable".to_owned(),
@@ -614,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn darwin_resctrl_strict_fails() {
+    fn legacy_resctrl_config_is_accepted_but_not_required() {
         let mut config = Config {
             platform: PlatformConfig {
                 backend: PlatformBackendName::Darwin,
@@ -628,7 +625,7 @@ mod tests {
                 config,
                 capability(Platform::Darwin, IsolationTier::BestEffort)
             )
-            .is_err()
+            .is_ok()
         );
     }
 

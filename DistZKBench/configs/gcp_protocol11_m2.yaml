@@ -7,8 +7,8 @@ experiment:
   random_seed: 20260711
   repetitions: 1
   warmups: 1
-  # perf/resctrl are supplemental and may be reported unsupported; requested
-  # cgroup/affinity/topology/verifier capabilities still fail closed.
+  # perf is supplemental and may be reported unsupported; cgroup/affinity/
+  # topology/verifier capabilities still fail closed. resctrl is not requested.
   fail_on_warning: false
 
 platform:

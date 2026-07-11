@@ -108,8 +108,7 @@ pub fn darwin_capability_report() -> CapabilityReport {
 
     let mut notes = vec![
         "macOS Apple Silicon backend is for portability and supplemental benchmarking".to_owned(),
-        "hard affinity, cgroup memory, resctrl CAT, netns/tc, and perf_event_open are unavailable"
-            .to_owned(),
+        "hard affinity, cgroup memory, netns/tc, and perf_event_open are unavailable".to_owned(),
     ];
     if let Some(summary) = perflevels {
         notes.push(summary);
@@ -130,7 +129,7 @@ pub fn darwin_capability_report() -> CapabilityReport {
             ),
             fixed_thread_budget: FeatureAvailability::strict("environment guards plus task checks"),
             cache_isolation: FeatureAvailability::unsupported(
-                "resctrl CAT / LLC way partitioning unavailable",
+                "LLC partitioning is intentionally not requested or collected",
             ),
             numa_binding: FeatureAvailability::unsupported(
                 "not applicable to Apple Silicon unified memory",
@@ -166,7 +165,6 @@ pub fn darwin_capability_report() -> CapabilityReport {
         unsupported_features: vec![
             "hard_cpu_affinity".to_owned(),
             "cgroup_memory_limit".to_owned(),
-            "resctrl_cat".to_owned(),
             "netns_veth".to_owned(),
             "tc_netem".to_owned(),
             "perf_event_open".to_owned(),

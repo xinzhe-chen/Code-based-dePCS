@@ -99,11 +99,6 @@ sudo tc qdisc add dev "${V0}" root netem delay 1ms
 ping -c 1 -W 2 10.200.1.2 >/dev/null
 sudo tc qdisc del dev "${V0}" root
 
-if [[ -d /sys/fs/resctrl ]]; then
-  resctrl_state="available"
-else
-  resctrl_state="unsupported"
-fi
 perf_paranoid="$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo missing)"
 if [[ "${perf_paranoid}" =~ ^-?[0-9]+$ ]] && [[ "${perf_paranoid}" -le 2 ]] && command -v perf >/dev/null; then
   perf_state="available"
@@ -121,6 +116,5 @@ cpuset_cgroup=ok ${cpuset_line}
 smt_sibling_avoidance_set=${smt_selection}
 numa_plan=ok
 netns_veth_tc=ok
-resctrl_cat=${resctrl_state}
 perf_event_open=${perf_state} paranoid=${perf_paranoid}
 REPORT

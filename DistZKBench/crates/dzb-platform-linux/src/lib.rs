@@ -30,7 +30,7 @@ impl PlatformBackend for LinuxBackend {
         Ok(HostPlan {
             run_id: cfg.run_id.clone(),
             notes: vec![
-                "strict Linux host preparation is delegated to cgroup/cpuset/resctrl/netns modules"
+                "strict Linux host preparation is delegated to cgroup/cpuset/netns modules"
                     .to_owned(),
             ],
         })
@@ -102,7 +102,6 @@ impl PlatformBackend for LinuxBackend {
 pub fn linux_capability_report() -> CapabilityReport {
     let is_linux = cfg!(target_os = "linux");
     let cgroup_v2 = is_linux && Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
-    let resctrl = is_linux && Path::new("/sys/fs/resctrl").exists();
     let procfs = is_linux && Path::new("/proc").exists();
     let netns = is_linux && command_available("ip");
     let tc = is_linux && command_available("tc");
@@ -111,9 +110,6 @@ pub fn linux_capability_report() -> CapabilityReport {
     let mut unsupported = Vec::new();
     if !cgroup_v2 {
         unsupported.push("cgroup_v2".to_owned());
-    }
-    if !resctrl {
-        unsupported.push("resctrl_cat".to_owned());
     }
     if !netns {
         unsupported.push("network_namespace".to_owned());
@@ -141,11 +137,9 @@ pub fn linux_capability_report() -> CapabilityReport {
                 FeatureAvailability::unsupported("not running on Linux")
             },
             fixed_thread_budget: FeatureAvailability::strict("environment guards plus task checks"),
-            cache_isolation: if resctrl {
-                FeatureAvailability::strict("resctrl CAT available")
-            } else {
-                FeatureAvailability::unsupported("resctrl CAT unavailable")
-            },
+            cache_isolation: FeatureAvailability::unsupported(
+                "LLC partitioning is intentionally not requested or collected",
+            ),
             numa_binding: if is_linux {
                 FeatureAvailability::strict("Linux NUMA policy")
             } else {

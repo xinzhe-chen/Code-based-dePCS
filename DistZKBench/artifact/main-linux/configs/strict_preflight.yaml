@@ -22,10 +22,6 @@ memory:
   cgroup: true
   per_rank_limit: 256MiB
 
-cache:
-  mode: resctrl_cat
-  fail_if_unavailable: true
-
 network:
   transport: tcp
   mode: netns_veth

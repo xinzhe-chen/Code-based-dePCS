@@ -24,11 +24,6 @@ test -e /sys/fs/cgroup/cgroup.controllers
 test -d /proc
 command -v ip >/dev/null
 command -v tc >/dev/null
-if [[ -d /sys/fs/resctrl ]]; then
-  echo "resctrl=mounted"
-else
-  echo "resctrl=missing"
-fi
 if [[ -e /proc/sys/kernel/perf_event_paranoid ]]; then
   echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
 else

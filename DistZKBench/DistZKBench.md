@@ -1,6 +1,8 @@
 # DistZKBench MVP-3 Artifact-Quality 工程实施指南
 
-目标：一步做到 **artifact-quality**，即不仅能本地跑多个 isolated prover，还能提供可复现配置、严格资源隔离、TCP-only 数据通信、phase-level tracing、memory/communication/prover/verifier measurement、netns/tc 网络仿真、resctrl cache 隔离、remote cluster 校准，以及可复现实验报告。
+目标：一步做到 **artifact-quality**，即不仅能本地跑多个 isolated prover，还能提供可复现配置、严格资源隔离、TCP-only 数据通信、phase-level tracing、memory/communication/prover/verifier measurement、netns/tc 网络仿真、remote cluster 校准，以及可复现实验报告。
+
+> 当前决策：不请求或采集 resctrl/CAT。该能力在多数云主机及通用实验环境中不可获得，不再作为 strict capability、警告项或验收条件。本文后续残留的 resctrl 章节仅保留为历史设计记录，不属于当前实现规范。
 
 ---
 

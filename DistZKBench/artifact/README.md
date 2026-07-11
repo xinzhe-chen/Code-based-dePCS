@@ -6,7 +6,8 @@ DistZKBench has two artifact paths:
 - `macos-apple-silicon/`: best-effort Apple Silicon path for portability and supplemental runs.
 
 Run toy smoke tests first. Linux strict runs must fail closed when requested
-features such as cgroup v2, resctrl, netns/tc, or perf are unavailable.
+features such as cgroup v2, netns/tc, or perf are unavailable. resctrl is not
+requested because it is unavailable on most benchmark hosts.
 
 For first-time users, start with the top-level console:
 
