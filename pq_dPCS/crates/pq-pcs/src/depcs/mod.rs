@@ -19,11 +19,14 @@ pub use backend::{
 };
 pub use protocol11::{
     BrakedownCode, EncodingRelation, GlobalPolynomial, PaperLayout, Protocol10Proof,
-    Protocol11Commitment, Protocol11Config, Protocol11Error, Protocol11Event, Protocol11Proof,
-    Protocol11ProverSession, Protocol11VerifierSession, PublicParameters, SecurityBudget,
+    Protocol11BatchClaim, Protocol11BatchProof, Protocol11Channel, Protocol11Commitment,
+    Protocol11Config, Protocol11Error, Protocol11Event, Protocol11Proof, Protocol11ProverSession,
+    Protocol11Statement, Protocol11VerifierSession, PublicParameters, SecurityBudget,
     SecurityProfile, WorkerCommitment, WorkerProverState, WorkerShard, aggregate_commitments,
-    commit_global, commit_worker, deserialize_commitment, deserialize_proof, proof_size_bytes,
-    prove_fs, serialize_commitment, serialize_proof, setup, verify_fs,
+    bind_batch_claims, commit_global, commit_worker, deserialize_batch_proof,
+    deserialize_commitment, deserialize_proof, proof_size_bytes, prove_batch_fs,
+    prove_distributed_fs, prove_fs, serialize_batch_proof, serialize_commitment, serialize_proof,
+    setup, verify_batch_fs, verify_fs,
 };
 pub use types::{PaperField, PaperPcsCommitment, PaperPcsOpeningProof};
 

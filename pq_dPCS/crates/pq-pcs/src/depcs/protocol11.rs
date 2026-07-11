@@ -29,6 +29,7 @@ pub const PROTOCOL11_FIDELITY: &str = "protocol11-deepfold";
 pub const PROTOCOL11_RELEASE_BLOCKER: &str = "vendored-deepfold-has-no-confirmed-license";
 const PROOF_MAGIC: &[u8; 8] = b"PQDPCS11";
 const COMMITMENT_MAGIC: &[u8; 8] = b"PQDPCSC1";
+const BATCH_PROOF_MAGIC: &[u8; 8] = b"PQDPCSB1";
 const PROOF_SCHEMA: u16 = 2;
 const MAX_PROOF_BYTES: usize = 1 << 30;
 const CODE_EXPANSION: usize = 2;
@@ -50,6 +51,7 @@ pub enum Protocol11Error {
     InvalidStatement,
     InsecureParameters,
     Serialization,
+    Distributed(String),
     UnsupportedLegacyProtocol,
     Backend(PaperDepcsError),
 }
@@ -65,6 +67,9 @@ impl Display for Protocol11Error {
             Self::InvalidStatement => write!(f, "protocol11 public statement does not match proof"),
             Self::InsecureParameters => write!(f, "protocol11 security budget is below target"),
             Self::Serialization => write!(f, "protocol11 canonical serialization failed"),
+            Self::Distributed(reason) => {
+                write!(f, "protocol11 distributed channel failed: {reason}")
+            }
             Self::UnsupportedLegacyProtocol => {
                 write!(
                     f,
@@ -989,6 +994,68 @@ pub struct Protocol11Proof {
     pub transcript_digest: [u8; 32],
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Protocol11Statement {
+    pub config: Protocol11Config,
+    pub setup_seed: [u8; 32],
+    pub commitment: Protocol11Commitment,
+    pub point: Vec<PaperField>,
+    pub claimed_value: PaperField,
+}
+
+pub trait Protocol11Channel {
+    fn rank(&self) -> usize;
+    fn world_size(&self) -> usize;
+    fn master_rank(&self) -> usize;
+    fn gather_bytes(
+        &mut self,
+        tag: u32,
+        payload: Vec<u8>,
+    ) -> std::result::Result<Option<Vec<Vec<u8>>>, String>;
+    fn broadcast_bytes(
+        &mut self,
+        tag: u32,
+        payload: Option<Vec<u8>>,
+    ) -> std::result::Result<Vec<u8>, String>;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WorkerOpeningContribution {
+    opening: WorkerEvalOpenings,
+    y1: Vec<PaperField>,
+    y2: Vec<PaperField>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OpeningAggregate {
+    openings: Vec<WorkerEvalOpenings>,
+    y1: Vec<PaperField>,
+    y2: Vec<PaperField>,
+}
+
+/// A single claim carried by the shared-transcript batch container.
+///
+/// Each constituent proof remains a complete Protocol 11 proof.  The batch
+/// transcript binds the ordered claim list but deliberately does not claim a
+/// DeepFold multi-open optimization.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Protocol11BatchClaim {
+    pub point: Vec<PaperField>,
+    pub claimed_value: PaperField,
+    pub proof: Protocol11Proof,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Protocol11BatchProof {
+    pub protocol: String,
+    pub batch_mode: String,
+    pub params_digest: [u8; 32],
+    pub commitment_root: [u8; 32],
+    pub claims: Vec<Protocol11BatchClaim>,
+    pub coefficients: Vec<PaperField>,
+    pub transcript_digest: [u8; 32],
+}
+
 #[derive(Clone, Debug)]
 struct EvalMaterial {
     worker_id: usize,
@@ -1287,6 +1354,273 @@ pub fn aggregate_commitments(
     })
 }
 
+pub fn prove_distributed_fs<C: Protocol11Channel>(
+    pp: &PublicParameters,
+    worker_commitment: WorkerCommitment,
+    worker: WorkerProverState,
+    point: &[PaperField],
+    channel: &mut C,
+) -> Result<Option<(Protocol11Statement, Protocol11Proof)>> {
+    if channel.world_size() != pp.layout.workers
+        || worker.worker_id != channel.rank()
+        || channel.master_rank() >= channel.world_size()
+    {
+        return Err(Protocol11Error::InvalidShard(
+            "distributed rank/layout mismatch",
+        ));
+    }
+    let gathered = channel_gather(channel, 100, &worker_commitment)?;
+    let commitment = if channel.rank() == channel.master_rank() {
+        let commitments = gathered.ok_or_else(|| {
+            Protocol11Error::Distributed("master commitment gather missing".to_owned())
+        })?;
+        aggregate_commitments(pp, commitments)?
+    } else {
+        Protocol11Commitment {
+            protocol: String::new(),
+            params_digest: [0_u8; 32],
+            workers: Vec::new(),
+            root: [0_u8; 32],
+        }
+    };
+    let commitment: Protocol11Commitment = channel_broadcast(
+        channel,
+        101,
+        (channel.rank() == channel.master_rank()).then_some(&commitment),
+    )?;
+    validate_public_inputs(pp, &commitment, point)?;
+
+    let (s1, s2) = point.split_at(pp.layout.row_bits);
+    let local_claim = evaluate_worker_rows(pp, std::slice::from_ref(&worker), s1, s2);
+    let gathered = channel_gather(channel, 102, &local_claim)?;
+    let claimed_value = if channel.rank() == channel.master_rank() {
+        gathered
+            .ok_or_else(|| Protocol11Error::Distributed("claim gather missing".to_owned()))?
+            .into_iter()
+            .fold(PaperField::from_int(0), |sum, value| sum + value)
+    } else {
+        PaperField::from_int(0)
+    };
+    let claimed_value: PaperField = channel_broadcast(
+        channel,
+        103,
+        (channel.rank() == channel.master_rank()).then_some(&claimed_value),
+    )?;
+    let mut transcript = statement_transcript(pp, &commitment, point, claimed_value)?;
+    let a = transcript.challenge_fields(b"protocol11-a", pp.layout.rows);
+    let material = build_eval_material(pp, &commitment, point, &a, &worker)?;
+
+    let gathered = channel_gather(channel, 104, &material.commitments)?;
+    let eval_commitments = if channel.rank() == channel.master_rank() {
+        let mut values = gathered.ok_or_else(|| {
+            Protocol11Error::Distributed("evaluation commitment gather missing".to_owned())
+        })?;
+        values.sort_by_key(|item| item.worker_id);
+        values
+    } else {
+        Vec::new()
+    };
+    let eval_commitments: Vec<WorkerEvalCommitments> = channel_broadcast(
+        channel,
+        105,
+        (channel.rank() == channel.master_rank()).then_some(&eval_commitments),
+    )?;
+    transcript.absorb(b"protocol11-eval-commitments", &eval_commitments)?;
+    let column_indices = transcript.distinct_indices(
+        b"protocol11-column-index",
+        pp.security.column_queries,
+        pp.layout.encoded_columns,
+    )?;
+    let local_opening = open_worker_contribution(pp, point, &worker, &material, &column_indices)?;
+    let gathered = channel_gather(channel, 106, &local_opening)?;
+    let aggregate = if channel.rank() == channel.master_rank() {
+        aggregate_worker_openings(
+            gathered.ok_or_else(|| {
+                Protocol11Error::Distributed("worker opening gather missing".to_owned())
+            })?,
+            pp.layout.workers,
+            column_indices.len(),
+        )?
+    } else {
+        OpeningAggregate {
+            openings: Vec::new(),
+            y1: Vec::new(),
+            y2: Vec::new(),
+        }
+    };
+    let aggregate: OpeningAggregate = channel_broadcast(
+        channel,
+        107,
+        (channel.rank() == channel.master_rank()).then_some(&aggregate),
+    )?;
+    transcript.absorb(
+        b"protocol11-column-openings",
+        &(&aggregate.openings, &aggregate.y1, &aggregate.y2),
+    )?;
+
+    let protocol10_e1 = prove_distributed_protocol10(
+        pp,
+        &mut transcript,
+        EncodingRelation::E1,
+        &material,
+        channel,
+        200,
+    )?;
+    let protocol10_e2 = prove_distributed_protocol10(
+        pp,
+        &mut transcript,
+        EncodingRelation::E2,
+        &material,
+        channel,
+        300,
+    )?;
+    let proof = Protocol11Proof {
+        protocol: PROTOCOL11_VERSION.to_owned(),
+        params_digest: pp.params_digest,
+        security_profile: pp.config.security,
+        eval_commitments,
+        worker_openings: aggregate.openings,
+        y1: aggregate.y1,
+        y2: aggregate.y2,
+        protocol10_e1,
+        protocol10_e2,
+        transcript_digest: transcript.digest(),
+    };
+    verify_fs(pp, &commitment, point, claimed_value, &proof)?;
+    Ok((channel.rank() == channel.master_rank()).then_some((
+        Protocol11Statement {
+            config: pp.config,
+            setup_seed: pp.setup_seed,
+            commitment,
+            point: point.to_vec(),
+            claimed_value,
+        },
+        proof,
+    )))
+}
+
+fn channel_gather<T, C>(channel: &mut C, tag: u32, value: &T) -> Result<Option<Vec<T>>>
+where
+    T: Serialize + for<'de> Deserialize<'de>,
+    C: Protocol11Channel,
+{
+    let bytes = canonical_options()
+        .serialize(value)
+        .map_err(|_| Protocol11Error::Serialization)?;
+    channel
+        .gather_bytes(tag, bytes)
+        .map_err(Protocol11Error::Distributed)?
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|bytes| {
+                    canonical_options()
+                        .reject_trailing_bytes()
+                        .deserialize(&bytes)
+                        .map_err(|_| Protocol11Error::Serialization)
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn channel_broadcast<T, C>(channel: &mut C, tag: u32, value: Option<&T>) -> Result<T>
+where
+    T: Serialize + for<'de> Deserialize<'de>,
+    C: Protocol11Channel,
+{
+    let bytes = value
+        .map(|value| canonical_options().serialize(value))
+        .transpose()
+        .map_err(|_| Protocol11Error::Serialization)?;
+    let bytes = channel
+        .broadcast_bytes(tag, bytes)
+        .map_err(Protocol11Error::Distributed)?;
+    canonical_options()
+        .reject_trailing_bytes()
+        .deserialize(&bytes)
+        .map_err(|_| Protocol11Error::Serialization)
+}
+
+fn open_worker_contribution(
+    pp: &PublicParameters,
+    point: &[PaperField],
+    worker: &WorkerProverState,
+    material: &EvalMaterial,
+    indices: &[usize],
+) -> Result<WorkerOpeningContribution> {
+    let (_, s2) = point.split_at(pp.layout.row_bits);
+    let source_columns = open_source_columns(pp, worker, indices)?;
+    let (e1_tree, _) = vector_tree(
+        pp.params_digest,
+        b"protocol11-e1-vector",
+        worker.worker_id,
+        &material.e1,
+    );
+    let (e2_tree, _) = vector_tree(
+        pp.params_digest,
+        b"protocol11-e2-vector",
+        worker.worker_id,
+        &material.e2,
+    );
+    let e1_columns = VectorMerkleOpening {
+        indices: indices.to_vec(),
+        values: indices.iter().map(|index| material.e1[*index]).collect(),
+        proof_bytes: e1_tree.open(indices),
+    };
+    let e2_columns = VectorMerkleOpening {
+        indices: indices.to_vec(),
+        values: indices.iter().map(|index| material.e2[*index]).collect(),
+        proof_bytes: e2_tree.open(indices),
+    };
+    Ok(WorkerOpeningContribution {
+        y1: e1_columns.values.clone(),
+        y2: e2_columns.values.clone(),
+        opening: WorkerEvalOpenings {
+            worker_id: worker.worker_id,
+            source_columns,
+            e1_columns,
+            e2_columns,
+            f2_at_s2: pc_open(
+                pp,
+                &material.f2,
+                &material.commitments.f2,
+                &backend_point_msb(s2),
+            )?,
+        },
+    })
+}
+
+fn aggregate_worker_openings(
+    mut contributions: Vec<WorkerOpeningContribution>,
+    workers: usize,
+    slots: usize,
+) -> Result<OpeningAggregate> {
+    contributions.sort_by_key(|item| item.opening.worker_id);
+    if contributions.len() != workers
+        || contributions.iter().enumerate().any(|(worker, item)| {
+            item.opening.worker_id != worker || item.y1.len() != slots || item.y2.len() != slots
+        })
+    {
+        return Err(Protocol11Error::InvalidProof(
+            "distributed worker opening shape mismatch",
+        ));
+    }
+    let mut y1 = vec![PaperField::from_int(0); slots];
+    let mut y2 = vec![PaperField::from_int(0); slots];
+    for contribution in &contributions {
+        for slot in 0..slots {
+            y1[slot] += contribution.y1[slot];
+            y2[slot] += contribution.y2[slot];
+        }
+    }
+    Ok(OpeningAggregate {
+        openings: contributions.into_iter().map(|item| item.opening).collect(),
+        y1,
+        y2,
+    })
+}
+
 pub fn prove_fs(
     pp: &PublicParameters,
     commitment: &Protocol11Commitment,
@@ -1414,6 +1748,104 @@ pub fn verify_fs(
         session.accept(event)?;
     }
     session.finalize(proof)
+}
+
+pub fn prove_batch_fs(
+    pp: &PublicParameters,
+    commitment: &Protocol11Commitment,
+    workers: &[WorkerProverState],
+    points: &[Vec<PaperField>],
+) -> Result<Protocol11BatchProof> {
+    if points.len() < 2 {
+        return Err(Protocol11Error::InvalidParameters(
+            "Protocol 11 batch requires at least two claims",
+        ));
+    }
+    let mut claims = Vec::with_capacity(points.len());
+    for point in points {
+        let (claimed_value, proof) = prove_fs(pp, commitment, workers.to_vec(), point)?;
+        claims.push(Protocol11BatchClaim {
+            point: point.clone(),
+            claimed_value,
+            proof,
+        });
+    }
+    bind_batch_claims(pp, commitment, claims)
+}
+
+pub fn bind_batch_claims(
+    pp: &PublicParameters,
+    commitment: &Protocol11Commitment,
+    claims: Vec<Protocol11BatchClaim>,
+) -> Result<Protocol11BatchProof> {
+    if claims.len() < 2 {
+        return Err(Protocol11Error::InvalidParameters(
+            "Protocol 11 batch requires at least two claims",
+        ));
+    }
+    let (coefficients, transcript_digest) = batch_binding(pp, commitment, &claims)?;
+    Ok(Protocol11BatchProof {
+        protocol: PROTOCOL11_VERSION.to_owned(),
+        batch_mode: "shared-transcript-independent-openings".to_owned(),
+        params_digest: pp.params_digest,
+        commitment_root: commitment.root,
+        claims,
+        coefficients,
+        transcript_digest,
+    })
+}
+
+pub fn verify_batch_fs(
+    pp: &PublicParameters,
+    commitment: &Protocol11Commitment,
+    batch: &Protocol11BatchProof,
+) -> Result<()> {
+    if batch.protocol != PROTOCOL11_VERSION
+        || batch.batch_mode != "shared-transcript-independent-openings"
+        || batch.params_digest != pp.params_digest
+        || batch.commitment_root != commitment.root
+        || batch.claims.len() < 2
+    {
+        return Err(Protocol11Error::InvalidProof("batch header mismatch"));
+    }
+    for claim in &batch.claims {
+        verify_fs(
+            pp,
+            commitment,
+            &claim.point,
+            claim.claimed_value,
+            &claim.proof,
+        )?;
+    }
+    let (coefficients, transcript_digest) = batch_binding(pp, commitment, &batch.claims)?;
+    if coefficients != batch.coefficients || transcript_digest != batch.transcript_digest {
+        return Err(Protocol11Error::InvalidProof(
+            "batch transcript binding mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn batch_binding(
+    pp: &PublicParameters,
+    commitment: &Protocol11Commitment,
+    claims: &[Protocol11BatchClaim],
+) -> Result<(Vec<PaperField>, [u8; 32])> {
+    let mut transcript = Transcript::new();
+    transcript.absorb_bytes(b"batch-mode", b"shared-transcript-independent-openings");
+    transcript.absorb(b"batch-params-digest", &pp.params_digest)?;
+    transcript.absorb(b"batch-commitment-root", &commitment.root)?;
+    transcript.absorb(b"batch-claim-count", &claims.len())?;
+    for claim in claims {
+        let proof_bytes = serialize_proof(&claim.proof)?;
+        transcript.absorb(
+            b"batch-claim",
+            &(&claim.point, claim.claimed_value, sha256(&proof_bytes)),
+        )?;
+    }
+    let coefficients = transcript.challenge_fields(b"batch-coefficients", claims.len());
+    transcript.absorb(b"batch-coefficients-binding", &coefficients)?;
+    Ok((coefficients, transcript.digest()))
 }
 
 fn verify_fs_inner(
@@ -1613,6 +2045,39 @@ pub fn deserialize_proof(bytes: &[u8]) -> Result<Protocol11Proof> {
     Ok(proof)
 }
 
+pub fn serialize_batch_proof(proof: &Protocol11BatchProof) -> Result<Vec<u8>> {
+    let body = canonical_options()
+        .serialize(proof)
+        .map_err(|_| Protocol11Error::Serialization)?;
+    let mut output = Vec::with_capacity(BATCH_PROOF_MAGIC.len() + 10 + body.len());
+    output.extend_from_slice(BATCH_PROOF_MAGIC);
+    output.extend_from_slice(&PROOF_SCHEMA.to_le_bytes());
+    output.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    output.extend_from_slice(&body);
+    Ok(output)
+}
+
+pub fn deserialize_batch_proof(bytes: &[u8]) -> Result<Protocol11BatchProof> {
+    if bytes.len() < BATCH_PROOF_MAGIC.len() + 10
+        || &bytes[..BATCH_PROOF_MAGIC.len()] != BATCH_PROOF_MAGIC
+    {
+        return Err(Protocol11Error::UnsupportedLegacyProtocol);
+    }
+    let schema = u16::from_le_bytes(bytes[8..10].try_into().expect("two bytes"));
+    let body_len = u64::from_le_bytes(bytes[10..18].try_into().expect("eight bytes")) as usize;
+    if schema != PROOF_SCHEMA || body_len > MAX_PROOF_BYTES || bytes.len() != 18 + body_len {
+        return Err(Protocol11Error::Serialization);
+    }
+    let proof: Protocol11BatchProof = canonical_options()
+        .reject_trailing_bytes()
+        .deserialize(&bytes[18..])
+        .map_err(|_| Protocol11Error::Serialization)?;
+    if serialize_batch_proof(&proof)? != bytes {
+        return Err(Protocol11Error::Serialization);
+    }
+    Ok(proof)
+}
+
 fn build_eval_material(
     pp: &PublicParameters,
     commitment: &Protocol11Commitment,
@@ -1795,6 +2260,136 @@ fn prove_protocol10(
             e_at_systematic: pc_open(pp, e_values, e_commitment, &e_point)?,
         });
     }
+    let proof = Protocol10Proof {
+        relation,
+        hu_commitment,
+        rounds,
+        hu_at_r,
+        worker_openings,
+    };
+    transcript.absorb(b"protocol10-proof-tail", &proof.worker_openings)?;
+    Ok(proof)
+}
+
+fn prove_distributed_protocol10<C: Protocol11Channel>(
+    pp: &PublicParameters,
+    transcript: &mut Transcript,
+    relation: EncodingRelation,
+    material: &EvalMaterial,
+    channel: &mut C,
+    tag_base: u32,
+) -> Result<Protocol10Proof> {
+    let relation_label = match relation {
+        EncodingRelation::E1 => b"protocol10-e1".as_slice(),
+        EncodingRelation::E2 => b"protocol10-e2".as_slice(),
+    };
+    transcript.absorb(b"protocol10-relation-kind", &relation)?;
+    let u = transcript.challenge_fields(b"protocol10-u", pp.layout.column_bits);
+    let hu = codeword_to_paper(pp, &pp.code.hu(&u)?)?;
+    let hu_seed = domain_digest(relation_label, &transcript.digest());
+    let hu_commitment = pc_commit(pp, &hu, hu_seed)?;
+    transcript.absorb(b"protocol10-hu-commitment", &hu_commitment)?;
+    let mut e_table = match relation {
+        EncodingRelation::E1 => material.e1.clone(),
+        EncodingRelation::E2 => material.e2.clone(),
+    };
+    let mut hu_table = hu.clone();
+    let mut claim = PaperField::from_int(0);
+    let mut rounds = Vec::with_capacity(pp.layout.column_bits + 1);
+    let mut r = Vec::with_capacity(pp.layout.column_bits + 1);
+    let mut round_index = 0_u32;
+    while hu_table.len() > 1 {
+        let local = product_round_evaluations(&e_table, &hu_table)?;
+        let gathered = channel_gather(channel, tag_base + round_index * 2, &local)?;
+        let evaluations = if channel.rank() == channel.master_rank() {
+            gathered
+                .ok_or_else(|| {
+                    Protocol11Error::Distributed("sumcheck round gather missing".to_owned())
+                })?
+                .into_iter()
+                .fold([PaperField::from_int(0); 3], |mut sum, item| {
+                    for index in 0..3 {
+                        sum[index] += item[index];
+                    }
+                    sum
+                })
+        } else {
+            [PaperField::from_int(0); 3]
+        };
+        let evaluations: [PaperField; 3] = channel_broadcast(
+            channel,
+            tag_base + round_index * 2 + 1,
+            (channel.rank() == channel.master_rank()).then_some(&evaluations),
+        )?;
+        if claim != evaluations[0] + evaluations[1] {
+            return Err(Protocol11Error::InvalidProof(
+                "distributed sumcheck invariant failed",
+            ));
+        }
+        let round = SumcheckRound { evaluations };
+        transcript.absorb(b"protocol10-sumcheck-round", &round)?;
+        let challenge = transcript.challenge_field(b"protocol10-r");
+        claim = quadratic_eval(evaluations, challenge);
+        e_table = fold_table(&e_table, challenge)?;
+        hu_table = fold_table(&hu_table, challenge)?;
+        rounds.push(round);
+        r.push(challenge);
+        round_index += 1;
+    }
+    let hu_at_r = pc_open(pp, &hu, &hu_commitment, &r)?;
+    let e_values = match relation {
+        EncodingRelation::E1 => &material.e1,
+        EncodingRelation::E2 => &material.e2,
+    };
+    let e_commitment = match relation {
+        EncodingRelation::E1 => &material.commitments.e1,
+        EncodingRelation::E2 => &material.commitments.e2,
+    };
+    let local_e_at_r = pc_open(pp, e_values, e_commitment, &r)?;
+    let gathered = channel_gather(channel, tag_base + 80, &local_e_at_r)?;
+    let e_at_r_openings: Vec<PcOpening> = if channel.rank() == channel.master_rank() {
+        gathered.ok_or_else(|| {
+            Protocol11Error::Distributed("final E opening gather missing".to_owned())
+        })?
+    } else {
+        Vec::new()
+    };
+    let e_at_r_openings: Vec<PcOpening> = channel_broadcast(
+        channel,
+        tag_base + 81,
+        (channel.rank() == channel.master_rank()).then_some(&e_at_r_openings),
+    )?;
+    transcript.absorb(b"protocol10-final-openings", &(&hu_at_r, &e_at_r_openings))?;
+    let u_prime = transcript.challenge_fields(b"protocol10-u-prime", pp.layout.column_bits);
+    let f_point = backend_point_msb(&u_prime);
+    let mut paper_e_point = u_prime.clone();
+    paper_e_point.push(PaperField::from_int(0));
+    let e_point = backend_point_msb(&paper_e_point);
+    let (f_values, f_commitment) = match relation {
+        EncodingRelation::E1 => (&material.f1, &material.commitments.f1),
+        EncodingRelation::E2 => (&material.f2, &material.commitments.f2),
+    };
+    let local_opening = WorkerRelationOpenings {
+        worker_id: material.worker_id,
+        e_at_r: local_e_at_r,
+        f_at_u_prime: pc_open(pp, f_values, f_commitment, &f_point)?,
+        e_at_systematic: pc_open(pp, e_values, e_commitment, &e_point)?,
+    };
+    let gathered = channel_gather(channel, tag_base + 82, &local_opening)?;
+    let worker_openings = if channel.rank() == channel.master_rank() {
+        let mut openings = gathered.ok_or_else(|| {
+            Protocol11Error::Distributed("relation opening gather missing".to_owned())
+        })?;
+        openings.sort_by_key(|opening| opening.worker_id);
+        openings
+    } else {
+        Vec::new()
+    };
+    let worker_openings: Vec<WorkerRelationOpenings> = channel_broadcast(
+        channel,
+        tag_base + 83,
+        (channel.rank() == channel.master_rank()).then_some(&worker_openings),
+    )?;
     let proof = Protocol10Proof {
         relation,
         hu_commitment,
@@ -2535,6 +3130,70 @@ mod tests {
         );
     }
 
+    struct SingleRankChannel;
+
+    impl Protocol11Channel for SingleRankChannel {
+        fn rank(&self) -> usize {
+            0
+        }
+
+        fn world_size(&self) -> usize {
+            1
+        }
+
+        fn master_rank(&self) -> usize {
+            0
+        }
+
+        fn gather_bytes(
+            &mut self,
+            _tag: u32,
+            payload: Vec<u8>,
+        ) -> std::result::Result<Option<Vec<Vec<u8>>>, String> {
+            Ok(Some(vec![payload]))
+        }
+
+        fn broadcast_bytes(
+            &mut self,
+            _tag: u32,
+            payload: Option<Vec<u8>>,
+        ) -> std::result::Result<Vec<u8>, String> {
+            payload.ok_or_else(|| "missing master payload".to_owned())
+        }
+    }
+
+    #[test]
+    fn distributed_single_rank_matches_reference_proof_bytes() {
+        let pp = setup(test_config(8, 1, 2), [10_u8; 32]).unwrap();
+        let rows = (0..pp.layout.rows_per_worker)
+            .map(|row| {
+                (0..pp.layout.columns)
+                    .map(|column| value(row * pp.layout.columns + column))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let (worker_commitment, worker_state) =
+            commit_worker(&pp, WorkerShard { worker_id: 0, rows }).unwrap();
+        let commitment = aggregate_commitments(&pp, vec![worker_commitment.clone()]).unwrap();
+        let point = vec![PaperField::from_parts(3, 11); pp.layout.nv];
+        let (reference_value, reference_proof) =
+            prove_fs(&pp, &commitment, vec![worker_state.clone()], &point).unwrap();
+        let (statement, distributed_proof) = prove_distributed_fs(
+            &pp,
+            worker_commitment,
+            worker_state,
+            &point,
+            &mut SingleRankChannel,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(statement.claimed_value, reference_value);
+        assert_eq!(
+            serialize_proof(&distributed_proof).unwrap(),
+            serialize_proof(&reference_proof).unwrap()
+        );
+    }
+
     #[test]
     fn protocol11_fs_roundtrip_and_statement_tamper() {
         let pp = setup(test_config(8, 2, 2), [11_u8; 32]).unwrap();
@@ -2558,6 +3217,40 @@ mod tests {
         let mut other_point = point.clone();
         other_point[0] += PaperField::from_int(1);
         assert!(verify_fs(&pp, &commitment, &other_point, claimed_value, &proof).is_err());
+    }
+
+    #[test]
+    fn protocol11_batch_binds_order_claims_and_commitment() {
+        let pp = setup(test_config(8, 2, 2), [12_u8; 32]).unwrap();
+        let evaluations = (0..pp.layout.original_len).map(value).collect::<Vec<_>>();
+        let (commitment, states) = commit_global(&pp, evaluations).unwrap();
+        let points = vec![
+            vec![PaperField::from_parts(2, 5); pp.layout.nv],
+            vec![PaperField::from_parts(3, 7); pp.layout.nv],
+        ];
+        let batch = prove_batch_fs(&pp, &commitment, &states, &points).unwrap();
+        verify_batch_fs(&pp, &commitment, &batch).unwrap();
+        let encoded = serialize_batch_proof(&batch).unwrap();
+        let decoded = deserialize_batch_proof(&encoded).unwrap();
+        verify_batch_fs(&pp, &commitment, &decoded).unwrap();
+
+        let mut reordered = batch.clone();
+        reordered.claims.swap(0, 1);
+        assert!(verify_batch_fs(&pp, &commitment, &reordered).is_err());
+
+        let mut bad_point = batch.clone();
+        bad_point.claims[0].point[0] += PaperField::from_int(1);
+        assert!(verify_batch_fs(&pp, &commitment, &bad_point).is_err());
+
+        let other_pp = setup(test_config(8, 2, 2), [14_u8; 32]).unwrap();
+        let (other_commitment, _) = commit_global(
+            &other_pp,
+            (0..other_pp.layout.original_len)
+                .map(value)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(verify_batch_fs(&other_pp, &other_commitment, &batch).is_err());
     }
 
     #[test]

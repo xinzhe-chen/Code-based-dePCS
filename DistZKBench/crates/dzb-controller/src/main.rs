@@ -1,12 +1,12 @@
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Instant, SystemTime};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant, SystemTime};
 
 use dzb_core::{
-    Config, Platform, PlatformBackendName, TopologyKind, load_config, resolve_config,
+    Config, Platform, PlatformBackendName, TopologyKind, expand_sweep, load_config, resolve_config,
     write_json_pretty,
 };
 use dzb_metrics::{ExperimentOutput, write_outputs};
@@ -16,6 +16,7 @@ use dzb_platform_linux::LinuxBackend;
 use dzb_runner::{RankRuntimeOutput, rank_runtime_config_from_resolved};
 use dzb_sdk::{ProofArtifact, sha256_hex};
 use dzb_transport::CommunicationCounters;
+use serde::{Deserialize, Serialize};
 
 mod ui;
 
@@ -307,17 +308,34 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let capability = capability_for_request(config.platform.backend)?;
     let resolved = resolve_config(config, capability).map_err(|error| error.to_string())?;
     let start = Instant::now();
-    let output = if resolved.original.protocol.mode == "black-box" {
-        run_black_box(&resolved, start)?
-    } else {
-        let rank_run = spawn_rank_processes(&resolved)?;
+    let execution = (|| -> Result<ExperimentOutput, String> {
+        if resolved.original.protocol.mode == "black-box" {
+            return run_black_box(&resolved, start);
+        }
+        let mut agent = AgentClient::start(&resolved)?;
+        let rank_run = spawn_rank_processes(&resolved, &mut agent)?;
         let verifier =
             if resolved.original.roles.verifier_enabled && !rank_run.proof.bytes.is_empty() {
-                Some(spawn_verifier_process(&resolved, &rank_run.proof)?)
+                Some(spawn_verifier_process(
+                    &resolved,
+                    &rank_run.proof,
+                    &mut agent,
+                )?)
             } else {
                 None
             };
-        ExperimentOutput {
+        agent.cleanup()?;
+        Ok(ExperimentOutput {
+            status: if verifier
+                .as_ref()
+                .and_then(|value| value.report.get("verified"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(!resolved.original.roles.verifier_enabled)
+            {
+                dzb_core::RunStatus::Ok
+            } else {
+                dzb_core::RunStatus::Failed
+            },
             phases: rank_run
                 .ranks
                 .iter()
@@ -337,6 +355,13 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             }),
             communication_precision: "exact_tcp_frame_payload".to_owned(),
             platform_evidence: platform_evidence(&resolved, None),
+        })
+    })();
+    let output = match execution {
+        Ok(output) => output,
+        Err(error) => {
+            persist_failed_run(&resolved, &error, start.elapsed())?;
+            return Err(error);
         }
     };
     let run_json = write_outputs(&resolved, &output).map_err(|error| error.to_string())?;
@@ -346,6 +371,51 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         run_json.run_id, run_json.status, run_json.proof_size_bytes, run_json.total_protocol_bytes
     );
     Ok(())
+}
+
+fn persist_failed_run(
+    config: &dzb_core::ResolvedConfig,
+    error: &str,
+    elapsed: Duration,
+) -> Result<(), String> {
+    let result_dir = Path::new(&config.result_dir);
+    fs::create_dir_all(result_dir.join("logs")).map_err(|io| io.to_string())?;
+    fs::write(result_dir.join("logs/failure.log"), format!("{error}\n"))
+        .map_err(|io| io.to_string())?;
+    let status = if error.contains("timed out") {
+        dzb_core::RunStatus::Timeout
+    } else if error.to_ascii_lowercase().contains("oom")
+        || error.contains("memory.max")
+        || error.contains("memory limit")
+    {
+        dzb_core::RunStatus::Oom
+    } else {
+        dzb_core::RunStatus::Failed
+    };
+    let run = dzb_core::RunJson {
+        schema_version: 2,
+        run_id: config.run_id.clone(),
+        experiment: config.original.experiment.name.clone(),
+        platform: config.platform.as_str().to_owned(),
+        isolation_tier: config.isolation_tier.as_str().to_owned(),
+        status: status.as_str().to_owned(),
+        prover_critical_path_ms: elapsed.as_secs_f64() * 1_000.0,
+        prover_wall_controller_ms: elapsed.as_secs_f64() * 1_000.0,
+        proof_size_bytes: 0,
+        proof_sha256: sha256_hex(&[]),
+        statement_size_bytes: 0,
+        statement_sha256: None,
+        total_protocol_bytes: 0,
+        total_framed_bytes: 0,
+        message_count: 0,
+        verifier_median_ms: 0.0,
+        rank_pids: Vec::new(),
+        verifier_pid: None,
+        communication_precision: "partial_or_unavailable".to_owned(),
+        platform_evidence: serde_json::json!({"error": error}),
+        best_effort_warning: None,
+    };
+    dzb_core::write_json_pretty(&result_dir.join("run.json"), &run).map_err(|io| io.to_string())
 }
 
 fn run_black_box(
@@ -382,12 +452,7 @@ fn run_black_box(
     if !status.success() {
         return Err(format!("black-box adapter exited with status {status}"));
     }
-    let proof_bytes = format!(
-        "black-box;command={command};run_id={};elapsed_ms={:.3}",
-        config.run_id,
-        start.elapsed().as_secs_f64() * 1000.0
-    )
-    .into_bytes();
+    let proof_bytes = Vec::new();
     let proof = ProofArtifact {
         sha256: sha256_hex(&proof_bytes),
         bytes: proof_bytes,
@@ -415,6 +480,7 @@ fn run_black_box(
         custom_metrics: Vec::new(),
     };
     Ok(ExperimentOutput {
+        status: dzb_core::RunStatus::Failed,
         phases: Vec::new(),
         proof,
         communication: CommunicationCounters::new(config.original.roles.prover_ranks),
@@ -423,7 +489,11 @@ fn run_black_box(
         verifier_ms: 0.0,
         ranks: vec![rank],
         verifier_pid: None,
-        verifier_report: Some(serde_json::json!({"verified": true, "mode": "black-box"})),
+        verifier_report: Some(serde_json::json!({
+            "verified": null,
+            "mode": "black-box",
+            "reason": "proof and verifier metrics are unavailable from an opaque process"
+        })),
         communication_precision: "unavailable".to_owned(),
         platform_evidence: platform_evidence(config, Some("black_box")),
     })
@@ -432,6 +502,7 @@ fn run_black_box(
 fn spawn_verifier_process(
     config: &dzb_core::ResolvedConfig,
     proof: &ProofArtifact,
+    agent: &mut AgentClient,
 ) -> Result<VerifierProcessOutput, String> {
     let command_path = adapter_command(config)?;
     let logs = Path::new(&config.result_dir).join("logs");
@@ -439,30 +510,55 @@ fn spawn_verifier_process(
     let proof_path = Path::new(&config.result_dir).join("proof.bin");
     let out = logs.join("verifier_process.json");
     let started = Instant::now();
-    let mut command = Command::new(&command_path);
-    command
-        .arg("verify")
-        .arg("--proof")
-        .arg(&proof_path)
-        .arg("--sha256")
-        .arg(&proof.sha256)
-        .arg("--out")
-        .arg(&out);
-    command.args(&config.original.protocol.args);
+    let mut args = vec![
+        config.original.protocol.verify_subcommand.clone(),
+        "--proof".to_owned(),
+        proof_path.to_string_lossy().into_owned(),
+        "--sha256".to_owned(),
+        proof.sha256.clone(),
+        "--out".to_owned(),
+        out.to_string_lossy().into_owned(),
+    ];
+    let statement_path = Path::new(&config.result_dir).join("statement.bin");
+    if statement_path.exists() {
+        args.push("--statement".to_owned());
+        args.push(statement_path.to_string_lossy().into_owned());
+    }
+    args.extend(config.original.protocol.args.clone());
+    let mut env = std::collections::BTreeMap::new();
     for (key, value) in standard_thread_budget_env(config.verifier_threads) {
-        command.env(key, value);
+        env.insert(key, value);
     }
     if config.platform == Platform::Darwin {
-        command.env("DZB_DARWIN_QOS", "user_initiated");
+        env.insert("DZB_DARWIN_QOS".to_owned(), "user_initiated".to_owned());
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("spawn verifier process failed: {error}"))?;
-    let pid = child.id();
-    let status = child
-        .wait()
-        .map_err(|error| format!("wait verifier process failed: {error}"))?;
-    if status.success() {
+    let pid = agent.launch(AgentLaunch {
+        id: "verifier".to_owned(),
+        executable: command_path.to_string_lossy().into_owned(),
+        args,
+        env,
+        stdout_path: logs
+            .join("verifier.stdout.log")
+            .to_string_lossy()
+            .into_owned(),
+        stderr_path: logs
+            .join("verifier.stderr.log")
+            .to_string_lossy()
+            .into_owned(),
+        run_id: config.run_id.clone(),
+        cpuset: strict_cpuset(
+            config,
+            config.original.roles.prover_ranks,
+            config.verifier_threads,
+        ),
+        memory_limit_bytes: strict_memory_limit(config)?,
+        strict_linux: config.platform == Platform::Linux && config.original.memory.cgroup,
+    })?;
+    let status = agent.wait(
+        "verifier",
+        config.original.timeouts.verify_sec.saturating_mul(1_000),
+    )?;
+    if status == 0 {
         let text = std::fs::read_to_string(&out)
             .map_err(|error| format!("read verifier report failed: {error}"))?;
         let report = serde_json::from_str(&text)
@@ -492,7 +588,147 @@ struct VerifierProcessOutput {
     report: serde_json::Value,
 }
 
-fn spawn_rank_processes(config: &dzb_core::ResolvedConfig) -> Result<RankRunOutput, String> {
+#[derive(Clone, Debug, Serialize)]
+struct AgentLaunch {
+    id: String,
+    executable: String,
+    args: Vec<String>,
+    env: std::collections::BTreeMap<String, String>,
+    stdout_path: String,
+    stderr_path: String,
+    run_id: String,
+    cpuset: Option<String>,
+    memory_limit_bytes: Option<u64>,
+    strict_linux: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AgentResponse {
+    ok: bool,
+    message: String,
+    pid: Option<u32>,
+    exit_code: Option<i32>,
+}
+
+struct AgentClient {
+    child: Child,
+    input: ChildStdin,
+    output: ChildStdout,
+}
+
+impl AgentClient {
+    fn start(config: &dzb_core::ResolvedConfig) -> Result<Self, String> {
+        let executable = sibling_executable("dzb-agent")?;
+        let strict_linux = config.platform == Platform::Linux
+            && (config.original.resources.no_overcommit
+                || config.original.memory.cgroup
+                || config.original.network.mode == "netns_veth");
+        let mut command = if strict_linux {
+            let mut command = Command::new("sudo");
+            command.arg("-n").arg(executable);
+            command
+        } else {
+            Command::new(executable)
+        };
+        let mut child = command
+            .arg("serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| format!("spawn dzb-agent failed: {error}"))?;
+        let input = child
+            .stdin
+            .take()
+            .ok_or_else(|| "dzb-agent stdin unavailable".to_owned())?;
+        let output = child
+            .stdout
+            .take()
+            .ok_or_else(|| "dzb-agent stdout unavailable".to_owned())?;
+        let mut client = Self {
+            child,
+            input,
+            output,
+        };
+        let response = client.request(&serde_json::json!({"kind": "ping"}))?;
+        if response.ok {
+            Ok(client)
+        } else {
+            Err(response.message)
+        }
+    }
+
+    fn launch(&mut self, launch: AgentLaunch) -> Result<u32, String> {
+        let mut value = serde_json::to_value(launch).map_err(|error| error.to_string())?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| "agent launch must serialize as an object".to_owned())?
+            .insert("kind".to_owned(), serde_json::json!("launch"));
+        let response = self.request(&value)?;
+        if response.ok {
+            response
+                .pid
+                .ok_or_else(|| "agent launch response omitted pid".to_owned())
+        } else {
+            Err(response.message)
+        }
+    }
+
+    fn wait(&mut self, id: &str, timeout_ms: u64) -> Result<i32, String> {
+        let response =
+            self.request(&serde_json::json!({"kind": "wait", "id": id, "timeout_ms": timeout_ms}))?;
+        if response.ok {
+            Ok(response.exit_code.unwrap_or(0))
+        } else {
+            Err(response.message)
+        }
+    }
+
+    fn wait_all(&mut self, ids: &[String], timeout_ms: u64) -> Result<(), String> {
+        let response = self.request(
+            &serde_json::json!({"kind": "wait_all", "ids": ids, "timeout_ms": timeout_ms}),
+        )?;
+        response.ok.then_some(()).ok_or(response.message)
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        let response = self.request(&serde_json::json!({"kind": "cleanup"}))?;
+        response.ok.then_some(()).ok_or(response.message)
+    }
+
+    fn request(&mut self, value: &serde_json::Value) -> Result<AgentResponse, String> {
+        let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+        self.input
+            .write_all(&(bytes.len() as u32).to_le_bytes())
+            .and_then(|_| self.input.write_all(&bytes))
+            .and_then(|_| self.input.flush())
+            .map_err(|error| format!("write agent request failed: {error}"))?;
+        let mut len = [0_u8; 4];
+        self.output
+            .read_exact(&mut len)
+            .map_err(|error| format!("read agent response length failed: {error}"))?;
+        let len = u32::from_le_bytes(len) as usize;
+        let mut bytes = vec![0_u8; len];
+        self.output
+            .read_exact(&mut bytes)
+            .map_err(|error| format!("read agent response failed: {error}"))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse agent response failed: {error}"))
+    }
+}
+
+impl Drop for AgentClient {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_rank_processes(
+    config: &dzb_core::ResolvedConfig,
+    agent: &mut AgentClient,
+) -> Result<RankRunOutput, String> {
     let command_path = adapter_command(config)?;
     let result_dir = Path::new(&config.result_dir);
     let logs = result_dir.join("logs");
@@ -508,7 +744,7 @@ fn spawn_rank_processes(config: &dzb_core::ResolvedConfig) -> Result<RankRunOutp
         })
         .collect::<Vec<_>>();
     let proof_path = result_dir.join("proof.bin");
-    let mut children = Vec::new();
+    let mut rank_ids = Vec::new();
     for rank in 0..config.original.roles.prover_ranks {
         let out = logs.join(format!("rank_{rank}.json"));
         let rank_config_path = tmp.join(format!("rank_{rank}.json"));
@@ -521,31 +757,52 @@ fn spawn_rank_processes(config: &dzb_core::ResolvedConfig) -> Result<RankRunOutp
                 .then(|| proof_path.to_string_lossy().into_owned()),
         )?;
         write_json_pretty(&rank_config_path, &rank_config).map_err(|error| error.to_string())?;
-        let stdout = File::create(logs.join(format!("rank_{rank}.stdout.log")))
-            .map_err(|error| error.to_string())?;
-        let stderr = File::create(logs.join(format!("rank_{rank}.stderr.log")))
-            .map_err(|error| error.to_string())?;
-        let mut command = Command::new(&command_path);
-        command
-            .arg("prove")
-            .arg("--config")
-            .arg(&rank_config_path)
-            .args(&config.original.protocol.args)
-            .env("DZB_RANK_CONFIG", &rank_config_path)
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "DZB_RANK_CONFIG".to_owned(),
+            rank_config_path.to_string_lossy().into_owned(),
+        );
         for (key, value) in standard_thread_budget_env(config.original.resources.worker_threads) {
-            command.env(key, value);
+            env.insert(key, value);
         }
         if config.platform == Platform::Darwin {
-            command.env("DZB_DARWIN_QOS", "user_initiated");
+            env.insert("DZB_DARWIN_QOS".to_owned(), "user_initiated".to_owned());
         }
-        let child = command
-            .spawn()
-            .map_err(|error| format!("spawn adapter rank {rank} failed: {error}"))?;
-        children.push((rank, child));
+        let id = format!("rank-{rank}");
+        let mut args = vec![
+            config.original.protocol.prove_subcommand.clone(),
+            "--config".to_owned(),
+            rank_config_path.to_string_lossy().into_owned(),
+        ];
+        args.extend(config.original.protocol.args.clone());
+        agent.launch(AgentLaunch {
+            id: id.clone(),
+            executable: command_path.to_string_lossy().into_owned(),
+            args,
+            env,
+            stdout_path: logs
+                .join(format!("rank_{rank}.stdout.log"))
+                .to_string_lossy()
+                .into_owned(),
+            stderr_path: logs
+                .join(format!("rank_{rank}.stderr.log"))
+                .to_string_lossy()
+                .into_owned(),
+            run_id: config.run_id.clone(),
+            cpuset: strict_cpuset(config, rank, config.original.resources.worker_threads),
+            memory_limit_bytes: strict_memory_limit(config)?,
+            strict_linux: config.platform == Platform::Linux && config.original.memory.cgroup,
+        })?;
+        rank_ids.push((rank, id));
     }
-    wait_for_ranks(children)?;
+    let ids = rank_ids
+        .iter()
+        .map(|(_, id)| id.clone())
+        .collect::<Vec<_>>();
+    agent.wait_all(
+        &ids,
+        config.original.timeouts.prove_sec.saturating_mul(1_000),
+    )?;
     let mut rank_outputs = Vec::new();
     let mut communication = CommunicationCounters::new(config.original.roles.prover_ranks);
     let mut critical_path = 0.0_f64;
@@ -576,6 +833,31 @@ fn spawn_rank_processes(config: &dzb_core::ResolvedConfig) -> Result<RankRunOutp
     })
 }
 
+fn strict_cpuset(
+    config: &dzb_core::ResolvedConfig,
+    slot: usize,
+    thread_count: usize,
+) -> Option<String> {
+    (config.platform == Platform::Linux && config.original.resources.no_overcommit).then(|| {
+        let first = slot.saturating_mul(thread_count);
+        if thread_count == 1 {
+            first.to_string()
+        } else {
+            format!("{first}-{}", first + thread_count - 1)
+        }
+    })
+}
+
+fn strict_memory_limit(config: &dzb_core::ResolvedConfig) -> Result<Option<u64>, String> {
+    if config.platform == Platform::Linux && config.original.memory.cgroup {
+        dzb_core::parse_byte_size(&config.original.memory.per_rank_limit)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(None)
+    }
+}
+
 fn platform_evidence(config: &dzb_core::ResolvedConfig, mode: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "platform": config.platform.as_str(),
@@ -596,28 +878,6 @@ fn platform_evidence(config: &dzb_core::ResolvedConfig, mode: Option<&str>) -> s
             "perf": config.capability.perf_counters.linux_perf_equivalent.supported
         }
     })
-}
-
-fn wait_for_ranks(mut children: Vec<(usize, Child)>) -> Result<(), String> {
-    let mut failure = None;
-    for (rank, child) in &mut children {
-        let status = child
-            .wait()
-            .map_err(|error| format!("wait rank {rank} failed: {error}"))?;
-        if !status.success() {
-            failure = Some(format!("rank {rank} exited with status {status}"));
-            break;
-        }
-    }
-    if let Some(error) = failure {
-        for (_, child) in &mut children {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        Err(error)
-    } else {
-        Ok(())
-    }
 }
 
 fn adapter_command(config: &dzb_core::ResolvedConfig) -> Result<PathBuf, String> {
@@ -650,7 +910,53 @@ fn sibling_executable(name: &str) -> Result<PathBuf, String> {
 }
 
 fn cmd_sweep(args: &[String]) -> Result<(), String> {
-    cmd_run(args)
+    let config_path = if args.len() == 1 {
+        PathBuf::from(&args[0])
+    } else {
+        parse_config_arg(args)?
+    };
+    let config = load_config(&config_path).map_err(|error| error.to_string())?;
+    let cells = expand_sweep(&config).map_err(|error| error.to_string())?;
+    let generated = Path::new(&config.experiment.output_dir)
+        .join(&config.experiment.name)
+        .join("sweep-configs");
+    fs::create_dir_all(&generated).map_err(|error| error.to_string())?;
+    for (cell_index, mut cell) in cells.into_iter().enumerate() {
+        let cell_id = format!("cell-{cell_index:03}");
+        let repetitions = cell.experiment.repetitions.max(1);
+        let warmups = cell.experiment.warmups;
+        cell.experiment.repetitions = 1;
+        cell.experiment.warmups = 0;
+        for warmup in 0..warmups {
+            let mut warmup_config = cell.clone();
+            warmup_config.experiment.name = format!(
+                "{}/warmups/{cell_id}/warmup-{warmup:03}",
+                config.experiment.name
+            );
+            let path = generated.join(format!("{cell_id}-warmup-{warmup:03}.yaml"));
+            fs::write(
+                &path,
+                serde_yaml::to_string(&warmup_config).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            cmd_run(&[path.to_string_lossy().into_owned()])?;
+        }
+        for repetition in 0..repetitions {
+            let mut measured = cell.clone();
+            measured.experiment.name = format!(
+                "{}/cells/{cell_id}/repetitions/{repetition:03}",
+                config.experiment.name
+            );
+            let path = generated.join(format!("{cell_id}-repetition-{repetition:03}.yaml"));
+            fs::write(
+                &path,
+                serde_yaml::to_string(&measured).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            cmd_run(&[path.to_string_lossy().into_owned()])?;
+        }
+    }
+    Ok(())
 }
 
 fn cmd_report(args: &[String]) -> Result<(), String> {

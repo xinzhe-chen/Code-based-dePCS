@@ -4,13 +4,14 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use dzb_core::{Manifest, ResolvedConfig, RunJson, write_json_pretty};
+use dzb_core::{Manifest, ResolvedConfig, RunJson, RunStatus, write_json_pretty};
 use dzb_runner::RankRuntimeOutput;
-use dzb_sdk::{PhaseEvent, ProofArtifact};
+use dzb_sdk::{PhaseEvent, ProofArtifact, sha256_hex};
 use dzb_transport::CommunicationCounters;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExperimentOutput {
+    pub status: RunStatus,
     pub phases: Vec<PhaseEvent>,
     pub proof: ProofArtifact,
     pub communication: CommunicationCounters,
@@ -57,6 +58,9 @@ pub fn write_outputs(
     write_json_pretty(
         &result_dir.join("verifier.json"),
         &serde_json::json!({
+            "schema_version": 2,
+            "proof_sha256": output.proof.sha256,
+            "statement_sha256": fs::read(result_dir.join("statement.bin")).ok().map(|bytes| sha256_hex(&bytes)),
             "median_ms": output.verifier_ms,
             "p95_ms": output.verifier_ms,
             "thread_budget": config.verifier_threads,
@@ -68,15 +72,21 @@ pub fn write_outputs(
     write_chrome_trace(result_dir, &output.phases)?;
     write_html_report(result_dir, config, output)?;
     let run_json = RunJson {
+        schema_version: 2,
         run_id: config.run_id.clone(),
         experiment: config.original.experiment.name.clone(),
         platform: config.platform.as_str().to_owned(),
         isolation_tier: config.isolation_tier.as_str().to_owned(),
-        status: "ok".to_owned(),
+        status: output.status.as_str().to_owned(),
         prover_critical_path_ms: output.prover_critical_path_ms,
         prover_wall_controller_ms: output.prover_wall_controller_ms,
         proof_size_bytes: output.proof.bytes.len(),
         proof_sha256: output.proof.sha256.clone(),
+        statement_size_bytes: fs::read(result_dir.join("statement.bin"))
+            .map_or(0, |bytes| bytes.len()),
+        statement_sha256: fs::read(result_dir.join("statement.bin"))
+            .ok()
+            .map(|bytes| sha256_hex(&bytes)),
         total_protocol_bytes: output.communication.total_payload_bytes(),
         total_framed_bytes: output.communication.total_framed_bytes(),
         message_count: output.communication.message_count(),
@@ -103,12 +113,26 @@ fn write_events(result_dir: &Path, phases: &[PhaseEvent]) -> std::io::Result<()>
 
 fn write_phase_csv(result_dir: &Path, phases: &[PhaseEvent]) -> std::io::Result<()> {
     let mut file = File::create(result_dir.join("per_phase.csv"))?;
-    writeln!(file, "phase,start_ms,duration_ms")?;
+    writeln!(
+        file,
+        "rank,phase_id,parent_phase_id,category,iteration,phase,start_ns,duration_ns,start_ms,duration_ms"
+    )?;
     for phase in phases {
         writeln!(
             file,
-            "{},{:.3},{:.3}",
-            phase.name, phase.start_ms, phase.duration_ms
+            "{},{},{},{},{},{},{},{},{:.3},{:.3}",
+            phase.rank,
+            phase.phase_id,
+            phase
+                .parent_phase_id
+                .map_or_else(String::new, |id| id.to_string()),
+            phase.category,
+            phase.iteration,
+            phase.name,
+            phase.start_ns,
+            phase.duration_ns,
+            phase.start_ms,
+            phase.duration_ms
         )?;
     }
     Ok(())
@@ -222,12 +246,12 @@ fn write_chrome_trace(result_dir: &Path, phases: &[PhaseEvent]) -> std::io::Resu
         .map(|phase| {
             serde_json::json!({
                 "name": phase.name,
-                "cat": "phase",
+                "cat": phase.category,
                 "ph": "X",
                 "ts": phase.start_ms * 1000.0,
                 "dur": phase.duration_ms * 1000.0,
-                "pid": 0,
-                "tid": 0
+                "pid": phase.rank,
+                "tid": phase.phase_id
             })
         })
         .collect::<Vec<_>>();

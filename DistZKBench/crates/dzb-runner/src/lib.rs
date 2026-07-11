@@ -42,6 +42,9 @@ pub struct RankRuntimeConfig {
     pub max_frame_payload: usize,
     pub output_path: String,
     pub proof_path: Option<String>,
+    pub statement_path: Option<String>,
+    #[serde(default)]
+    pub protocol_parameters: serde_json::Value,
     pub thread_budget: usize,
     pub shaper: RankShaperConfig,
     pub memory_limit_bytes: Option<u64>,
@@ -316,6 +319,13 @@ pub fn rank_runtime_config_from_resolved(
         max_frame_payload,
         output_path,
         proof_path,
+        statement_path: (rank == config.original.roles.master_rank).then(|| {
+            Path::new(&config.result_dir)
+                .join("statement.bin")
+                .to_string_lossy()
+                .into_owned()
+        }),
+        protocol_parameters: config.original.protocol.parameters.clone(),
         thread_budget: config.original.resources.worker_threads,
         shaper: RankShaperConfig {
             bandwidth_bytes_per_sec: parse_shaper_bandwidth(
@@ -433,6 +443,7 @@ fn send_payload(
         .check_send(config.rank as u32, dst as u32)
         .map_err(|error| error.to_string())?;
     let frames = encode_frames(
+        &config.run_id,
         1,
         config.rank as u32,
         dst as u32,
@@ -768,7 +779,16 @@ fn record_message(
     topology
         .check_send(src as u32, dst as u32)
         .map_err(|error| error.to_string())?;
-    let frames = encode_frames(1, src as u32, dst as u32, 1, 1, payload, 16 * 1024 * 1024);
+    let frames = encode_frames(
+        "in-process-toy",
+        1,
+        src as u32,
+        dst as u32,
+        1,
+        1,
+        payload,
+        16 * 1024 * 1024,
+    );
     ctx.communication
         .record_message(src as u32, dst as u32, payload.len(), frames.len());
     Ok(())

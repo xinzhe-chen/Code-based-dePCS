@@ -7,10 +7,11 @@ pub mod units;
 pub use config::{
     CacheConfig, Config, ConfigError, EdgeShaperConfig, ExperimentConfig, MemoryConfig,
     MetricsConfig, NetworkConfig, PlatformBackendName, PlatformConfig, ProtocolConfig,
-    ResolvedConfig, ResourcesConfig, RolesConfig, ShaperConfig, TimeoutsConfig, TopologyConfig,
-    TopologyKind, ToyProtocolConfig, load_config, resolve_config,
+    ResolvedConfig, ResourcesConfig, RolesConfig, ShaperConfig, SweepAxis, SweepConfig,
+    TimeoutsConfig, TopologyConfig, TopologyKind, ToyProtocolConfig, expand_sweep, load_config,
+    resolve_config,
 };
-pub use manifest::{Manifest, RunJson, write_json_pretty};
+pub use manifest::{Manifest, RunJson, RunStatus, write_json_pretty};
 pub use platform::{
     CapabilityReport, FeatureAvailability, IsolationTier, MemoryControl, NetworkEmulation,
     PerfCounters, Platform, ResourceControl,

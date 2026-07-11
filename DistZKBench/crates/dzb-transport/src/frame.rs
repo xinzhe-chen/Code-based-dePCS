@@ -25,6 +25,8 @@ pub struct FrameHeader {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct FrameKey {
+    pub run_id_hi: u64,
+    pub run_id_lo: u64,
     pub src_rank: RankId,
     pub dst_rank: RankId,
     pub tag: u32,
@@ -50,13 +52,14 @@ pub struct FrameHeaderArgs {
 }
 
 impl FrameHeader {
-    pub fn new(args: FrameHeaderArgs) -> Self {
+    pub fn new(run_id: &str, args: FrameHeaderArgs, payload_crc32: u32) -> Self {
+        let (run_id_hi, run_id_lo) = run_id_words(run_id);
         Self {
             magic: FRAME_MAGIC,
-            version: 1,
+            version: 2,
             header_len: FRAME_HEADER_LEN as u16,
-            run_id_hi: 0,
-            run_id_lo: 0,
+            run_id_hi,
+            run_id_lo,
             phase_id: args.phase_id,
             src_rank: args.src_rank,
             dst_rank: args.dst_rank,
@@ -66,7 +69,7 @@ impl FrameHeader {
             frame_count: args.frame_count,
             flags: 0,
             payload_len: args.payload_len,
-            payload_crc32: 0,
+            payload_crc32,
             reserved: 0,
         }
     }
@@ -116,11 +119,16 @@ impl FrameHeader {
         if header.magic != FRAME_MAGIC {
             return Err("bad DZKB frame magic".to_owned());
         }
+        if header.version != 2 || header.header_len as usize != FRAME_HEADER_LEN {
+            return Err("unsupported DZKB frame version or header length".to_owned());
+        }
         Ok(header)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn encode_frames(
+    run_id: &str,
     phase_id: u32,
     src_rank: RankId,
     dst_rank: RankId,
@@ -137,20 +145,45 @@ pub fn encode_frames(
             let end = payload.len().min(start + chunk);
             let bytes = payload.get(start..end).unwrap_or(&[]);
             Frame {
-                header: FrameHeader::new(FrameHeaderArgs {
-                    phase_id,
-                    src_rank,
-                    dst_rank,
-                    tag,
-                    message_id,
-                    frame_index: index as u32,
-                    frame_count: frame_count as u32,
-                    payload_len: bytes.len() as u64,
-                }),
+                header: FrameHeader::new(
+                    run_id,
+                    FrameHeaderArgs {
+                        phase_id,
+                        src_rank,
+                        dst_rank,
+                        tag,
+                        message_id,
+                        frame_index: index as u32,
+                        frame_count: frame_count as u32,
+                        payload_len: bytes.len() as u64,
+                    },
+                    crc32(bytes),
+                ),
                 payload: bytes.to_vec(),
             }
         })
         .collect()
+}
+
+pub fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffff_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320_u32 & (0_u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
+
+pub fn run_id_words(run_id: &str) -> (u64, u64) {
+    let mut hi = 0xcbf2_9ce4_8422_2325_u64;
+    let mut lo = 0x8422_2325_cbf2_9ce4_u64;
+    for byte in run_id.bytes() {
+        hi = (hi ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+        lo = (lo ^ u64::from(byte.rotate_left(1))).wrapping_mul(0x100_0000_01b3);
+    }
+    (hi, lo)
 }
 
 fn write_u16(out: &mut [u8], offset: usize, value: u16) {
@@ -197,22 +230,26 @@ mod tests {
 
     #[test]
     fn header_round_trips() {
-        let header = FrameHeader::new(FrameHeaderArgs {
-            phase_id: 3,
-            src_rank: 1,
-            dst_rank: 2,
-            tag: 9,
-            message_id: 10,
-            frame_index: 0,
-            frame_count: 1,
-            payload_len: 42,
-        });
+        let header = FrameHeader::new(
+            "test-run",
+            FrameHeaderArgs {
+                phase_id: 3,
+                src_rank: 1,
+                dst_rank: 2,
+                tag: 9,
+                message_id: 10,
+                frame_index: 0,
+                frame_count: 1,
+                payload_len: 42,
+            },
+            0,
+        );
         assert_eq!(FrameHeader::decode(&header.encode()), Ok(header));
     }
 
     #[test]
     fn chunks_payload() {
-        let frames = encode_frames(1, 0, 1, 7, 8, &[1, 2, 3, 4, 5], 2);
+        let frames = encode_frames("test-run", 1, 0, 1, 7, 8, &[1, 2, 3, 4, 5], 2);
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[2].payload, vec![5]);
     }

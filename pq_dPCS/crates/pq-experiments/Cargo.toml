@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+dzb-sdk = { path = "../../../DistZKBench/crates/dzb-sdk" }
 pq-core = { path = "../pq-core" }
 pq-pcs = { path = "../pq-pcs" }
 bincode = { workspace = true }

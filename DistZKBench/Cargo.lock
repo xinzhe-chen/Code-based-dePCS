@@ -50,7 +50,10 @@ dependencies = [
 name = "dzb-agent"
 version = "0.1.0"
 dependencies = [
+ "dzb-core",
  "dzb-platform",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Instant, SystemTime};
 
+use dzb_sdk::Dzb;
 use pq_pcs::depcs::protocol11::{self as protocol11, Protocol11Config, SecurityProfile};
 use pq_pcs::depcs::{
     self, PAPER_PCS_HASH, PAPER_PCS_LICENSE, PAPER_PCS_SECURITY_BITS, PAPER_PCS_SOURCE_REV,
@@ -371,6 +372,8 @@ fn main() {
 
 fn run(args: Vec<String>) -> Result<(), CliError> {
     match args.first().map(String::as_str) {
+        Some("dzb-prove") => run_dzb_prove(),
+        Some("dzb-verify") => run_dzb_verify(&args[1..]),
         Some("pcs-benchmark") => run_pcs_benchmark(parse_pcs_benchmark_command(&args[1..])?),
         Some("verify-pcs-results") => {
             verify_pcs_results(parse_verify_pcs_results_command(&args[1..])?)
@@ -385,6 +388,293 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
             usage()
         ))),
     }
+}
+
+struct DzbProtocolChannel<'a> {
+    dzb: &'a mut Dzb,
+}
+
+impl protocol11::Protocol11Channel for DzbProtocolChannel<'_> {
+    fn rank(&self) -> usize {
+        self.dzb.context().rank()
+    }
+
+    fn world_size(&self) -> usize {
+        self.dzb.context().world_size()
+    }
+
+    fn master_rank(&self) -> usize {
+        self.dzb.context().master_rank()
+    }
+
+    fn gather_bytes(
+        &mut self,
+        tag: u32,
+        payload: Vec<u8>,
+    ) -> std::result::Result<Option<Vec<Vec<u8>>>, String> {
+        self.dzb.gather(self.master_rank() as u32, tag, &payload)
+    }
+
+    fn broadcast_bytes(
+        &mut self,
+        tag: u32,
+        payload: Option<Vec<u8>>,
+    ) -> std::result::Result<Vec<u8>, String> {
+        let root = self.master_rank() as u32;
+        if self.rank() == self.master_rank() {
+            let bytes = payload.ok_or_else(|| "master broadcast payload missing".to_owned())?;
+            self.dzb.broadcast(root, tag, &bytes)?;
+            Ok(bytes)
+        } else {
+            self.dzb
+                .broadcast(root, tag, &[])?
+                .ok_or_else(|| "worker broadcast payload missing".to_owned())
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum DzbStatementEnvelope {
+    Protocol11(protocol11::Protocol11Statement),
+    Protocol11Batch {
+        config: Protocol11Config,
+        setup_seed: [u8; 32],
+        commitment: protocol11::Protocol11Commitment,
+        claims: Vec<(Vec<depcs::PaperField>, depcs::PaperField)>,
+    },
+}
+
+fn run_dzb_prove() -> Result<(), CliError> {
+    let mut dzb = dzb_sdk::init().map_err(CliError)?;
+    let params = dzb.context().protocol_parameters().clone();
+    let nv = params
+        .get("nv")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(10) as usize;
+    let opening = params
+        .get("opening")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("protocol11");
+    let batch_claims = params
+        .get("batch_claims")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(2) as usize;
+    let security = match params
+        .get("security")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("test-only")
+    {
+        "paper100" => SecurityProfile::Paper100,
+        "test-only" => SecurityProfile::TestOnly {
+            queries: params
+                .get("queries")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(2) as usize,
+        },
+        other => {
+            return Err(CliError(format!(
+                "unknown DistZKBench security profile '{other}'"
+            )));
+        }
+    };
+    if nv >= usize::BITS as usize {
+        return Err(CliError("nv exceeds usize width".to_owned()));
+    }
+    let config = Protocol11Config {
+        original_len: 1usize << nv,
+        workers: dzb.context().world_size(),
+        security,
+    };
+    let setup_seed = dzb_sdk::deterministic_seed(
+        dzb.context().config().random_seed,
+        dzb.context().run_id(),
+        0,
+        0,
+    );
+    let pp = protocol11::setup(config, setup_seed)
+        .map_err(|error| CliError(format!("DistZKBench protocol11 setup failed: {error}")))?;
+    let rank = dzb.context().rank();
+    let rows = (0..pp.layout.rows_per_worker)
+        .map(|local_row| {
+            (0..pp.layout.columns)
+                .map(|column| {
+                    let global_row = rank * pp.layout.rows_per_worker + local_row;
+                    let index = global_row * pp.layout.columns + column;
+                    depcs::PaperField::from_parts(
+                        ((index as u64 + 3) * 17) & ((1_u64 << 61) - 1),
+                        ((index as u64 + 11) * 23) & ((1_u64 << 61) - 1),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let (worker_commitment, worker_state) = dzb
+        .phase("protocol11.worker_commit", |_| {
+            protocol11::commit_worker(
+                &pp,
+                protocol11::WorkerShard {
+                    worker_id: rank,
+                    rows,
+                },
+            )
+            .map_err(|error| format!("DistZKBench worker commit failed: {error}"))
+        })
+        .map_err(CliError)?;
+    let claim_count = if opening == "protocol11-batch" {
+        batch_claims.max(2)
+    } else {
+        1
+    };
+    let mut master_outputs = dzb
+        .phase("protocol11.distributed_prove", |dzb| {
+            let mut master_outputs = Vec::new();
+            let mut channel = DzbProtocolChannel { dzb };
+            for claim in 0..claim_count {
+                let point = (0..pp.layout.nv)
+                    .map(|index| {
+                        depcs::PaperField::from_parts(
+                            (index as u64 + 5 + claim as u64) * 19,
+                            (index as u64 + 7 + claim as u64) * 23,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(output) = protocol11::prove_distributed_fs(
+                    &pp,
+                    worker_commitment.clone(),
+                    worker_state.clone(),
+                    &point,
+                    &mut channel,
+                )
+                .map_err(|error| format!("distributed Protocol 11 failed: {error}"))?
+                {
+                    master_outputs.push(output);
+                }
+            }
+            Ok(master_outputs)
+        })
+        .map_err(CliError)?;
+    dzb.metrics.gauge(
+        "protocol11.security_claim_bits",
+        pp.security.target_bits.unwrap_or(0) as u64,
+    );
+    dzb.metrics
+        .gauge("protocol11.batch_claim_count", claim_count as u64);
+    if rank == dzb.context().master_rank() {
+        let (statement_bytes, proof_bytes) = if opening == "protocol11-batch" {
+            let commitment = master_outputs[0].0.commitment.clone();
+            let claims = master_outputs
+                .iter()
+                .map(|(statement, proof)| protocol11::Protocol11BatchClaim {
+                    point: statement.point.clone(),
+                    claimed_value: statement.claimed_value,
+                    proof: proof.clone(),
+                })
+                .collect::<Vec<_>>();
+            let batch = protocol11::bind_batch_claims(&pp, &commitment, claims)
+                .map_err(|error| CliError(format!("bind Protocol 11 batch failed: {error}")))?;
+            let statement = DzbStatementEnvelope::Protocol11Batch {
+                config,
+                setup_seed,
+                commitment,
+                claims: master_outputs
+                    .iter()
+                    .map(|(statement, _)| (statement.point.clone(), statement.claimed_value))
+                    .collect(),
+            };
+            (
+                bincode::serialize(&statement).map_err(|error| CliError(error.to_string()))?,
+                protocol11::serialize_batch_proof(&batch)
+                    .map_err(|error| CliError(error.to_string()))?,
+            )
+        } else {
+            let (statement, proof) = master_outputs
+                .pop()
+                .ok_or_else(|| CliError("master protocol output missing".to_owned()))?;
+            (
+                bincode::serialize(&DzbStatementEnvelope::Protocol11(statement))
+                    .map_err(|error| CliError(error.to_string()))?,
+                protocol11::serialize_proof(&proof).map_err(|error| CliError(error.to_string()))?,
+            )
+        };
+        dzb.artifacts
+            .publish_statement_bytes(&statement_bytes)
+            .map_err(CliError)?;
+        dzb.artifacts
+            .publish_proof_bytes(proof_bytes)
+            .map_err(CliError)?;
+    }
+    dzb.finish().map_err(CliError)?;
+    Ok(())
+}
+
+fn run_dzb_verify(args: &[String]) -> Result<(), CliError> {
+    let proof_path = adapter_arg(args, "--proof")?;
+    let statement_path = adapter_arg(args, "--statement")?;
+    let out = adapter_arg(args, "--out")?;
+    let proof_bytes =
+        fs::read(&proof_path).map_err(|error| CliError(format!("read proof failed: {error}")))?;
+    let statement_bytes = fs::read(&statement_path)
+        .map_err(|error| CliError(format!("read statement failed: {error}")))?;
+    let statement: DzbStatementEnvelope = bincode::deserialize(&statement_bytes)
+        .map_err(|error| CliError(format!("decode statement failed: {error}")))?;
+    let (opening, verified) = match statement {
+        DzbStatementEnvelope::Protocol11(statement) => {
+            let pp = protocol11::setup(statement.config, statement.setup_seed)
+                .map_err(|error| CliError(error.to_string()))?;
+            let proof = protocol11::deserialize_proof(&proof_bytes)
+                .map_err(|error| CliError(error.to_string()))?;
+            protocol11::verify_fs(
+                &pp,
+                &statement.commitment,
+                &statement.point,
+                statement.claimed_value,
+                &proof,
+            )
+            .map_err(|error| CliError(error.to_string()))?;
+            ("protocol11", true)
+        }
+        DzbStatementEnvelope::Protocol11Batch {
+            config,
+            setup_seed,
+            commitment,
+            claims,
+        } => {
+            let pp = protocol11::setup(config, setup_seed)
+                .map_err(|error| CliError(error.to_string()))?;
+            let proof = protocol11::deserialize_batch_proof(&proof_bytes)
+                .map_err(|error| CliError(error.to_string()))?;
+            if proof
+                .claims
+                .iter()
+                .map(|claim| (&claim.point, claim.claimed_value))
+                .ne(claims.iter().map(|(point, value)| (point, *value)))
+            {
+                return Err(CliError("batch statement/proof claim mismatch".to_owned()));
+            }
+            protocol11::verify_batch_fs(&pp, &commitment, &proof)
+                .map_err(|error| CliError(error.to_string()))?;
+            ("protocol11-batch", true)
+        }
+    };
+    fs::write(
+        out,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "verified": verified,
+            "opening": opening,
+            "pid": std::process::id(),
+            "proof_sha256": dzb_sdk::sha256_hex(&proof_bytes),
+            "statement_sha256": dzb_sdk::sha256_hex(&statement_bytes),
+        }))
+        .map_err(|error| CliError(error.to_string()))?,
+    )
+    .map_err(|error| CliError(format!("write verifier report failed: {error}")))?;
+    Ok(())
+}
+
+fn adapter_arg(args: &[String], key: &str) -> Result<String, CliError> {
+    args.windows(2)
+        .find_map(|pair| (pair[0] == key).then(|| pair[1].clone()))
+        .ok_or_else(|| CliError(format!("{key} is required")))
 }
 
 fn run_pcs_network_worker(args: &[String]) -> Result<(), CliError> {

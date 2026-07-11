@@ -17,9 +17,11 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub experiment: ExperimentConfig,
     pub platform: PlatformConfig,
     pub roles: RolesConfig,
@@ -31,6 +33,43 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub protocol: ProtocolConfig,
     pub timeouts: TimeoutsConfig,
+    pub sweep: SweepConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            schema_version: default_schema_version(),
+            experiment: ExperimentConfig::default(),
+            platform: PlatformConfig::default(),
+            roles: RolesConfig::default(),
+            topology: TopologyConfig::default(),
+            resources: ResourcesConfig::default(),
+            memory: MemoryConfig::default(),
+            cache: CacheConfig::default(),
+            network: NetworkConfig::default(),
+            metrics: MetricsConfig::default(),
+            protocol: ProtocolConfig::default(),
+            timeouts: TimeoutsConfig::default(),
+            sweep: SweepConfig::default(),
+        }
+    }
+}
+
+const fn default_schema_version() -> u32 {
+    1
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SweepConfig {
+    pub axes: Vec<SweepAxis>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SweepAxis {
+    pub path: String,
+    pub values: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -286,6 +325,9 @@ pub struct ProtocolConfig {
     pub mode: String,
     pub command: String,
     pub args: Vec<String>,
+    pub prove_subcommand: String,
+    pub verify_subcommand: String,
+    pub parameters: serde_json::Value,
     pub toy: ToyProtocolConfig,
 }
 
@@ -296,6 +338,9 @@ impl Default for ProtocolConfig {
             mode: "sdk-binary".to_owned(),
             command: String::new(),
             args: Vec::new(),
+            prove_subcommand: "prove".to_owned(),
+            verify_subcommand: "verify".to_owned(),
+            parameters: serde_json::json!({}),
             toy: ToyProtocolConfig::default(),
         }
     }
@@ -350,10 +395,73 @@ pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
     serde_yaml::from_str(&text).map_err(|error| ConfigError(format!("parse yaml failed: {error}")))
 }
 
+pub fn expand_sweep(config: &Config) -> Result<Vec<Config>, ConfigError> {
+    let mut cells = vec![config.clone()];
+    for axis in &config.sweep.axes {
+        if axis.values.is_empty() {
+            return Err(ConfigError(format!(
+                "sweep axis '{}' has no values",
+                axis.path
+            )));
+        }
+        let mut next = Vec::with_capacity(cells.len().saturating_mul(axis.values.len()));
+        for cell in cells {
+            for value in &axis.values {
+                let mut expanded = cell.clone();
+                set_sweep_value(&mut expanded, &axis.path, value)?;
+                next.push(expanded);
+            }
+        }
+        cells = next;
+    }
+    for cell in &mut cells {
+        cell.sweep.axes.clear();
+    }
+    Ok(cells)
+}
+
+fn set_sweep_value(
+    config: &mut Config,
+    path: &str,
+    value: &serde_json::Value,
+) -> Result<(), ConfigError> {
+    match path {
+        "roles.prover_ranks" => {
+            config.roles.prover_ranks = value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| ConfigError(format!("sweep value for {path} must be an integer")))?;
+        }
+        "resources.worker_threads" => {
+            config.resources.worker_threads = value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| ConfigError(format!("sweep value for {path} must be an integer")))?;
+        }
+        _ => {
+            let Some(key) = path.strip_prefix("protocol.parameters.") else {
+                return Err(ConfigError(format!("unsupported sweep path '{path}'")));
+            };
+            let object =
+                config.protocol.parameters.as_object_mut().ok_or_else(|| {
+                    ConfigError("protocol.parameters must be a mapping".to_owned())
+                })?;
+            object.insert(key.to_owned(), value.clone());
+        }
+    }
+    Ok(())
+}
+
 pub fn resolve_config(
     config: Config,
     capability: CapabilityReport,
 ) -> Result<ResolvedConfig, ConfigError> {
+    if !(1..=2).contains(&config.schema_version) {
+        return Err(ConfigError(format!(
+            "unsupported config schema_version {}",
+            config.schema_version
+        )));
+    }
     let platform = match config.platform.backend {
         PlatformBackendName::Auto => Platform::host(),
         PlatformBackendName::Linux => Platform::Linux,
@@ -522,5 +630,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn expands_registered_sweep_axes_and_rejects_unknown_paths() {
+        let mut config = Config::default();
+        config.sweep.axes = vec![
+            SweepAxis {
+                path: "roles.prover_ranks".to_owned(),
+                values: vec![serde_json::json!(2), serde_json::json!(4)],
+            },
+            SweepAxis {
+                path: "protocol.parameters.nv".to_owned(),
+                values: vec![serde_json::json!(18), serde_json::json!(19)],
+            },
+        ];
+        let cells = expand_sweep(&config).expect("valid sweep");
+        assert_eq!(cells.len(), 4);
+        assert_eq!(cells[3].roles.prover_ranks, 4);
+        assert_eq!(cells[3].protocol.parameters["nv"], 19);
+
+        config.sweep.axes[0].path = "unknown.path".to_owned();
+        assert!(expand_sweep(&config).is_err());
     }
 }

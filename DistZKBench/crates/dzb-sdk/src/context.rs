@@ -7,9 +7,27 @@ use dzb_transport::CommunicationCounters;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PhaseEvent {
+    #[serde(default)]
+    pub rank: usize,
+    #[serde(default)]
+    pub phase_id: u32,
+    #[serde(default)]
+    pub parent_phase_id: Option<u32>,
+    #[serde(default = "default_phase_category")]
+    pub category: String,
+    #[serde(default)]
+    pub iteration: usize,
+    #[serde(default)]
+    pub start_ns: u64,
+    #[serde(default)]
+    pub duration_ns: u64,
     pub name: String,
     pub start_ms: f64,
     pub duration_ms: f64,
+}
+
+fn default_phase_category() -> String {
+    "protocol".to_owned()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -51,6 +69,13 @@ impl ProverCtx {
         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
         let _ = self.phase_stack.pop();
         self.phases.push(PhaseEvent {
+            rank: 0,
+            phase_id: self.phases.len() as u32 + 1,
+            parent_phase_id: None,
+            category: default_phase_category(),
+            iteration: 0,
+            start_ns: start.duration_since(self.started).as_nanos() as u64,
+            duration_ns: start.elapsed().as_nanos() as u64,
             name,
             start_ms,
             duration_ms,

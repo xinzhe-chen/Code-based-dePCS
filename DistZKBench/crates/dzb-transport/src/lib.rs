@@ -6,7 +6,8 @@ pub mod topology;
 
 pub use counters::{CommunicationCounters, EdgeCounter};
 pub use frame::{
-    FRAME_HEADER_LEN, FRAME_MAGIC, Frame, FrameHeader, FrameHeaderArgs, FrameKey, encode_frames,
+    FRAME_HEADER_LEN, FRAME_MAGIC, Frame, FrameHeader, FrameHeaderArgs, FrameKey, crc32,
+    encode_frames, run_id_words,
 };
 pub use shaper::UserspaceShaper;
 pub use tcp::{

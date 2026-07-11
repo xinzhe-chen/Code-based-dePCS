@@ -1,5 +1,6 @@
+schema_version: 2
 experiment:
-  name: pq_depcs_native_small
+  name: pq_depcs_batch_small
   run_id: auto
   output_dir: results
   random_seed: 12345
@@ -24,7 +25,7 @@ resources:
 network:
   transport: tcp
   mode: loopback
-  base_port: 39220
+  base_port: 39240
 
 protocol:
   adapter: pq-depcs-adapter
@@ -33,7 +34,8 @@ protocol:
   prove_subcommand: dzb-prove
   verify_subcommand: dzb-verify
   parameters:
-    opening: protocol11
+    opening: protocol11-batch
+    batch_claims: 2
     nv: 10
     security: test-only
     queries: 2

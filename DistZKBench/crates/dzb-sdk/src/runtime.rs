@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use dzb_core::{TopologyKind, parse_byte_size, parse_duration_millis};
 use dzb_transport::{
     CommunicationCounters, Topology, UserspaceShaper, encode_frames, mio_accept, mio_bind,
-    mio_connect, mio_read_message, mio_write_frames, set_nodelay,
+    mio_connect, mio_read_message, mio_write_frames, run_id_words, set_nodelay,
 };
 
 use crate::{PhaseEvent, ProofArtifact, deterministic_bytes, deterministic_seed, sha256_hex};
@@ -33,6 +33,9 @@ pub struct DzbRankConfig {
     pub max_frame_payload: usize,
     pub output_path: String,
     pub proof_path: Option<String>,
+    pub statement_path: Option<String>,
+    #[serde(default)]
+    pub protocol_parameters: serde_json::Value,
     pub thread_budget: usize,
     pub shaper: SdkShaperConfig,
     pub memory_limit_bytes: Option<u64>,
@@ -94,6 +97,10 @@ impl RuntimeContext {
         &self.config.adapter
     }
 
+    pub fn protocol_parameters(&self) -> &serde_json::Value {
+        &self.config.protocol_parameters
+    }
+
     pub fn thread_budget(&self) -> usize {
         self.config.thread_budget
     }
@@ -121,6 +128,7 @@ impl RuntimeContext {
 
 #[derive(Clone, Debug)]
 pub struct Metrics {
+    rank: usize,
     started: Instant,
     phase_stack: Vec<(String, u32, Instant)>,
     phases: Vec<PhaseEvent>,
@@ -129,8 +137,9 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    fn new(started: Instant) -> Self {
+    fn new(started: Instant, rank: usize) -> Self {
         Self {
+            rank,
             started,
             phase_stack: Vec::new(),
             phases: Vec::new(),
@@ -147,10 +156,17 @@ impl Metrics {
     }
 
     pub fn end_phase(&mut self) -> Result<()> {
-        let Some((name, _, start)) = self.phase_stack.pop() else {
+        let Some((name, id, start)) = self.phase_stack.pop() else {
             return Err("no active DistZKBench phase".to_owned());
         };
         self.phases.push(PhaseEvent {
+            rank: self.rank,
+            phase_id: id,
+            parent_phase_id: self.phase_stack.last().map(|(_, parent, _)| *parent),
+            category: "protocol".to_owned(),
+            iteration: 0,
+            start_ns: start.duration_since(self.started).as_nanos() as u64,
+            duration_ns: start.elapsed().as_nanos() as u64,
             name,
             start_ms: start.duration_since(self.started).as_secs_f64() * 1000.0,
             duration_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -245,6 +261,7 @@ impl Network {
             .check_send(self.rank(), to)
             .map_err(|error| error.to_string())?;
         let frames = encode_frames(
+            &self.config.run_id,
             phase_id,
             self.rank(),
             to,
@@ -275,6 +292,9 @@ impl Network {
         loop {
             let mut stream = mio_accept(&mut self.listener, Duration::from_secs(30))?;
             let (key, payload, _) = mio_read_message(&mut stream, Duration::from_secs(30))?;
+            if (key.run_id_hi, key.run_id_lo) != run_id_words(&self.config.run_id) {
+                return Err("received message from a different DistZKBench run".to_owned());
+            }
             if key.dst_rank != self.rank() {
                 return Err(format!(
                     "received message for rank {} on rank {}",
@@ -377,17 +397,59 @@ impl Network {
         if payloads.len() != self.world_size() {
             return Err("all_to_all payloads length must equal world_size".to_owned());
         }
+        let mut outgoing = Vec::new();
         for dst in 0..self.world_size() as RankId {
-            if dst != self.rank() {
-                self.send(dst, tag, &payloads[dst as usize], phase_id)?;
+            if dst == self.rank() {
+                continue;
             }
+            self.topology
+                .check_send(self.rank(), dst)
+                .map_err(|error| error.to_string())?;
+            let frames = encode_frames(
+                &self.config.run_id,
+                phase_id,
+                self.rank(),
+                dst,
+                tag,
+                self.next_message_id,
+                &payloads[dst as usize],
+                self.config.max_frame_payload,
+            );
+            self.next_message_id = self.next_message_id.saturating_add(1);
+            outgoing.push((
+                dst,
+                self.config.listen_addrs[dst as usize].clone(),
+                frames,
+                self.shaper_for(dst),
+                payloads[dst as usize].len(),
+            ));
         }
         let mut values = vec![Vec::new(); self.world_size()];
         values[self.rank() as usize] = payloads[self.rank() as usize].clone();
-        for src in 0..self.world_size() as RankId {
-            if src != self.rank() {
-                values[src as usize] = self.recv(src, tag)?;
+        std::thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::with_capacity(outgoing.len());
+            for (_, addr, frames, shaper, _) in &outgoing {
+                handles.push(scope.spawn(move || -> Result<()> {
+                    let mut stream = mio_connect(addr, Duration::from_secs(30))?;
+                    let _ = set_nodelay(&stream, true);
+                    mio_write_frames(&mut stream, frames, shaper, Duration::from_secs(30))
+                }));
             }
+            for src in 0..self.world_size() as RankId {
+                if src != self.rank() {
+                    values[src as usize] = self.recv(src, tag)?;
+                }
+            }
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| "all-to-all sender thread panicked".to_owned())??;
+            }
+            Ok(())
+        })?;
+        for (dst, _, frames, _, payload_len) in outgoing {
+            self.counters
+                .record_message(self.rank(), dst, payload_len, frames.len());
         }
         Ok(values)
     }
@@ -440,6 +502,7 @@ pub struct IncomingMessage {
 pub struct Artifacts {
     output_path: PathBuf,
     proof_path: Option<PathBuf>,
+    statement_path: Option<PathBuf>,
     proof: Option<ProofArtifact>,
 }
 
@@ -448,6 +511,7 @@ impl Artifacts {
         Self {
             output_path: PathBuf::from(&config.output_path),
             proof_path: config.proof_path.as_ref().map(PathBuf::from),
+            statement_path: config.statement_path.as_ref().map(PathBuf::from),
             proof: None,
         }
     }
@@ -487,6 +551,14 @@ impl Artifacts {
                 .map_err(|error| format!("write proof failed: {error}"))?;
         }
         Ok(proof)
+    }
+
+    pub fn publish_statement_bytes(&self, bytes: &[u8]) -> Result<()> {
+        let path = self
+            .statement_path
+            .as_ref()
+            .ok_or_else(|| "statement path is unavailable for this rank".to_owned())?;
+        fs::write(path, bytes).map_err(|error| format!("write statement failed: {error}"))
     }
 
     pub fn proof(&self) -> Option<&ProofArtifact> {
@@ -662,7 +734,7 @@ pub fn init_from_config(config: DzbRankConfig) -> Result<Dzb> {
     let started = Instant::now();
     Ok(Dzb {
         network: Network::new(&config)?,
-        metrics: Metrics::new(started),
+        metrics: Metrics::new(started, config.rank),
         artifacts: Artifacts::new(&config),
         runtime: RuntimeContext { config, started },
         verifier: VerifierChannel,
@@ -791,6 +863,8 @@ mod tests {
             max_frame_payload: 4,
             output_path: format!("/tmp/dzb-sdk-test-rank-{rank}.json"),
             proof_path: None,
+            statement_path: None,
+            protocol_parameters: serde_json::json!({}),
             thread_budget: 1,
             shaper: SdkShaperConfig::default(),
             memory_limit_bytes: None,

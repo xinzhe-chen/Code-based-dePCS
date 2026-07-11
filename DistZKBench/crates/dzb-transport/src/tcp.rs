@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
-use crate::frame::{FRAME_HEADER_LEN, Frame, FrameHeader, FrameKey};
+use crate::frame::{FRAME_HEADER_LEN, Frame, FrameHeader, FrameKey, crc32};
 use crate::shaper::UserspaceShaper;
 
 const LISTENER: Token = Token(0);
@@ -46,12 +46,17 @@ pub fn read_frame<R: Read>(stream: &mut R) -> Result<Frame, String> {
     stream
         .read_exact(&mut payload)
         .map_err(|error| format!("read DZKB frame payload failed: {error}"))?;
+    if crc32(&payload) != header.payload_crc32 {
+        return Err("DZKB payload CRC32 mismatch".to_owned());
+    }
     Ok(Frame { header, payload })
 }
 
 pub fn read_message<R: Read>(stream: &mut R) -> Result<(FrameKey, Vec<u8>, usize), String> {
     let first = read_frame(stream)?;
     let key = FrameKey {
+        run_id_hi: first.header.run_id_hi,
+        run_id_lo: first.header.run_id_lo,
         src_rank: first.header.src_rank,
         dst_rank: first.header.dst_rank,
         tag: first.header.tag,
@@ -64,6 +69,8 @@ pub fn read_message<R: Read>(stream: &mut R) -> Result<(FrameKey, Vec<u8>, usize
     while frames.len() < frame_count {
         let frame = read_frame(stream)?;
         let next_key = FrameKey {
+            run_id_hi: frame.header.run_id_hi,
+            run_id_lo: frame.header.run_id_lo,
             src_rank: frame.header.src_rank,
             dst_rank: frame.header.dst_rank,
             tag: frame.header.tag,
@@ -74,6 +81,12 @@ pub fn read_message<R: Read>(stream: &mut R) -> Result<(FrameKey, Vec<u8>, usize
                 "interleaved DZKB messages on one stream are unsupported in MVP-3 TCP helper"
                     .to_owned(),
             );
+        }
+        if frame.header.run_id_hi != first.header.run_id_hi
+            || frame.header.run_id_lo != first.header.run_id_lo
+            || frame.header.frame_count != first.header.frame_count
+        {
+            return Err("DZKB frame run id or count mismatch".to_owned());
         }
         frames.insert(frame.header.frame_index, frame.payload);
     }
@@ -178,6 +191,8 @@ pub fn mio_read_message(
     let result = (|| {
         let first = read_frame_mio(stream, &mut poll, timeout)?;
         let key = FrameKey {
+            run_id_hi: first.header.run_id_hi,
+            run_id_lo: first.header.run_id_lo,
             src_rank: first.header.src_rank,
             dst_rank: first.header.dst_rank,
             tag: first.header.tag,
@@ -190,6 +205,8 @@ pub fn mio_read_message(
         while frames.len() < frame_count {
             let frame = read_frame_mio(stream, &mut poll, timeout)?;
             let next_key = FrameKey {
+                run_id_hi: frame.header.run_id_hi,
+                run_id_lo: frame.header.run_id_lo,
                 src_rank: frame.header.src_rank,
                 dst_rank: frame.header.dst_rank,
                 tag: frame.header.tag,
@@ -281,6 +298,9 @@ fn read_frame_mio(
         .map_err(|_| "DZKB payload length does not fit usize".to_owned())?;
     let mut payload = vec![0_u8; payload_len];
     read_exact_mio(stream, &mut payload, poll, timeout)?;
+    if crc32(&payload) != header.payload_crc32 {
+        return Err("DZKB payload CRC32 mismatch".to_owned());
+    }
     Ok(Frame { header, payload })
 }
 
