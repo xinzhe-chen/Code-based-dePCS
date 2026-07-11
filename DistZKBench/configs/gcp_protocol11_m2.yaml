@@ -7,7 +7,9 @@ experiment:
   random_seed: 20260711
   repetitions: 1
   warmups: 1
-  fail_on_warning: true
+  # perf/resctrl are supplemental and may be reported unsupported; requested
+  # cgroup/affinity/topology/verifier capabilities still fail closed.
+  fail_on_warning: false
 
 platform:
   backend: linux
