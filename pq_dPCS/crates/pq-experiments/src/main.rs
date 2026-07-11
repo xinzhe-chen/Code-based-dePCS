@@ -615,47 +615,8 @@ fn run_dzb_verify(args: &[String]) -> Result<(), CliError> {
         fs::read(&proof_path).map_err(|error| CliError(format!("read proof failed: {error}")))?;
     let statement_bytes = fs::read(&statement_path)
         .map_err(|error| CliError(format!("read statement failed: {error}")))?;
-    let statement: DzbStatementEnvelope = bincode::deserialize(&statement_bytes)
-        .map_err(|error| CliError(format!("decode statement failed: {error}")))?;
-    let (opening, verified) = match statement {
-        DzbStatementEnvelope::Protocol11(statement) => {
-            let pp = protocol11::setup(statement.config, statement.setup_seed)
-                .map_err(|error| CliError(error.to_string()))?;
-            let proof = protocol11::deserialize_proof(&proof_bytes)
-                .map_err(|error| CliError(error.to_string()))?;
-            protocol11::verify_fs(
-                &pp,
-                &statement.commitment,
-                &statement.point,
-                statement.claimed_value,
-                &proof,
-            )
-            .map_err(|error| CliError(error.to_string()))?;
-            ("protocol11", true)
-        }
-        DzbStatementEnvelope::Protocol11Batch {
-            config,
-            setup_seed,
-            commitment,
-            claims,
-        } => {
-            let pp = protocol11::setup(config, setup_seed)
-                .map_err(|error| CliError(error.to_string()))?;
-            let proof = protocol11::deserialize_batch_proof(&proof_bytes)
-                .map_err(|error| CliError(error.to_string()))?;
-            if proof
-                .claims
-                .iter()
-                .map(|claim| (&claim.point, claim.claimed_value))
-                .ne(claims.iter().map(|(point, value)| (point, *value)))
-            {
-                return Err(CliError("batch statement/proof claim mismatch".to_owned()));
-            }
-            protocol11::verify_batch_fs(&pp, &commitment, &proof)
-                .map_err(|error| CliError(error.to_string()))?;
-            ("protocol11-batch", true)
-        }
-    };
+    let opening = verify_dzb_bytes(&statement_bytes, &proof_bytes)?;
+    let verified = true;
     fs::write(
         out,
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -669,6 +630,50 @@ fn run_dzb_verify(args: &[String]) -> Result<(), CliError> {
     )
     .map_err(|error| CliError(format!("write verifier report failed: {error}")))?;
     Ok(())
+}
+
+fn verify_dzb_bytes(statement_bytes: &[u8], proof_bytes: &[u8]) -> Result<&'static str, CliError> {
+    let statement: DzbStatementEnvelope = bincode::deserialize(statement_bytes)
+        .map_err(|error| CliError(format!("decode statement failed: {error}")))?;
+    match statement {
+        DzbStatementEnvelope::Protocol11(statement) => {
+            let pp = protocol11::setup(statement.config, statement.setup_seed)
+                .map_err(|error| CliError(error.to_string()))?;
+            let proof = protocol11::deserialize_proof(proof_bytes)
+                .map_err(|error| CliError(error.to_string()))?;
+            protocol11::verify_fs(
+                &pp,
+                &statement.commitment,
+                &statement.point,
+                statement.claimed_value,
+                &proof,
+            )
+            .map_err(|error| CliError(error.to_string()))?;
+            Ok("protocol11")
+        }
+        DzbStatementEnvelope::Protocol11Batch {
+            config,
+            setup_seed,
+            commitment,
+            claims,
+        } => {
+            let pp = protocol11::setup(config, setup_seed)
+                .map_err(|error| CliError(error.to_string()))?;
+            let proof = protocol11::deserialize_batch_proof(proof_bytes)
+                .map_err(|error| CliError(error.to_string()))?;
+            if proof
+                .claims
+                .iter()
+                .map(|claim| (&claim.point, claim.claimed_value))
+                .ne(claims.iter().map(|(point, value)| (point, *value)))
+            {
+                return Err(CliError("batch statement/proof claim mismatch".to_owned()));
+            }
+            protocol11::verify_batch_fs(&pp, &commitment, &proof)
+                .map_err(|error| CliError(error.to_string()))?;
+            Ok("protocol11-batch")
+        }
+    }
 }
 
 fn adapter_arg(args: &[String], key: &str) -> Result<String, CliError> {
@@ -1340,6 +1345,16 @@ fn run_single_depcs_batch_job(job: PcsBenchmarkJob) -> Result<PcsJobOutput, CliE
 }
 
 fn verify_pcs_results(command: VerifyPcsResultsCommand) -> Result<(), CliError> {
+    if !command.dir.join("source.csv").is_file() {
+        let artifacts = verify_distzkbench_artifacts(&command.dir)?;
+        match command.format {
+            OutputFormat::Json => {
+                println!("{{\"ok\":true,\"distzkbench_artifacts_checked\":{artifacts}}}")
+            }
+            OutputFormat::Csv => println!("ok,distzkbench_artifacts_checked\ntrue,{artifacts}"),
+        }
+        return Ok(());
+    }
     let source_check = verify_pcs_source_csv(&command.dir)?;
     let fixture_rows = verify_pcs_proof_fixtures(&command.dir, source_check.depcs_rows)?;
     let summary_rows = verify_pcs_summary_csv(&command.dir)?;
@@ -1355,6 +1370,51 @@ fn verify_pcs_results(command: VerifyPcsResultsCommand) -> Result<(), CliError> 
         ),
     }
     Ok(())
+}
+
+fn verify_distzkbench_artifacts(dir: &Path) -> Result<usize, CliError> {
+    fn visit(dir: &Path, checked: &mut usize) -> Result<(), CliError> {
+        let proof = dir.join("proof.bin");
+        let statement = dir.join("statement.bin");
+        if proof.is_file() && statement.is_file() {
+            let run: serde_json::Value = serde_json::from_slice(
+                &fs::read(dir.join("run.json"))
+                    .map_err(|error| CliError(format!("read run.json failed: {error}")))?,
+            )
+            .map_err(|error| CliError(format!("decode run.json failed: {error}")))?;
+            if run.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+                return Err(CliError(format!(
+                    "non-ok DistZKBench run at {}",
+                    dir.display()
+                )));
+            }
+            verify_dzb_bytes(
+                &fs::read(&statement)
+                    .map_err(|error| CliError(format!("read statement failed: {error}")))?,
+                &fs::read(&proof)
+                    .map_err(|error| CliError(format!("read proof failed: {error}")))?,
+            )?;
+            *checked += 1;
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)
+            .map_err(|error| CliError(format!("read results directory failed: {error}")))?
+        {
+            let path = entry
+                .map_err(|error| CliError(format!("read results entry failed: {error}")))?
+                .path();
+            if path.is_dir() {
+                visit(&path, checked)?;
+            }
+        }
+        Ok(())
+    }
+    let mut checked = 0;
+    visit(dir, &mut checked)?;
+    if checked == 0 {
+        return Err(CliError("no DistZKBench proof artifacts found".to_owned()));
+    }
+    Ok(checked)
 }
 
 fn phase_record(phase: &str, scope: &str, elapsed_ms: f64) -> PhaseTimingRecord {
