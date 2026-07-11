@@ -1,47 +1,33 @@
 schema_version: 2
-
 experiment:
-  name: protocol11_m2_paper100
+  name: gcp_strict_smoke
   run_id: auto
   output_dir: results
   random_seed: 20260711
   repetitions: 1
-  warmups: 1
-  fail_on_warning: true
-
+  warmups: 0
 platform:
   backend: linux
-
 roles:
-  prover_ranks: 2
+  prover_ranks: 4
   master_rank: 0
-  master_participates: true
-  master_has_local_shard: true
   verifier_enabled: true
-
 topology:
   type: star
   worker_to_worker: forbidden
   enforce_topology: true
-
 resources:
   worker_threads: 4
   verifier_threads: same_as_worker
   no_overcommit: true
   check_extra_threads: true
-
 memory:
-  per_rank_limit: 40GiB
+  per_rank_limit: 4GiB
   cgroup: true
-
 network:
   transport: tcp
   mode: loopback
-  base_port: 39300
-
-metrics:
-  perf: false
-
+  base_port: 39400
 protocol:
   adapter: pq-depcs-adapter
   mode: sdk-binary
@@ -49,22 +35,12 @@ protocol:
   prove_subcommand: dzb-prove
   verify_subcommand: dzb-verify
   parameters:
-    opening: protocol11
+    opening: protocol11-batch
     batch_claims: 2
-    nv: 18
-    security: paper100
-    queries: 0
-
+    nv: 10
+    security: test-only
+    queries: 2
 timeouts:
-  connection_setup_sec: 60
-  prove_sec: 21600
-  verify_sec: 7200
-
-sweep:
-  axes:
-    - path: protocol.parameters.nv
-      values: [18, 19, 20, 21, 22, 23, 24]
-    - path: roles.prover_ranks
-      values: [2, 4]
-    - path: protocol.parameters.opening
-      values: [protocol11, protocol11-batch]
+  connection_setup_sec: 30
+  prove_sec: 600
+  verify_sec: 300
