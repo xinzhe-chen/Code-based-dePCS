@@ -1,0 +1,48 @@
+schema_version: 2
+experiment:
+  name: gcp_strict_smoke_netns_v2
+  run_id: auto
+  output_dir: results
+  random_seed: 20260711
+  repetitions: 1
+  warmups: 0
+platform:
+  backend: linux
+roles:
+  prover_ranks: 4
+  master_rank: 0
+  verifier_enabled: true
+topology:
+  type: star
+  worker_to_worker: forbidden
+  enforce_topology: true
+resources:
+  worker_threads: 4
+  verifier_threads: same_as_worker
+  no_overcommit: true
+  check_extra_threads: true
+memory:
+  per_rank_limit: 4GiB
+  cgroup: true
+network:
+  transport: tcp
+  mode: netns_veth
+  base_port: 39400
+metrics:
+  memory_sampling_interval: 100ms
+protocol:
+  adapter: pq-depcs-adapter
+  mode: sdk-binary
+  command: ../pq_dPCS/target/release/pq-experiments
+  prove_subcommand: dzb-prove
+  verify_subcommand: dzb-verify
+  parameters:
+    opening: protocol11-batch
+    batch_claims: 2
+    nv: 10
+    security: test-only
+    queries: 2
+timeouts:
+  connection_setup_sec: 30
+  prove_sec: 600
+  verify_sec: 300

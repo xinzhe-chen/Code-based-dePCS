@@ -1,0 +1,35 @@
+   Compiling libc v0.2.186
+   Compiling mio v0.8.11
+   Compiling dzb-transport v0.1.0 (/home/chenxinzhe132_gmail_com/DistZK/DistZKBench/crates/dzb-transport)
+   Compiling dzb-sdk v0.1.0 (/home/chenxinzhe132_gmail_com/DistZK/DistZKBench/crates/dzb-sdk)
+    Finished `release` profile [optimized] target(s) in 2.20s
+     Running unittests src/lib.rs (target/release/deps/dzb_sdk-f5e10356af6a4bcd)
+
+running 1 test
+test runtime::tests::four_rank_256_mib_all_to_all_has_exact_accounting ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 8.54s
+
+	Command being timed: "cargo test --release -p dzb-sdk runtime::tests::four_rank_256_mib_all_to_all_has_exact_accounting -- --ignored --nocapture"
+	User time (seconds): 33.19
+	System time (seconds): 7.26
+	Percent of CPU this job got: 374%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:10.79
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9326072
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 31
+	Minor (reclaiming a frame) page faults: 3845834
+	Voluntary context switches: 7007
+	Involuntary context switches: 139
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 36128
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
