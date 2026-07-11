@@ -177,7 +177,7 @@ fn write_rank_csv(
     let mut file = File::create(result_dir.join("per_rank.csv"))?;
     writeln!(
         file,
-        "rank,pid,total_time_ms,compute_time_ms,serialized_sent_bytes,serialized_recv_bytes,thread_budget,qos_class,qos_applied"
+        "rank,pid,total_time_ms,compute_time_ms,serialize_time_ms,send_time_ms,recv_time_ms,network_wait_ms,barrier_wait_ms,proof_assembly_ms,protocol_time_ms,serialized_sent_bytes,serialized_recv_bytes,thread_budget,qos_class,qos_applied"
     )?;
     for rank in 0..config.original.roles.prover_ranks {
         let rank_output = output.ranks.iter().find(|item| item.rank == rank);
@@ -205,9 +205,26 @@ fn write_rank_csv(
             .and_then(|item| item.qos_class.as_deref())
             .unwrap_or("");
         let qos_applied = rank_output.is_some_and(|item| item.qos_applied);
+        let phase_ms = |category: &str| {
+            rank_output.map_or(0.0, |item| {
+                item.phases
+                    .iter()
+                    .filter(|phase| phase.category == category)
+                    .map(|phase| phase.duration_ms)
+                    .sum::<f64>()
+            })
+        };
         writeln!(
             file,
-            "{rank},{pid},{total_ms:.3},{total_ms:.3},{sent},{recv},{thread_budget},{qos_class},{qos_applied}"
+            "{rank},{pid},{total_ms:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{sent},{recv},{thread_budget},{qos_class},{qos_applied}",
+            phase_ms("compute"),
+            phase_ms("serialize"),
+            phase_ms("send"),
+            phase_ms("recv"),
+            phase_ms("network_wait"),
+            phase_ms("barrier_wait"),
+            phase_ms("proof_assembly"),
+            phase_ms("protocol"),
         )?;
     }
     Ok(())

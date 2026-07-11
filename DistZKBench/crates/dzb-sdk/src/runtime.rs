@@ -130,7 +130,7 @@ impl RuntimeContext {
 pub struct Metrics {
     rank: usize,
     started: Instant,
-    phase_stack: Vec<(String, u32, Instant)>,
+    phase_stack: Vec<(String, String, u32, Instant)>,
     phases: Vec<PhaseEvent>,
     metrics: Vec<CustomMetric>,
     next_phase_id: u32,
@@ -149,21 +149,30 @@ impl Metrics {
     }
 
     pub fn start_phase(&mut self, name: impl Into<String>) -> u32 {
+        self.start_phase_category(name, "protocol")
+    }
+
+    pub fn start_phase_category(
+        &mut self,
+        name: impl Into<String>,
+        category: impl Into<String>,
+    ) -> u32 {
         let id = self.next_phase_id;
         self.next_phase_id = self.next_phase_id.saturating_add(1);
-        self.phase_stack.push((name.into(), id, Instant::now()));
+        self.phase_stack
+            .push((name.into(), category.into(), id, Instant::now()));
         id
     }
 
     pub fn end_phase(&mut self) -> Result<()> {
-        let Some((name, id, start)) = self.phase_stack.pop() else {
+        let Some((name, category, id, start)) = self.phase_stack.pop() else {
             return Err("no active DistZKBench phase".to_owned());
         };
         self.phases.push(PhaseEvent {
             rank: self.rank,
             phase_id: id,
-            parent_phase_id: self.phase_stack.last().map(|(_, parent, _)| *parent),
-            category: "protocol".to_owned(),
+            parent_phase_id: self.phase_stack.last().map(|(_, _, parent, _)| *parent),
+            category,
             iteration: 0,
             start_ns: start.duration_since(self.started).as_nanos() as u64,
             duration_ns: start.elapsed().as_nanos() as u64,
@@ -175,7 +184,7 @@ impl Metrics {
     }
 
     pub fn current_phase_id(&self) -> u32 {
-        self.phase_stack.last().map_or(0, |(_, id, _)| *id)
+        self.phase_stack.last().map_or(0, |(_, _, id, _)| *id)
     }
 
     pub fn counter(&mut self, name: impl Into<String>, value: u64) {
@@ -598,6 +607,21 @@ impl Dzb {
         f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
         self.metrics.start_phase(name);
+        let result = f(self);
+        let end_result = self.metrics.end_phase();
+        match (result, end_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+
+    pub fn phase_category<T>(
+        &mut self,
+        name: impl Into<String>,
+        category: impl Into<String>,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.metrics.start_phase_category(name, category);
         let result = f(self);
         let end_result = self.metrics.end_phase();
         match (result, end_result) {

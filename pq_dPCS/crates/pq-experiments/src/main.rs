@@ -509,7 +509,7 @@ fn run_dzb_prove() -> Result<(), CliError> {
         })
         .collect::<Vec<_>>();
     let (worker_commitment, worker_state) = dzb
-        .phase("protocol11.worker_commit", |_| {
+        .phase_category("protocol11.worker_commit", "compute", |_| {
             protocol11::commit_worker(
                 &pp,
                 protocol11::WorkerShard {
