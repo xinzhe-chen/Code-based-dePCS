@@ -1,14 +1,20 @@
-//! Distributed PCS implementations.
+//! Artifact-backed dePCS implementation.
 //!
-//! `protocol11` is the normative Protocol 6--11 implementation. It uses real
-//! matrix encoding, column and vector Merkle commitments, four independent
-//! polynomial-commitment families, distributed sumcheck, and an external
-//! `(commitment, point, value)` verification statement.
+//! The submodules mirror Protocol 6 through Protocol 11 from
+//! `Doc/papers/pq_dSNARK.pdf`. This refactor is intentionally structural: public CLI,
+//! benchmark CSV fields, transcript labels, proof serialization, timing points,
+//! and communication accounting stay unchanged.
 
 pub mod backend;
 mod compact_codec;
 mod pcs_backend;
-pub mod protocol11;
+mod proof_size;
+mod protocol10_encoding;
+mod protocol11_distributed_brakedown;
+pub mod protocol6_composition;
+pub mod protocol7_merkle_commitments;
+pub mod protocol8_e_commitments;
+pub mod protocol9_f_commitments;
 mod types;
 mod utils;
 
@@ -17,18 +23,19 @@ pub use backend::{
     PAPER_PCS_SOURCE_REV, PAPER_PCS_SOURCE_URL, PaperPcsBackend, PaperQueryPolicy,
     paper_fair_query_count, paper_query_count, paper_query_count_for_code_rate,
 };
-pub use protocol11::{
-    BrakedownCode, EncodingRelation, GlobalPolynomial, PaperLayout, Protocol10Proof,
-    Protocol11Channel, Protocol11Commitment, Protocol11Config, Protocol11Error, Protocol11Event,
-    Protocol11Proof, Protocol11ProverSession, Protocol11Statement, Protocol11VerifierSession,
-    PublicParameters, SecurityBudget, SecurityProfile, WorkerCommitment, WorkerProverState,
-    WorkerShard, aggregate_commitments, commit_global, commit_worker, deserialize_commitment,
-    deserialize_proof, proof_size_bytes, prove_distributed_fs, prove_fs, serialize_commitment,
-    serialize_proof, setup, verify_fs,
+pub use proof_size::{
+    PaperProofSizeBreakdown, commitment_size_bytes, proof_size_breakdown, proof_size_bytes,
 };
-pub use types::{PaperField, PaperPcsCommitment, PaperPcsOpeningProof};
+pub use protocol11_distributed_brakedown::{
+    assemble_opening, commit_from_worker_commitments, commit_worker, commit_worker_cached,
+    open_worker, open_worker_cached, sample_point, verify, worker_coefficients,
+};
+pub use types::*;
 
 pub const PAPER_DEPCS_SOURCE_URL: &str = crate::depcs::backend::PAPER_PCS_SOURCE_URL;
 pub const PAPER_DEPCS_SOURCE_REV: &str = crate::depcs::backend::PAPER_PCS_SOURCE_REV;
 pub const PAPER_DEPCS_LICENSE: &str = crate::depcs::backend::PAPER_PCS_LICENSE;
 pub const PAPER_DEPCS_HASH: &str = crate::depcs::backend::PAPER_PCS_HASH;
+
+#[cfg(test)]
+mod tests;

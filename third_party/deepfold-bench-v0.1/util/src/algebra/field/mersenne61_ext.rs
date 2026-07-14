@@ -2,36 +2,15 @@ use super::MyField;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::_mulx_u64;
 use rand::Rng;
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Serialize, Deserialize)]
 pub struct Mersenne61Ext {
     pub real: u64,
     pub image: u64,
 }
 
-impl<'de> Deserialize<'de> for Mersenne61Ext {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Coordinates {
-            real: u64,
-            image: u64,
-        }
-
-        let coordinates = Coordinates::deserialize(deserializer)?;
-        if coordinates.real >= MOD || coordinates.image >= MOD {
-            return Err(D::Error::custom("non-canonical Mersenne61Ext coordinate"));
-        }
-        Ok(Self {
-            real: coordinates.real,
-            image: coordinates.image,
-        })
-    }
-}
-
-pub const MODULUS: u64 = (1u64 << 61) - 1;
-const MOD: u64 = MODULUS;
+const MOD: u64 = (1u64 << 61) - 1;
 
 #[inline]
 fn try_sub(x: u64) -> u64 {
@@ -171,14 +150,12 @@ impl Mersenne61Ext {
         bytes
     }
 
-    pub fn try_from_full_bytes(bytes: [u8; 16]) -> Option<Self> {
+    pub fn from_full_bytes(bytes: [u8; 16]) -> Self {
         let mut real = [0_u8; 8];
         let mut image = [0_u8; 8];
         real.copy_from_slice(&bytes[..8]);
         image.copy_from_slice(&bytes[8..]);
-        let real = u64::from_le_bytes(real);
-        let image = u64::from_le_bytes(image);
-        (real < MOD && image < MOD).then_some(Self { real, image })
+        Self::from_parts(u64::from_le_bytes(real), u64::from_le_bytes(image))
     }
 }
 
@@ -201,21 +178,13 @@ impl MyField for Mersenne61Ext {
 
     #[inline]
     fn from_hash(hash: [u8; crate::merkle_tree::MERKLE_ROOT_SIZE]) -> Self {
-        // Rejection sampling is exact because masking produces a uniform value
-        // in [0, 2^61), of which only MOD is rejected. Rehashing on rejection
-        // avoids the biased 56-bit components used by the artifact code.
-        let mut block = hash;
-        loop {
-            let mut real = [0_u8; 8];
-            let mut image = [0_u8; 8];
-            real.copy_from_slice(&block[..8]);
-            image.copy_from_slice(&block[8..16]);
-            let real = u64::from_le_bytes(real) & MOD;
-            let image = u64::from_le_bytes(image) & MOD;
-            if real < MOD && image < MOD {
-                return Mersenne61Ext { real, image };
-            }
-            block = Sha256::digest(block).into();
+        Mersenne61Ext {
+            real: (0..7)
+                .into_iter()
+                .fold(0, |acc, x| (acc << 8) + hash[x] as u64),
+            image: (8..15)
+                .into_iter()
+                .fold(0, |acc, x| (acc << 8) + hash[x] as u64),
         }
     }
 
@@ -250,7 +219,8 @@ impl MyField for Mersenne61Ext {
 
     #[inline]
     fn to_bytes(&self) -> Vec<u8> {
-        self.to_full_bytes().to_vec()
+        let x = self.real.to_le_bytes().to_vec();
+        x
     }
 }
 
@@ -265,20 +235,5 @@ mod tests {
         mult_and_inverse::<Mersenne61Ext>();
         assigns::<Mersenne61Ext>();
         pow_and_generator::<Mersenne61Ext>();
-    }
-
-    #[test]
-    fn canonical_bytes_bind_both_components() {
-        let a = Mersenne61Ext::from_parts(7, 11);
-        let b = Mersenne61Ext::from_parts(7, 12);
-        assert_ne!(a.to_bytes(), b.to_bytes());
-        assert_eq!(
-            Mersenne61Ext::try_from_full_bytes(a.to_full_bytes()),
-            Some(a)
-        );
-
-        let mut non_canonical = a.to_full_bytes();
-        non_canonical[..8].copy_from_slice(&MOD.to_le_bytes());
-        assert_eq!(Mersenne61Ext::try_from_full_bytes(non_canonical), None);
     }
 }

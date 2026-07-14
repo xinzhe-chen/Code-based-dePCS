@@ -12,19 +12,43 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+use pq_pcs::depcs::{
+    self, PaperDepcsConfig, PaperProtocol11Commitment, PaperProtocol11WorkerCommitment,
+    PaperProtocol11WorkerOpening,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::CliError;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum PcsWorkerRequest {
+    PaperCommitSeeded {
+        original_len: usize,
+        workers: usize,
+        worker_id: usize,
+        config: PaperDepcsConfig,
+    },
+    PaperOpen {
+        commitment: PaperProtocol11Commitment,
+        point: Vec<depcs::PaperField>,
+    },
     Shutdown,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum PcsWorkerResponse {
+    PaperCommit {
+        commitment: PaperProtocol11WorkerCommitment,
+        elapsed_ms: f64,
+    },
+    PaperOpen {
+        opening: PaperProtocol11WorkerOpening,
+        elapsed_ms: f64,
+    },
     Ack,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 pub(crate) struct PcsNetworkWorkerClient {

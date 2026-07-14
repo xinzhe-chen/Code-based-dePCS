@@ -24,6 +24,18 @@ impl PreparedPaperProver {
             Self::DeepFold(prover) => PaperPcsCommitment::DeepFold(prover.commit_polynomial()),
         }
     }
+
+    pub(crate) fn open(
+        self,
+        point: &[PaperField],
+    ) -> PaperDepcsResult<(PaperPcsOpeningProof, PaperField)> {
+        // Consume the prepared prover: `prove`/`generate_proof` mutate/consume it,
+        // and the worker cache is opened at most once, so taking ownership here
+        // avoids the O(domain) deep clone of the codeword + Merkle tree per open.
+        match self {
+            Self::DeepFold(prover) => deepfold::open_prepared(prover, point),
+        }
+    }
 }
 
 pub(crate) fn prepare_prover(
@@ -63,22 +75,19 @@ pub(crate) fn open_polynomial(
     }
 }
 
-pub(crate) fn verify_evaluation(
+pub(crate) fn verify_worker_opening(
     config: PaperDepcsConfig,
     nv: usize,
     commitment: &PaperPcsCommitment,
-    point: &[PaperField],
-    value: PaperField,
-    proof: &PaperPcsOpeningProof,
+    opening: &PaperProtocol11WorkerOpening,
     oracle: &RandomOracle<PaperField>,
 ) -> PaperDepcsResult<()> {
-    let result = catch_unwind(AssertUnwindSafe(|| match (proof, commitment) {
+    let result = catch_unwind(AssertUnwindSafe(|| match (&opening.proof, commitment) {
         (PaperPcsOpeningProof::DeepFold(proof), PaperPcsCommitment::DeepFold(commitment)) => {
-            deepfold::verify_evaluation(
+            deepfold::verify_opening(
                 nv,
                 commitment,
-                point,
-                value,
+                opening,
                 proof,
                 oracle,
                 config.code_rate_log(),

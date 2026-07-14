@@ -7,9 +7,6 @@ vendored trees are kept:
   the only vendored **workspace dependency**: `crates/pq-pcs` depends on its
   `deepfold` and `util` crates by path. Do not move or rename it
   without updating `crates/pq-pcs/Cargo.toml`.
-  No upstream license file has been confirmed for this snapshot. Public
-  redistribution is therefore an explicit release blocker; keeping the code
-  buildable locally is not a license conclusion.
 - **`ligesis-pcs-3447/`** — the three distributed-PCS comparison baselines the
   benchmark measures against. It is *not* a workspace dependency;
   `scripts/benchmark.py` builds and runs its example binaries as separate

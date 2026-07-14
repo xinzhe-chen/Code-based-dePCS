@@ -13,9 +13,6 @@ pq-core = { path = "../pq-core" }
 rayon = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
-num-bigint = { workspace = true }
-num-rational = { workspace = true }
-num-traits = { workspace = true }
 paper-deepfold = { package = "deepfold", path = "../../third_party/deepfold-bench-v0.1/deepfold" }
 paper-util = { package = "util", path = "../../third_party/deepfold-bench-v0.1/util" }
 

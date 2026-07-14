@@ -1,4 +1,4 @@
-//! Core math and circuit data structures for Code-based dePCS.
+//! Core math and circuit data structures for pq_dSNARK.
 
 pub mod error;
 pub mod field;
