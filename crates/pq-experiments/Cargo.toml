@@ -1,0 +1,20 @@
+[package]
+name = "pq-experiments"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dzb-sdk = { git = "https://github.com/xinzhe-chen/DistZKBench", rev = "6ffa6ad0d4886774d6a8382ff203b7338e148fd8" }
+pq-core = { path = "../pq-core" }
+pq-pcs = { path = "../pq-pcs" }
+bincode = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "pq-experiments"
+path = "src/main.rs"
+
+[lints]
+workspace = true

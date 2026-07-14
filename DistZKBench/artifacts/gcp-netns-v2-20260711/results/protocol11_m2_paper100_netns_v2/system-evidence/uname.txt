@@ -1,1 +1,0 @@
-Linux distzkbench-netns-v2-20260711 6.17.0-1020-gcp #22~24.04.1-Ubuntu SMP Mon Jun 22 20:24:13 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux

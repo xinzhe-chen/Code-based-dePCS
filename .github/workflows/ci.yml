@@ -11,9 +11,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    defaults:
-      run:
-        working-directory: pq_dPCS
     steps:
       - uses: actions/checkout@v4
       - name: Format
