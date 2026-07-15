@@ -47,14 +47,12 @@ enum OutputFormat {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PcsOpeningSelection {
     Protocol11,
-    Protocol11Batch,
 }
 
 impl PcsOpeningSelection {
     fn variants(self) -> Vec<PcsOpeningVariant> {
         match self {
             Self::Protocol11 => vec![PcsOpeningVariant::Protocol11],
-            Self::Protocol11Batch => vec![PcsOpeningVariant::Protocol11Batch],
         }
     }
 }
@@ -62,14 +60,12 @@ impl PcsOpeningSelection {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum PcsOpeningVariant {
     Protocol11,
-    Protocol11Batch,
 }
 
 impl PcsOpeningVariant {
     fn as_str(self) -> &'static str {
         match self {
             Self::Protocol11 => "protocol11",
-            Self::Protocol11Batch => "protocol11-batch",
         }
     }
 }
@@ -901,7 +897,6 @@ fn run_single_pcs_job(
 ) -> Result<(PcsMetricRecord, Vec<PhaseTimingRecord>), CliError> {
     match job.opening {
         PcsOpeningVariant::Protocol11 => run_single_depcs_job(job),
-        PcsOpeningVariant::Protocol11Batch => run_single_depcs_batch_job(job),
     }
 }
 
@@ -1075,18 +1070,6 @@ fn run_single_depcs_job(
         phase_record("paper_protocol11_verify", &scope, network_run.verify_ms),
     ];
     Ok((record, timings))
-}
-
-fn run_single_depcs_batch_job(
-    job: PcsBenchmarkJob,
-) -> Result<(PcsMetricRecord, Vec<PhaseTimingRecord>), CliError> {
-    let reason = "batch_unavailable_deepfold_artifact_native_batch_api_missing: LigeSIS batch/multi-open requires ark_ff::PrimeField + HasQuadraticExtension, while paper dePCS uses DeepFold artifact Mersenne61Ext/RandomOracle/Merkle; refusing to swap backend or use digest-only Protocol10/11 placeholders";
-    Err(CliError(format!(
-        "paper-backed protocol11-batch unavailable for backend={} nv={} workers={}: {reason}",
-        job.backend.as_str(),
-        variable_count(job.size),
-        job.workers
-    )))
 }
 
 fn verify_pcs_results(command: VerifyPcsResultsCommand) -> Result<(), CliError> {
@@ -2411,9 +2394,8 @@ fn next_value<'a>(args: &'a [String], index: &mut usize, flag: &str) -> Result<&
 fn parse_opening(value: &str) -> Result<PcsOpeningSelection, CliError> {
     match value {
         "protocol11" | "depcs" => Ok(PcsOpeningSelection::Protocol11),
-        "protocol11-batch" | "depcs-batch" => Ok(PcsOpeningSelection::Protocol11Batch),
         other => Err(CliError(format!(
-            "unsupported --opening '{other}', expected protocol11 or protocol11-batch"
+            "unsupported --opening '{other}', expected protocol11"
         ))),
     }
 }
@@ -2488,28 +2470,40 @@ fn core_affinity_label(workers: usize, cores_per_worker: usize) -> String {
     let worker_cpusets = env::var("PQ_WORKER_CPUSETS").unwrap_or_else(|_| "unset".to_owned());
     let numa_policy = env::var("PQ_NUMA_POLICY").unwrap_or_else(|_| "unset".to_owned());
     let affinity_status = env::var("PQ_AFFINITY_STATUS").unwrap_or_else(|_| "unset".to_owned());
-    core_affinity_label_from_parts(
+    core_affinity_label_from_parts(CoreAffinityLabelParts {
         workers,
         cores_per_worker,
-        &rayon_threads,
-        &policy,
-        &row_cpuset,
-        &worker_cpusets,
-        &numa_policy,
-        &affinity_status,
-    )
+        rayon_threads: &rayon_threads,
+        policy: &policy,
+        row_cpuset: &row_cpuset,
+        worker_cpusets: &worker_cpusets,
+        numa_policy: &numa_policy,
+        affinity_status: &affinity_status,
+    })
 }
 
-fn core_affinity_label_from_parts(
+struct CoreAffinityLabelParts<'a> {
     workers: usize,
     cores_per_worker: usize,
-    rayon_threads: &str,
-    policy: &str,
-    row_cpuset: &str,
-    worker_cpusets: &str,
-    numa_policy: &str,
-    affinity_status: &str,
-) -> String {
+    rayon_threads: &'a str,
+    policy: &'a str,
+    row_cpuset: &'a str,
+    worker_cpusets: &'a str,
+    numa_policy: &'a str,
+    affinity_status: &'a str,
+}
+
+fn core_affinity_label_from_parts(parts: CoreAffinityLabelParts<'_>) -> String {
+    let CoreAffinityLabelParts {
+        workers,
+        cores_per_worker,
+        rayon_threads,
+        policy,
+        row_cpuset,
+        worker_cpusets,
+        numa_policy,
+        affinity_status,
+    } = parts;
     let requested_threads = workers.saturating_mul(cores_per_worker);
     format!(
         "{policy};worker_process_threads={cores_per_worker};master_requested_threads={requested_threads};master_rayon_threads={rayon_threads};row_cpuset={row_cpuset};worker_cpusets={worker_cpusets};numa_policy={numa_policy};affinity_status={affinity_status}"
@@ -2683,7 +2677,7 @@ fn write_text_file(path: &Path, contents: &str) -> Result<(), CliError> {
 
 fn usage() -> String {
     "usage:
-  cargo run -p pq-experiments -- pcs-benchmark [--opening protocol11|protocol11-batch] [--backend deepfold] [--backend-rate-inv N] [--sizes 256,512,1024 | --size-range 256..1024 | --nv-values/--variable-counts 8,9,10 | --nv-range/--variable-range 8..10] [--workers 1,2,4] [--cores-per-worker N] [--pcs-queries N] [--security-bits N] [--repeats N] [--no-pcs-warmup] [--out DIR]
+  cargo run -p pq-experiments -- pcs-benchmark [--opening protocol11] [--backend deepfold] [--backend-rate-inv N] [--sizes 256,512,1024 | --size-range 256..1024 | --nv-values/--variable-counts 8,9,10 | --nv-range/--variable-range 8..10] [--workers 1,2,4] [--cores-per-worker N] [--pcs-queries N] [--security-bits N] [--repeats N] [--no-pcs-warmup] [--out DIR]
   cargo run -p pq-experiments -- verify-pcs-results --dir results/pcs-bench-... [--format json|csv]"
         .to_owned()
 }
@@ -2720,16 +2714,16 @@ mod tests {
 
     #[test]
     fn core_affinity_label_records_affinity_metadata() {
-        let label = core_affinity_label_from_parts(
-            4,
-            8,
-            "32",
-            "adaptive-affinity-per-row",
-            "0-31",
-            "0-7;8-15;16-23;24-31",
-            "local-node-if-available",
-            "taskset-available",
-        );
+        let label = core_affinity_label_from_parts(CoreAffinityLabelParts {
+            workers: 4,
+            cores_per_worker: 8,
+            rayon_threads: "32",
+            policy: "adaptive-affinity-per-row",
+            row_cpuset: "0-31",
+            worker_cpusets: "0-7;8-15;16-23;24-31",
+            numa_policy: "local-node-if-available",
+            affinity_status: "taskset-available",
+        });
         assert!(label.contains("adaptive-affinity-per-row"));
         assert!(label.contains("master_requested_threads=32"));
         assert!(label.contains("master_rayon_threads=32"));
@@ -2737,31 +2731,6 @@ mod tests {
         assert!(label.contains("worker_cpusets=0-7;8-15;16-23;24-31"));
         assert!(label.contains("numa_policy=local-node-if-available"));
         assert!(label.contains("affinity_status=taskset-available"));
-    }
-
-    #[test]
-    fn protocol11_batch_opening_is_explicit_and_fail_closed() {
-        assert_eq!(
-            parse_opening("protocol11-batch").expect("batch opening"),
-            PcsOpeningSelection::Protocol11Batch
-        );
-        let deepfold_job = PcsBenchmarkJob {
-            size: 1 << 10,
-            workers: 2,
-            opening: PcsOpeningVariant::Protocol11Batch,
-            trial: 1,
-            pcs_queries: 1,
-            backend: PaperPcsBackend::DeepFold,
-            backend_rate_inv: 2,
-            cores_per_worker: 1,
-        };
-        let error = run_single_depcs_batch_job(deepfold_job)
-            .expect_err("deepfold batch must not swap backend");
-        assert!(
-            error
-                .0
-                .contains("batch_unavailable_deepfold_artifact_native_batch_api_missing")
-        );
     }
 
     #[test]

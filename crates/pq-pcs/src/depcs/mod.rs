@@ -1,9 +1,9 @@
 //! Artifact-backed dePCS implementation.
 //!
 //! The submodules mirror Protocol 6 through Protocol 11 from
-//! `Doc/papers/pq_dSNARK.pdf`. This refactor is intentionally structural: public CLI,
-//! benchmark CSV fields, transcript labels, proof serialization, timing points,
-//! and communication accounting stay unchanged.
+//! the Code-based dePCS design. Public CLI, benchmark CSV fields, transcript
+//! labels, proof serialization, timing points, and communication accounting are
+//! kept stable across internal refactors.
 
 pub mod backend;
 mod compact_codec;
@@ -11,10 +11,10 @@ mod pcs_backend;
 mod proof_size;
 mod protocol10_encoding;
 mod protocol11_distributed_brakedown;
-pub mod protocol6_composition;
-pub mod protocol7_merkle_commitments;
-pub mod protocol8_e_commitments;
-pub mod protocol9_f_commitments;
+mod protocol6_composition;
+mod protocol7_merkle_commitments;
+mod protocol8_e_commitments;
+mod protocol9_f_commitments;
 mod types;
 mod utils;
 

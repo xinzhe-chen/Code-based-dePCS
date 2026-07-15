@@ -5,11 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ark-ff = { workspace = true }
-ark-poly = { workspace = true }
-ark-serialize = { workspace = true }
-ark-std = { workspace = true }
-pq-core = { path = "../pq-core" }
 rayon = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }

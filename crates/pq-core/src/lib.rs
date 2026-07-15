@@ -1,4 +1,4 @@
-//! Core math and circuit data structures for pq_dSNARK.
+//! Standalone field, polynomial, and multilinear-extension utilities.
 
 pub mod error;
 pub mod field;

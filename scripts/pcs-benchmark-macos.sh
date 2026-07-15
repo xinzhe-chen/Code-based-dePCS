@@ -11,7 +11,7 @@ if [ -z "$python_bin" ]; then
 fi
 
 default_args=(
-  --out results/depcs-fiveway-parallel-merkle-nv18-24-w2-w4
+  --out results/depcs-fourway-nv18-24-w2-w4
   --fair-sequential
   --depcs-nv-range 18..24
   --depcs-workers 2,4
@@ -28,9 +28,9 @@ if [ "$#" -gt 0 ]; then
   exec "$python_bin" "$repo_root/scripts/benchmark.py" "$@"
 fi
 
-echo "pq_dSNARK dePCS benchmark launcher (macOS)"
+echo "Code-based dePCS benchmark launcher (macOS)"
 echo
-echo "1) Run default nv=18..24 workers=2,4 five-way benchmark"
+echo "1) Run default nv=18..24 workers=2,4 four-way benchmark"
 echo "2) Dry-run default schedule"
 echo "3) Enter custom benchmark.py arguments"
 echo "4) Show benchmark.py help"

@@ -16,11 +16,11 @@ if not "%~1"=="" (
   exit /b %errorlevel%
 )
 
-set "DEFAULT_ARGS=--out results/depcs-fiveway-parallel-merkle-nv18-24-w2-w4 --fair-sequential --depcs-nv-range 18..24 --depcs-workers 2,4 --depcs-backends deepfold:2 --depcs-opening protocol11 --ligesis-nvs 18,19,20,21,22,23,24 --ligesis-parties-list 2,4 --external-pcs-schemes dfrittata-pcs,dpip-fri-pcs --pcs-queries 1 --repeats 1"
+set "DEFAULT_ARGS=--out results/depcs-fourway-nv18-24-w2-w4 --fair-sequential --depcs-nv-range 18..24 --depcs-workers 2,4 --depcs-backends deepfold:2 --depcs-opening protocol11 --ligesis-nvs 18,19,20,21,22,23,24 --ligesis-parties-list 2,4 --external-pcs-schemes dfrittata-pcs,dpip-fri-pcs --pcs-queries 1 --repeats 1"
 
-echo pq_dSNARK dePCS benchmark launcher (Windows)
+echo Code-based dePCS benchmark launcher (Windows)
 echo.
-echo 1^) Run default nv=18..24 workers=2,4 five-way benchmark
+echo 1^) Run default nv=18..24 workers=2,4 four-way benchmark
 echo 2^) Dry-run default schedule
 echo 3^) Enter custom benchmark.py arguments
 echo 4^) Show benchmark.py help

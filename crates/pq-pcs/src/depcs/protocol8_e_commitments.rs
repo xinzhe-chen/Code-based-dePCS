@@ -19,7 +19,7 @@ use paper_util::algebra::field::MyField;
 
 use super::types::*;
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct Protocol8EClaim {
     pub(crate) opening_claim: PaperProtocol10OpeningClaim,
 }
@@ -37,7 +37,7 @@ pub(crate) fn relation_weight(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn systematic_value(
     relation_kind: PaperProtocol10RelationKind,
     opening: &PaperProtocol11WorkerOpening,
@@ -50,7 +50,7 @@ pub(crate) fn systematic_value(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn e_at_r_claim(
     opening: &PaperProtocol11WorkerOpening,
     relation_weight: PaperField,
@@ -71,7 +71,7 @@ pub(crate) fn e_at_r_claim(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn e_at_systematic_claim(
     relation_kind: PaperProtocol10RelationKind,
     opening: &PaperProtocol11WorkerOpening,

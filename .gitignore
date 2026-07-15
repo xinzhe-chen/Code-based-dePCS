@@ -8,12 +8,17 @@ target/
 # a purely local scratch zone for benchmark runs.
 /results/
 
+# Local analysis scratch space (rendered PDFs, screenshots, extracted text,
+# one-off plots, and other disposable review artifacts).
+/tmp/
+
 # Local logs and temporary report screenshots
 *.log
 *.tmp
 *.bak
 *.pyc
 __pycache__/
+.pycache/
 
 # Editor and OS noise
 .DS_Store

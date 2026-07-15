@@ -44,14 +44,13 @@ pub(crate) fn prove_composed_claim(
     // Protocol 6 uses a single global claim `f(s) = v`. Protocol 11 obtains it
     // by partitioning `s = s1 || s2`: each worker opens its local shard at
     // `s2`, and the master combines those values with `eq(s1, worker_id)`.
-    // Canonical order is part of the transcript/proof layout, so sorting here
-    // preserves the pre-refactor serialized proof order.
+    // Canonical order is part of the transcript/proof layout.
     worker_openings.sort_by_key(|opening| opening.worker_id);
     let claimed_value = composed_claim_value(commitment, point, worker_openings)?;
     Ok(Protocol6CompositionClaim { claimed_value })
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn verify_composed_claim(
     commitment: &PaperProtocol11Commitment,
     proof: &PaperProtocol11Proof,

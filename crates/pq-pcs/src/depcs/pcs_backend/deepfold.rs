@@ -14,20 +14,18 @@ use paper_util::{STEP, algebra::polynomial::MultilinearPolynomial, random_oracle
 use super::{interpolate_cosets, interpolate_cosets_lazy};
 use crate::depcs::types::*;
 
-type LazyCosetCache = Mutex<HashMap<(usize, usize), Arc<Vec<Coset<PaperField>>>>>;
+type CosetCacheKey = (usize, usize);
+type SharedCosets = Arc<Vec<Coset<PaperField>>>;
+type LazyCosetCache = Mutex<HashMap<CosetCacheKey, SharedCosets>>;
 const MATERIALIZED_COSET_CACHE_CAPACITY: usize = 2;
 
 #[derive(Default)]
 struct BoundedMaterializedCosetCache {
-    entries: VecDeque<((usize, usize), Arc<Vec<Coset<PaperField>>>)>,
+    entries: VecDeque<(CosetCacheKey, SharedCosets)>,
 }
 
 impl BoundedMaterializedCosetCache {
-    fn get_or_insert_with<F>(
-        &mut self,
-        key: (usize, usize),
-        build: F,
-    ) -> Arc<Vec<Coset<PaperField>>>
+    fn get_or_insert_with<F>(&mut self, key: CosetCacheKey, build: F) -> SharedCosets
     where
         F: FnOnce() -> Vec<Coset<PaperField>>,
     {

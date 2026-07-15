@@ -1,4 +1,4 @@
-# pq_dSNARK dePCS
+# Code-based dePCS
 
 This repository contains a transparent distributed polynomial commitment scheme
 (dePCS) implementation plus benchmark scripts for comparing it with vendored PCS
@@ -21,8 +21,8 @@ The repository pins its Rust version through `rust-toolchain.toml`.
 ## 2. Clone
 
 ```bash
-git clone https://github.com/xinzhe-chen/pq_dSNARK.git
-cd pq_dSNARK
+git clone https://github.com/xinzhe-chen/Code-based-dePCS.git
+cd Code-based-dePCS
 ```
 
 There are no git submodules to initialize.
@@ -63,13 +63,13 @@ bash scripts/pcs-benchmark-macos.sh
 
 Menu options:
 
-- `1`: run the default five-way benchmark.
+- `1`: run the default four-way benchmark.
 - `2`: dry-run the default schedule without running experiments.
 - `3`: enter custom `scripts/benchmark.py` arguments.
 - `4`: show all benchmark options.
 - `5`: quit.
 
-The default five-way benchmark runs:
+The default four-way benchmark runs:
 
 - dePCS DeepFold
 - LigeSIS
@@ -86,7 +86,7 @@ Windows:
 
 ```powershell
 .\scripts\pcs-benchmark-powershell.cmd `
-  --out results/depcs-fiveway-nv18-24-w2-w4 `
+  --out results/depcs-fourway-nv18-24-w2-w4 `
   --fair-sequential `
   --depcs-nv-range 18..24 `
   --depcs-workers 2,4 `
@@ -102,7 +102,7 @@ Linux/macOS:
 
 ```bash
 bash scripts/pcs-benchmark-linux.sh \
-  --out results/depcs-fiveway-nv18-24-w2-w4 \
+  --out results/depcs-fourway-nv18-24-w2-w4 \
   --fair-sequential \
   --depcs-nv-range 18..24 \
   --depcs-workers 2,4 \
@@ -139,7 +139,7 @@ Verify each generated dePCS `pcs-bench-*` directory:
 
 ```bash
 cargo run -p pq-experiments -- verify-pcs-results \
-  --dir results/depcs-fiveway-nv18-24-w2-w4/pcs-bench-... \
+  --dir results/depcs-fourway-nv18-24-w2-w4/pcs-bench-... \
   --format json
 ```
 

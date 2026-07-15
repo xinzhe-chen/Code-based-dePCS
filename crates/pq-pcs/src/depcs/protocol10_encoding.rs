@@ -390,7 +390,7 @@ pub(crate) fn merge_relation_opening_batches(
     })
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn relation_challenge(
     relation_index: usize,
     relation_kind: PaperProtocol10RelationKind,
@@ -433,7 +433,7 @@ pub(crate) fn protocol10_worker_contexts(
         .collect()
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn worker_statement_digests(
     commitment: &PaperProtocol11Commitment,
     point: &[PaperField],
@@ -447,7 +447,7 @@ pub(crate) fn worker_statement_digests(
     )
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn relation_challenge_with_statement_digests(
     relation_index: usize,
     relation_kind: PaperProtocol10RelationKind,

@@ -19,7 +19,7 @@ use super::protocol7_merkle_commitments::worker_commitment_digest;
 use super::types::*;
 use super::utils::{artifact_point, deterministic_value};
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct Protocol9FClaim {
     pub(crate) opening_claim: PaperProtocol10OpeningClaim,
 }
@@ -154,7 +154,7 @@ pub(crate) fn validate_worker_opening_metadata(
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn f_pad_systematic_claim(
     opening: &PaperProtocol11WorkerOpening,
     source_digest: [u8; 32],

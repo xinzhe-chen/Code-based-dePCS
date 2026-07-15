@@ -183,7 +183,7 @@ pub(crate) fn worker_opening_statement_digest(
     ))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn push_claim(out: &mut Vec<u8>, claim: &PaperProtocol10OpeningClaim) {
     push_claim_parts(
         out,
@@ -253,7 +253,7 @@ pub(crate) fn protocol11_transcript_state(
     digest_with_label(b"paper-protocol11-transcript-v2", &bytes)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn claim_digest(claim: &PaperProtocol10OpeningClaim) -> [u8; 32] {
     let mut bytes = Vec::new();
     push_claim(&mut bytes, claim);
